@@ -96,6 +96,13 @@ class NativePromptTests(unittest.TestCase):
         graph = runtime.expand_prompt(self.payload, self.lookup)['prompt']
         self.assertIn('default upscale factor', graph['17']['inputs'][runtime.ERROR])
 
+    def test_fastest_mode_requires_the_freevideo_model(self):
+        self.node['inputs']['fast_mode'] = 'fast2'
+        graph = runtime.expand_prompt(self.payload, self.lookup)['prompt']
+        self.assertEqual(list(graph), ['17'])
+        self.assertIn('Turn off Fastest mode', graph['17']['inputs'][runtime.ERROR])
+        self.assertIs(runtime.expand_prompt(self.payload, lambda identity: None), self.payload)
+
     def test_native_and_vdn_outputs_must_be_queued_separately(self):
         self.payload['prompt']['50'] = deepcopy(self.node)
         self.payload['prompt']['50']['inputs'][runtime.PRESET] = ''

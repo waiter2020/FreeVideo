@@ -107,6 +107,9 @@ def _unsupported(inputs):
     if inputs.get('upscale_factor') not in (None, '', '2', 2):
         raise _problem('Use the default upscale factor with single-pass MiniMax H3 Base.',
                        'MiniMax H3 底模为单次采样，请将放大倍率设为默认值。')
+    if inputs.get('fast_mode') not in (None, '', 'none'):
+        raise _problem('Turn off Fastest mode for MiniMax H3 Base, or switch to the FreeVideo model in Settings.',
+                       '请关闭 MiniMax H3 底模的最快模式，或在设置里切回 FreeVideo 模型。')
 
 
 def _check_media(variant, anchors, references):

@@ -2,7 +2,8 @@
 // the launcher reading this ComfyUI opens its installation with the video model, and its review installs it once accepted.
 
 export const VIDEO_MODEL_CHANGED = 'freevideo-video-model-changed';
-export const COMFY_H3_SAMPLING = Object.freeze({base_steps: 20, two_pass: false, preview: false, step_cache: 'none', upscale_factor: '2'});
+export const COMFY_H3_SAMPLING = Object.freeze({base_steps: 20, two_pass: false, preview: false, step_cache: 'none',
+    upscale_factor: '2', fast_mode: 'none'});
 
 export async function activeVideoModel(fetchApi) {
     try {
