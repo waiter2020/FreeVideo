@@ -23,6 +23,8 @@ import { preloadMode, setPreloadMode, onPreload } from './preload_setting.js';
 import { createUpdateNotice, releaseNotesInto, productVersion } from './updates.js';
 import { createImageGenClient } from './image_generation.js';
 import { IMAGE_MODELS, modelState, pausedText, continueUse } from './image_view_models.js';
+import { hfModelSettings } from './settings_video_models.js';
+import { VIDEO_MODEL_CHANGED } from './video_model.js';
 import { swapLoraFailureText } from './swap_lora.js';
 import { MODULES } from './health.js';
 import { userMessage } from './user_message.js';
@@ -239,6 +241,32 @@ export async function openSetup(options) {
     more.end.append(logCopy); more.element.hidden = true;
     models.append(hero, more.element);
 
+    const modelRequest = {request: (action, value) => request(action, value), refresh: () => poll()};
+    const videoModels = hfModelSettings({...modelRequest, onActivate: active => {
+        window.dispatchEvent(new CustomEvent(VIDEO_MODEL_CHANGED, {detail: active}));
+    }});
+    const imageModels = hfModelSettings({...modelRequest, kind: 'image', onActivate: () => {
+        window.dispatchEvent(new Event('freevideo-image-model-changed'));
+        void pollImages();
+    }});
+    const sharedEncoderModel = 'minimax-h3-image';
+    const sharedEncoderFormat = t('Qwen3-VL 32B NVFP4 AWQ or plain NVFP4 · Single .safetensors file',
+        'Qwen3-VL 32B NVFP4 AWQ 或普通 NVFP4 · 单个 .safetensors 文件');
+    const manageSharedEncoder = button(t('Manage weights', '管理权重'), {kind: 'fill'});
+    manageSharedEncoder.onclick = () => imageModels.focusComponent(sharedEncoderModel, 'text_encoder');
+    const sharedEncoderRow = row({iconName: 'film', title: t('MiniMax H3 text encoder shared with H3 Image', '与 H3 Image 共用的 MiniMax H3 文本编码器'),
+        sub: sharedEncoderFormat, end: [manageSharedEncoder]});
+    const sharedEncoderCard = card(sharedEncoderRow.element);
+    sharedEncoderCard.hidden = true;
+    function paintSharedEncoder(value) {
+        const encoder = value?.components?.[sharedEncoderModel]?.text_encoder;
+        sharedEncoderCard.hidden = !encoder?.ready;
+        const active = encoder?.active;
+        sharedEncoderRow.sub.textContent = [sharedEncoderFormat, active?.damaged ? t('Active weights unavailable', '当前权重不可用') :
+            active?.label && t(`In use: ${active.label}`, `使用中：${active.label}`)].filter(Boolean).join(' · ');
+    }
+    models.append(...videoModels.elements, sharedEncoderCard);
+
     // Picture models: both always listed, each with its own state (installed, not installed, downloading, failed).
     const imageCard = card(); const imageRows = new Map();
     const imageHead = groupHead(t('Picture models', '图像模型'), el('span', '', ''));
@@ -272,7 +300,7 @@ export async function openSetup(options) {
     addCard.append(swapRow.element, samplingRow.element);
     // The first-use download is said on hover only, not as a standing line.
     const addHead = tip(groupHead(t('Add-on models', '附加模型')), t('Add-on models', '附加模型'), t('Also downloaded the first time they are used', '第一次用到时也会自动下载'));
-    models.append(imageHead, imageCard, addHead, addCard);
+    models.append(imageHead, imageCard, ...imageModels.elements, addHead, addCard);
 
     // Folders: set once and rarely again, folded away.
     const folders = fold({iconName: 'folder', title: t('Advanced: installation and model folders', '高级：安装位置与模型文件夹'), sub: ''});
@@ -1005,7 +1033,8 @@ export async function openSetup(options) {
             const {row: r, size, chip, act, meter} = item;
             r.element.dataset.state = s.state; r.element.removeAttribute('aria-disabled');
             chip.hidden = act.hidden = meter.hidden = true; r.sub.className = '';
-            r.sub.textContent = IMAGE_WORDS[id] || '';
+            const profile = s.row?.profile?.label;
+            r.sub.textContent = profile ? t(`Using ${profile}`, `正在使用 ${profile}`) : IMAGE_WORDS[id] || '';
             r.element.querySelector('.st-ic').classList.toggle('is-ok', s.state === 'ready');
             size.textContent = s.total && s.state !== 'ready' ? t(`About ${gb(s.total)} GiB`, `约 ${gb(s.total)} GiB`) : '';
             // Installed is the normal case and says nothing on the row; its size is on hover.
@@ -1056,8 +1085,11 @@ export async function openSetup(options) {
     async function pollImages() {
         clearTimeout(imageTimer);
         if (!dialog.open) return;
+        const readyModels = value => (value?.models || []).filter(model => model.ready).map(model => model.id).join(',');
+        const readyBefore = readyModels(imageInfo);
         try { imageInfo = await imageClient.info(); } catch { imageInfo ??= {models: []}; }
         paintImages();
+        if (token && readyModels(imageInfo) !== readyBefore) void poll();
         const downloading = IMAGE_MODELS.some(m => modelState(imageInfo, m.id).state === 'downloading');
         if (downloading && shown === 'models') imageTimer = setTimeout(pollImages, 2000);
     }
@@ -1102,6 +1134,7 @@ export async function openSetup(options) {
     // ════════════ The installer (its behaviour as before; its parts now live in the Models page and the plan sheet) ════════════
     let savedFolders = "", savedMissing = false;
     let calibrateWait = false;
+    let pollSequence = 0;
     let token, planId, busy = false, probeBusy = false, pollTimer, lastPlanId, planErrors = false, planStale = false, ready = false, waitSince;
     let lastTask = {}, loaded = false, readFailed = false, wantSheet = false, busyLabel = '';
     // A click names what is happening at once, before the server has answered.
@@ -1307,6 +1340,8 @@ export async function openSetup(options) {
         tip(install, t('Install', '安装'), t('Download and fix what the plan lists', '按计划下载并修复缺少的部分'), {why: install.disabled ? why || t('Wait for the current task to finish', '请等待当前任务完成') : ''});
         recheck.hidden = !planErrors; install.hidden = planErrors; acceptLabel.hidden = busy || !planId;
         tip(calibrateButton, t('Start measuring', '开始测量'), t('Measure this computer; about 30 min per pass', '测量本机性能，每轮约 30 分钟'), {why: busy ? t('Wait for the current setup task to finish', '请等待当前安装任务完成') : ''});
+        videoModels.update(undefined, busy);
+        imageModels.update(undefined, busy);
         paintHero();
     };
     // A changed setting makes a shown plan outdated: clear it rather than leave it beside a disabled button.
@@ -1417,9 +1452,18 @@ export async function openSetup(options) {
     }
     async function poll() {
         clearTimeout(pollTimer);
-        try { const info = await request(); token = info.discovery.token; render(info.task); showDownloads(info.discovery.downloads); }
-        catch (error) { fail(error); }
-        if (dialog.open && (busy || probeBusy)) pollTimer = setTimeout(poll, 750);
+        const sequence = ++pollSequence;
+        try {
+            const info = await request();
+            if (sequence !== pollSequence) return;
+            token = info.discovery.token;
+            render(info.task); showDownloads(info.discovery.downloads);
+            videoModels.update(info.video_models, busy);
+            imageModels.update(info.image_models, busy);
+            paintSharedEncoder(info.image_models);
+        }
+        catch (error) { if (sequence !== pollSequence) return; fail(error); }
+        if (dialog.open && (busy || probeBusy || videoModels.busy() || imageModels.busy())) pollTimer = setTimeout(poll, 750);
     }
     async function saveModelFolders() {
         const result = await request('model-directories', {extra_libraries: extra.value.split("\n")});
@@ -1463,7 +1507,7 @@ export async function openSetup(options) {
     use.onclick = async () => {
         try { const result = await request("use", {root: root.value}); ready = Boolean(result.ready); if (result.ready) { state.textContent = t("Existing installation connected. Ready to generate.", "已连接现有安装，可以生成。"); state.className = "st-state fv-ready"; lastTask = {}; }
               else { fault(state, result.detail); state.className = "st-state is-fail"; }
-              invalidate(); }
+              invalidate(); if (ready) poll(); }
         catch (error) { fail(error); }
     };
     cancel.onclick = async () => { try { render(await request("cancel")); poll(); } catch (error) { fail(error); } };
@@ -1491,9 +1535,12 @@ export async function openSetup(options) {
         paths.dataset.count = String(libs.length);
         ready = Boolean(info.discovery.ready);
         render(info.task || {});
+        videoModels.update(info.video_models, busy);
+        imageModels.update(info.image_models, busy);
+        paintSharedEncoder(info.image_models);
         // A failure the last task left stays readable; only a quiet ready installation says it is ready.
         if (info.discovery.ready && !busy && info.task?.status !== 'failed') state.textContent = t("Ready to generate.", "已就绪，可以开始生成。");
-        if (busy || probeBusy) poll();
+        if (busy || probeBusy || videoModels.busy() || imageModels.busy()) poll();
         paintHero();
     } catch (error) { loaded = true; readFailed = true; fail(error); }
     return dialog;

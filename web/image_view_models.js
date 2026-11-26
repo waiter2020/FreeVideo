@@ -66,6 +66,7 @@ export function statusLine(state) {
 
 const ICON_OF = {ready: 'check', failed: 'warn', downloading: 'down', unavailable: 'info', missing: 'cloud', checking: 'clock'};
 const gbOf = state => state.total ? (state.total / 1e9).toFixed(1) : '';
+const displayName = (model, state) => state.row?.profile?.label || model.name;
 function useOf(model, state) {
     const shared = model.id !== 'moss-image-sft';
     const size = state.total ? shared ? t(`about ${gbOf(state)} GB, files shared with video are not downloaded again`, `约 ${gbOf(state)} GB，和视频共用的文件不重复下载`)
@@ -113,7 +114,8 @@ export function modelPicker({host, onPick, onInstall, onPause}) {
         list.replaceChildren(...states().map(({model, state}) => {
             const row = el('div', 'fv-iv-mopt'); row.setAttribute('role', 'option'); row.tabIndex = -1; row.dataset.model = model.id; row.dataset.state = state.state;
             row.setAttribute('aria-selected', String(model.id === last.chosen)); row.setAttribute('aria-disabled', String(state.state === 'unavailable'));
-            const text = el('span', 'fv-iv-mopt-tx'); text.append(el('b', '', model.name), el('small', '', statusLine(state)));
+            const label = displayName(model, state);
+            const text = el('span', 'fv-iv-mopt-tx'); text.append(el('b', '', label), el('small', '', statusLine(state)));
             row.append(icon('check', 'fv-iv-mopt-mark'), text);
             const act = actionOf(state);
             if (act) {
@@ -122,7 +124,7 @@ export function modelPicker({host, onPick, onInstall, onPause}) {
                 row.append(b);
             }
             if (state.state === 'downloading') { const p = el('i', 'fv-iv-mpick-bar'); p.style.setProperty('--p', String(state.fraction || 0)); row.append(p); }
-            tip(row, model.name, useOf(model, state));
+            tip(row, label, useOf(model, state));
             row.addEventListener('click', () => { if (state.state === 'unavailable') return; onPick(model); close(); });
             return row;
         }));
@@ -144,11 +146,12 @@ export function modelPicker({host, onPick, onInstall, onPause}) {
         last = {info, chosen, pending};
         const model = IMAGE_MODELS.find(m => m.id === chosen) || IMAGE_MODELS[0], state = modelState(info, model.id);
         root.dataset.state = state.state;
-        name.textContent = model.name;
+        const label = displayName(model, state);
+        name.textContent = label;
         status.replaceChildren(icon(state.unknown ? 'clock' : ICON_OF[state.state] || 'cloud'), el('span', '', statusLine(state)));
         // Closed, the row names the model only; it speaks when something needs doing (to download, downloading, failed).
         status.hidden = state.state === 'ready' || state.state === 'checking';
-        tip(trigger, t('Model', '模型'), t(`${model.name}: ${useOf(model, state)}. Click to choose another`, `${model.name}：${useOf(model, state)}。点开换别的模型`));
+        tip(trigger, t('Model', '模型'), t(`${label}: ${useOf(model, state)}. Click to choose another`, `${label}：${useOf(model, state)}。点开换别的模型`));
         const act = actionOf(state); action.hidden = !act; action.replaceChildren(el('span', 'fv-iv-btn-label', act));
         if (act) tip(action, state.paused ? t('Continue download', '继续下载') : state.state === 'downloading' ? t('Pause download', '暂停下载') : state.state === 'failed' ? t('Retry download', '重新下载') : t(`Install ${model.short}`, `安装 ${model.short}`),
             state.paused ? continueUse() : useOf(model, state));

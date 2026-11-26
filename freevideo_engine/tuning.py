@@ -14,6 +14,7 @@ import time
 from urllib.parse import unquote, urlsplit
 
 from . import subprocess_output
+from .encoder_checkpoint import ACTIVE_ENCODER, configured_component, configured_encoder_file
 from .hardware import GiB
 from .policy import BLOCK_BYTES
 from .monitoring import save
@@ -89,7 +90,7 @@ def identity(machine, hardware):
     from .install_tuning import required_models
     observed = inventory(machine['gpu_uuid'])
     package = Path(__file__).parent
-    encoder = Path(machine['encoder_model_root']) / 'text_encoders' / machine['encoder']
+    encoder = configured_encoder_file(machine)
     manifest = Path(machine['cache']) / 'manifest.json'
     weights = json.loads(manifest.read_text(encoding='utf-8'))
     stamps = {}
@@ -150,7 +151,7 @@ def encoder_content(path, catalog):
             'catalog_bytes': expected and expected['bytes'], 'sampled_sha256': value.hexdigest()}
 
 
-def text_identity(machine, hardware):
+def text_identity(machine, hardware, *, encoder_component=ACTIVE_ENCODER):
     """What the text conditioning of a prompt depends on: encoder content, its encoding version and arithmetic.
 
     No git, no timestamps, no video models, no GPU serial number, no source fingerprints: an update that leaves
@@ -159,7 +160,9 @@ def text_identity(machine, hardware):
     package = Path(__file__).parent
     catalog = json.loads((package / 'model_files.json').read_text(encoding='utf-8'))
     catalog = catalog['files'] if isinstance(catalog, dict) else catalog
-    encoder = Path(machine['encoder_model_root']) / 'text_encoders' / machine['encoder']
+    selected = configured_component(machine, encoder_component)
+    encoder = (dict(id=selected['id'], sha256=selected['sha256']) if selected is not None
+               else encoder_content(configured_encoder_file(machine, None), catalog))
     specs = json.loads((package / 'dependencies.json').read_text(encoding='utf-8'))
     texts = Path(machine['comfy_root']) / 'comfy' / 'text_encoders'
     assets = {str(p.relative_to(texts)): digest(p) for p in sorted(texts.rglob('*'))
@@ -167,7 +170,7 @@ def text_identity(machine, hardware):
     versions = package_versions(machine['comfy_python'])
     return {'schema': TEXT_SCHEMA, 'kind': 'text-conditioning', 'system': hardware.system,
             'gpu': [hardware.gpu_name, list(hardware.capability), hardware.driver_version],
-            'encoder': encoder_content(encoder, catalog),
+            'encoder': encoder,
             'encoder_packages': {k: v for k, v in versions.items() if k in TEXT_PACKAGES},
             'comfy_commit': specs['encoder']['comfy_commit'], 'comfy_text_encoders': assets,
             'encoding_version': ENCODING_VERSION}

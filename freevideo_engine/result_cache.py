@@ -193,7 +193,10 @@ def request_key(prompt, seed, canvas, sampling_plan, extra, machine, resources, 
                 'vdn': tree(machine['vdn_root'], code=True),
                 'encoder': tree(Path(machine['comfy_root']) / 'comfy', code=True)})
         models = phase('models', lambda: {key: tree(machine[key]) for key in ('cache', 'base', 'checkpoint')})
-        models['encoder'] = file(Path(machine['encoder_model_root']) / 'text_encoders' / machine['encoder'])
+        from .encoder_checkpoint import configured_component, configured_encoder_file
+        selected = configured_component(machine)
+        models['encoder'] = (dict(id=selected['id'], sha256=selected['sha256']) if selected is not None
+                             else file(configured_encoder_file(machine, None)))
         models['paths'] = file(machine['model_paths'])
         if sampling_plan.get('upscaler_sha256'):
             from .two_pass import UPSCALER

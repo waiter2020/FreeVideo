@@ -198,12 +198,13 @@ def keep_encoder_decision(*, free_now, placed, shape, budget_cap, reserved, vae_
     return True, dict(facts, reason='the picture is placed the same with the encoder on the card')
 
 
-def placed_encoder_bytes(endpoint):
+def placed_encoder_bytes(endpoint, identity=None):
     """Card bytes of the text encoder in the resident worker at ``endpoint``; 0 when it holds none there or cannot say."""
     from ..resident_process import ENV, status
     held = status({ENV: endpoint})
     try:
-        return sum(int(row.get('gpu_bytes') or 0) for row in held.get('models') or [] if row.get('role') == 'encoder')
+        return sum(int(row.get('gpu_bytes') or 0) for row in held.get('models') or []
+                   if row.get('role') == 'encoder' and (identity is None or row.get('identity') == identity))
     except (AttributeError, TypeError, ValueError):
         return 0
 
@@ -373,49 +374,24 @@ def _tensor_bytes(value):
 
 
 def _encode(prompt, *, encoder, comfy_root, comfy_python, model_paths, vram_gib, ram_gib, vision_images=(),
-            resident_endpoint=None, release_gpu=True):
+            resident_endpoint=None, release_gpu=True, encoder_component=None):
     """Run the shared text encoder in its own process and return the saved conditioning."""
-    import os
-    import sys
-    from ..resident_process import ENV
-    # With the video worker alive the encoder is taken from (and left in) its ModelBank; a worker that is gone
-    # makes ``child`` fall back to the short-lived process by itself.
-    previous = os.environ.get(ENV)
-    if resident_endpoint:
-        os.environ[ENV] = resident_endpoint
     try:
-        try:
-            return _encode_once(prompt, encoder, comfy_root, comfy_python, model_paths, vram_gib, ram_gib, vision_images,
-                                release_gpu=release_gpu)
-        except MemoryError as error:
-            import json
-            from ..encoder_commit import ENCODER_GPU_FLOOR, commit_exhausted
-            if not commit_exhausted(error):
-                raise
-            # Windows commit ran out while the weights were placed (physical RAM may be free). Once more with the
-            # card's share of the weights cut to the floor: the layers beyond it stream from the checkpoint, which
-            # commit does not charge, and the arithmetic is the same.
-            retry_gib = ENCODER_GPU_FLOOR / 2**30
-            print(json.dumps({'event': 'encoder_commit_retry', 'vram_gib': retry_gib}), flush=True)
-            return _encode_once(prompt, encoder, comfy_root, comfy_python, model_paths,
-                                min(vram_gib, retry_gib) if vram_gib else retry_gib, ram_gib, vision_images,
-                                release_gpu=release_gpu)
+        return _encode_once(prompt, encoder, comfy_root, comfy_python, model_paths, vram_gib, ram_gib, vision_images,
+                            resident_endpoint=resident_endpoint, release_gpu=release_gpu, encoder_component=encoder_component)
     except BaseException as error:
         # The caller's classifier keeps only a code; the text of the failure goes to the worker's log.
         print('H3 encode failed: %s: %s' % (type(error).__name__, str(error)[-2000:]), file=sys.stderr, flush=True)
         raise
-    finally:
-        if resident_endpoint:
-            if previous is None:
-                os.environ.pop(ENV, None)
-            else:
-                os.environ[ENV] = previous
-
 
 def _encode_once(prompt, encoder, comfy_root, comfy_python, model_paths, vram_gib, ram_gib, vision_images=(),
-                 release_gpu=True):
+                 *, resident_endpoint=None, release_gpu=True, encoder_component=None):
+    import json
+    from ..adaptive import classify_failure
     from .. import encode as encode_command
-    import sys
+    from ..encoder_commit import ENCODER_GPU_FLOOR, commit_exhausted
+    from ..encoder_retry import fresh_process_retry
+
     with tempfile.TemporaryDirectory(prefix='freevideo-h3img-') as directory:
         prompt_file = Path(directory) / 'prompt.txt'
         prompt_file.write_text(prompt, encoding='utf-8')
@@ -424,17 +400,44 @@ def _encode_once(prompt, encoder, comfy_root, comfy_python, model_paths, vram_gi
         for index, image in enumerate(vision_images):
             pictures.append(Path(directory) / f'picture-{index + 1}.png')
             image.save(pictures[-1], format='PNG', compress_level=1)
-        encode_command.run(argparse.Namespace(
-            prompt_file=prompt_file, out=out, encoder=encoder,
+        request = dict(
+            prompt_file=prompt_file, out=out, encoder=encoder, encoder_component=encoder_component,
             comfy_root=Path(comfy_root) if comfy_root else None, model_paths=Path(model_paths) if model_paths else None,
             comfy_python=comfy_python or sys.executable, vram_gib=vram_gib, ram_gib=ram_gib, attention='auto',
             gpu_reserve_gib=None, ram_reserve_gib=None, release_gpu=release_gpu,
             # A kept encoder gives back only the encoding's working memory, which the picture plans with.
-            empty_cache=not release_gpu, h3_image_references=pictures))
+            empty_cache=not release_gpu, h3_image_references=pictures)
+        if resident_endpoint:
+            request['resident_endpoint'] = resident_endpoint
+        try:
+            encode_command.run(argparse.Namespace(**request))
+        except Exception as error:
+            if getattr(error, 'worker_stop_confirmed', None) is False:
+                raise
+            try:
+                metrics = json.loads(out.with_suffix('.encoding.json').read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                metrics = {}
+            retry = (fresh_process_retry(classify_failure(error, metrics), metrics)
+                     if resident_endpoint else None)
+            if retry is not None:
+                # A resident worker whose cleanup failed has exited. Re-encode the same input with a fresh CUDA context.
+                print(json.dumps(dict(event='encoder_fresh_retry', overrides=retry)), flush=True)
+                retry.update(resident_endpoint=None, release_gpu=True, empty_cache=False)
+            elif commit_exhausted(error):
+                # Windows commit can be the placement limit even if physical RAM looks free.
+                floor = ENCODER_GPU_FLOOR / 2**30
+                retry = dict(vram_gib=min(vram_gib, floor) if vram_gib else floor)
+                print(json.dumps(dict(event='encoder_commit_retry', **retry)), flush=True)
+            else:
+                raise
+            out = Path(directory) / 'retry.pt'
+            encode_command.run(argparse.Namespace(**{**request, **retry, 'out': out}))
         return torch.load(out, map_location='cpu', weights_only=False)
 
 
-def reference_moments(copies, vae_path, device, *, cache=True, cache_root=None, stats=None, before_load=None):
+def reference_moments(copies, vae_path, device, *, cache=True, cache_root=None, stats=None, before_load=None,
+                      vae_sha256=None):
     """Posterior moments ([1, 48, h, w] float32 on the CPU) of each reference's VAE copy, read from or kept in the
     input cache the video references use; the encoder loads only when one is missing, after ``before_load()``."""
     import hashlib
@@ -444,7 +447,8 @@ def reference_moments(copies, vae_path, device, *, cache=True, cache_root=None, 
     if cache:
         try:
             from ..media_encoding import _latent_cache
-            store = _latent_cache(cache_root, Path(vae_path).parent.parent, device, recipe=REFERENCE_CACHE_RECIPE)
+            store = _latent_cache(cache_root, None, device, recipe=REFERENCE_CACHE_RECIPE,
+                                  weight_file=vae_path, weight_sha256=vae_sha256)
         except Exception:
             store = None
     out, keys, encoder, hits = [], [], None, 0
@@ -525,7 +529,8 @@ def small_parts_to_host(model):
 PREPARE_SIZE = (1024, 1024)
 
 
-def prepare(dit_path, vae_path, *, kept, resident_endpoint=None, should_stop=lambda: False, stats=None):
+def prepare(dit_path, vae_path, *, kept, resident_endpoint=None, should_stop=lambda: False, stats=None,
+            encoder_path=None, comfy_root=None):
     """Leave the DiT and the decoder in ``kept`` as a picture of the default size leaves them, before any prompt is
     known, so the next picture starts sampling right after its encoding. Returns what happened, as a word.
 
@@ -540,7 +545,9 @@ def prepare(dit_path, vae_path, *, kept, resident_endpoint=None, should_stop=lam
     from .image_policy import plan_image
     torch.set_grad_enabled(False)
     device = torch.device('cuda')
-    placed = placed_encoder_bytes(resident_endpoint) if resident_endpoint else 0
+    from ..encoder_checkpoint import encoder_resident_key
+    identity = encoder_resident_key(encoder_path, comfy_root) if resident_endpoint and encoder_path and comfy_root else None
+    placed = placed_encoder_bytes(resident_endpoint, identity) if resident_endpoint else 0
     encoder_room = max(0, RESIDENT_ENCODE_MIN_FREE - placed) if resident_endpoint else 0
     host_free = host_free_bytes()
     canvas_h, canvas_w = h3_dit.canvas_size(*PREPARE_SIZE)
@@ -612,7 +619,7 @@ def generate(prompt, width, height, seed, references=None, progress_cb=None, can
              encoder='qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors', comfy_root=None, comfy_python=None,
              model_paths=None, vram_gib=None, ram_gib=None, resident=None, cpu_noise=False, stats=None, mapped=True,
              preview=None, enter=None, reference_cache=True, reference_cache_root=None, resident_endpoint=None, kept=None,
-             note=None):
+             note=None, encoder_component=None, encoder_path=None, vae_sha256=None, conditioning_cache=True):
     """Return a PIL image for the prompt.
 
     ``progress_cb(stage, done, total)`` is called with stage in encode, denoise, decode;
@@ -652,7 +659,9 @@ def generate(prompt, width, height, seed, references=None, progress_cb=None, can
         # The resident encoder worker keeps its own CUDA context (about 0.8 GiB) on the card for good and encoding needs
         # 5 GiB: a card with less free than that plus the picture process's share encodes in a short process, as before.
         free_now = _driver_free_bytes()
-        placed = placed_encoder_bytes(resident_endpoint)
+        from ..encoder_checkpoint import encoder_resident_key
+        identity = encoder_resident_key(encoder_path, comfy_root) if encoder_path and comfy_root else None
+        placed = placed_encoder_bytes(resident_endpoint, identity)
         use_resident, why = resident_encode_decision(free_now, placed)
         stats['encode_resident_decision'] = why
         if not use_resident:
@@ -680,14 +689,16 @@ def generate(prompt, width, height, seed, references=None, progress_cb=None, can
     encoder_on_card = bool(resident_endpoint) and placed > 0 and not keep_encoder
     tick = time.perf_counter()
     from . import prompt_cache
+    cache = (prompt_cache.open_cache(encoder=encoder, comfy_root=comfy_root, comfy_python=comfy_python or sys.executable,
+                                    model_paths=model_paths, encoder_component=encoder_component)
+             if conditioning_cache else None)
     cond = prompt_cache.encode(
         prompt, [vision for _, vision in copies], stats=stats, encoder=encoder, use_saved=not encoder_on_card,
-        cache=prompt_cache.open_cache(encoder=encoder, comfy_root=comfy_root, comfy_python=comfy_python or sys.executable,
-                                      model_paths=model_paths),
+        cache=cache,
         compute=lambda: _encode(prompt, encoder=encoder, comfy_root=comfy_root, model_paths=model_paths,
                                 comfy_python=comfy_python, vram_gib=vram_gib, ram_gib=ram_gib,
                                 vision_images=[vision for _, vision in copies], resident_endpoint=resident_endpoint,
-                                release_gpu=not keep_encoder))
+                                release_gpu=not keep_encoder, encoder_component=encoder_component))
     stats['encode_s'] = round(time.perf_counter() - tick, 2)
     check()
     moments = []
@@ -703,7 +714,8 @@ def generate(prompt, width, height, seed, references=None, progress_cb=None, can
         # The encoder's peak (about 3 GiB) was never planned beside the blocks and decoder kept from the last picture.
         moments = reference_moments(copies, vae_path, torch.device('cuda'), cache=reference_cache,
                                     cache_root=reference_cache_root, stats=stats,
-                                    before_load=kept.give_back_device if kept is not None else None)
+                                    before_load=kept.give_back_device if kept is not None else None,
+                                    vae_sha256=vae_sha256)
         free_host_memory()
         stats.update(reference_encode_s=round(time.perf_counter() - tick, 2),
                      reference_encode_peak_gib=round(torch.cuda.max_memory_allocated() / 2**30, 2),

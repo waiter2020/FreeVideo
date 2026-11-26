@@ -121,7 +121,7 @@ class ImageRunner:
     full_card = False
     mapped = False
 
-    def __init__(self, pack_dir, *, device='cuda', gpu_budget_bytes=None, log=None, progress=None):
+    def __init__(self, pack_dir, *, device='cuda', gpu_budget_bytes=None, log=None, progress=None, components=None):
         from .qwen_pipeline import QwenImageGenerator
         from .qwen_te_weights import load_text_encoder
         from .qwen_weights import load_dit, load_vae
@@ -132,9 +132,8 @@ class ImageRunner:
         self.log = log or (lambda *args, **kwargs: None)
         self.load_seconds = {}
 
-        def path(directory, name):
-            nested = self.pack_dir / directory / name
-            return nested if nested.exists() else self.pack_dir / name
+        self.weights = {role: Path(components[role]['path']) if components else self.pack_dir / name
+                        for role, name in (('dit', _DIT_FILE), ('text_encoder', _TE_FILE), ('vae', _VAE_FILE))}
 
         loading = _LoadProgress(progress or (lambda stage, fraction: None))
         started = time.monotonic()
@@ -148,20 +147,20 @@ class ImageRunner:
         low_commit = not self.mapped and self._copies_exceed_commit()
         mapped_files = {'mapped': True} if self.mapped or low_commit else {}
         self.low_commit = low_commit
-        self.transformer = load_dit(self.pack_dir / _DIT_FILE, device=self.device if self.full_card else 'cpu',
+        self.transformer = load_dit(self.weights['dit'], device=self.device if self.full_card else 'cpu',
                                     progress=lambda done, total: loading.report('dit', done, total),
                                     **mapped_files)
         self.load_seconds['dit'] = time.monotonic() - started
         loading.complete('dit')
         started = time.monotonic()
-        self.vae = load_vae(self.pack_dir / _VAE_FILE, device='cpu',
+        self.vae = load_vae(self.weights['vae'], device='cpu',
                             progress=lambda done, total: loading.report('vae', done, total))
         self.load_seconds['vae'] = time.monotonic() - started
         loading.complete('vae')
         started = time.monotonic()
         config_dir = self.pack_dir / 'text_encoder'
         processor_dir = self.pack_dir / 'processor'
-        text = load_text_encoder(self.pack_dir / _TE_FILE, config_path=config_dir / 'config.json', device='cpu',
+        text = load_text_encoder(self.weights['text_encoder'], config_path=config_dir / 'config.json', device='cpu',
                                  progress=lambda done, total: loading.report('text', done, total),
                                  **mapped_files)
         from transformers import Qwen3VLProcessor
@@ -227,7 +226,7 @@ class ImageRunner:
             None, placement=_Placement(self), device=self.device, transformer=self.transformer, vae=self.vae,
             text_encoder=text, processor=processor, sample_sigmas=None, vae_tile=True)
         from .qwen_pipeline import load_sample_sigmas
-        self.generator.sample_sigmas = load_sample_sigmas(self.pack_dir / _DIT_FILE)
+        self.generator.sample_sigmas = load_sample_sigmas(self.weights['dit'])
         self.last_plan = None
         loading.finish()
 
@@ -245,7 +244,7 @@ class ImageRunner:
         try:
             from ..system import system_memory
             commit = system_memory().get('commit_available_bytes')
-            copies = sum((self.pack_dir / name).stat().st_size for name in (_DIT_FILE, _TE_FILE, _VAE_FILE))
+            copies = sum(path.stat().st_size for path in self.weights.values())
         except Exception:
             return False
         return commit is not None and commit < copies + COMMIT_FLOOR

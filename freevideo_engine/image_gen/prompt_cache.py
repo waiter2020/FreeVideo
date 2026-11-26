@@ -25,18 +25,18 @@ def reference_key(prompt, images, encoder):
 _OPENED = {}
 
 
-def open_cache(*, encoder, comfy_root, comfy_python, model_paths):
+def open_cache(*, encoder, comfy_root, comfy_python, model_paths, encoder_component=None):
     """The input cache for this installation, or None when its identity cannot be established.
 
     Worked out once per process and set of paths: reading the GPU and hashing the encoder's code costs seconds."""
-    key = (encoder, str(comfy_root), str(comfy_python), str(model_paths))
+    key = (encoder, str(comfy_root), str(comfy_python), str(model_paths), encoder_component)
     if key not in _OPENED:
         _OPENED[key] = _open_cache(encoder=encoder, comfy_root=comfy_root, comfy_python=comfy_python,
-                                   model_paths=model_paths)
+                                   model_paths=model_paths, encoder_component=encoder_component)
     return _OPENED[key]
 
 
-def _open_cache(*, encoder, comfy_root, comfy_python, model_paths):
+def _open_cache(*, encoder, comfy_root, comfy_python, model_paths, encoder_component=None):
     try:
         from .. import tuning
         from ..hardware import detect
@@ -52,7 +52,7 @@ def _open_cache(*, encoder, comfy_root, comfy_python, model_paths):
                 and model_paths and Path(model_paths).resolve() == Path(machine['model_paths']).resolve())
         if not same:
             return None
-        return InputCache(tuning.text_identity(machine, detect()), kind=KIND)
+        return InputCache(tuning.text_identity(machine, detect(), encoder_component=encoder_component), kind=KIND)
     except Exception:
         return None
 

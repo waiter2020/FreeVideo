@@ -74,11 +74,13 @@ class H3Runner:
         except (AttributeError, TypeError):
             return False
 
-    def __init__(self, pack_dir, *, device='cuda', progress=None):
+    def __init__(self, pack_dir, *, device='cuda', progress=None, components=None):
         self.pack_dir = Path(pack_dir)
         self.model_root = self.pack_dir.parent
         self.device = device
-        self.files = files(self.model_root)
+        self.components = components
+        self.files = ({role: Path(row['path']) for role, row in components.items()}
+                      if components else files(self.model_root))
         self.last_plan = None
         self.last_stats = None
         self.kept = None
@@ -116,10 +118,15 @@ class H3Runner:
         if self.kept is None:
             self.kept = h3_pipeline.KeptModels()
         try:
+            selected = self.components['text_encoder'] if self.components else None
             return h3_pipeline.generate(
                 prompt, width, height, seed, reference_images or None, report,
                 (lambda: bool(cancel and cancel())), dit_path=self.files['dit'], vae_path=self.files['vae'],
                 encoder=setup.get('encoder'), comfy_root=setup.get('comfy_root'), comfy_python=setup.get('comfy_python'),
+                encoder_component=('builtin' if selected.get('builtin') else selected['id']) if selected else None,
+                encoder_path=self.files['text_encoder'] if selected else None,
+                vae_sha256=self.components['vae'].get('sha256') if self.components else None,
+                conditioning_cache=not setup.get('smoke'), reference_cache=not setup.get('smoke'),
                 model_paths=setup.get('model_paths'), vram_gib=setup.get('vram_gib'), ram_gib=setup.get('ram_gib'),
                 stats=stats, preview=_previewer(preview), enter=stage, note=note,
                 resident_endpoint=setup.get('resident_endpoint'), kept=self.kept)
@@ -145,8 +152,11 @@ class H3Runner:
         from . import h3_pipeline
         if self.kept is None:
             self.kept = h3_pipeline.KeptModels()
+        setup = setup or {}
         return h3_pipeline.prepare(self.files['dit'], self.files['vae'], kept=self.kept,
-                                   resident_endpoint=(setup or {}).get('resident_endpoint'), should_stop=should_stop)
+                                   resident_endpoint=setup.get('resident_endpoint'), should_stop=should_stop,
+                                   encoder_path=self.files['text_encoder'] if self.components else None,
+                                   comfy_root=setup.get('comfy_root'))
 
     def at_boundary(self):
         return True

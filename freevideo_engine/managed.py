@@ -30,6 +30,11 @@ def command_for(machine, command, arguments):
     if command in ('generate', 'encode', 'plan', 'bench', 'predict'):
         defaults.update(vram_gib=machine.get('vram_gib'), ram_gib=machine.get('ram_gib'))
     given = {argument.split('=', 1)[0] for argument in arguments if argument.startswith('--')}
+    if command in ('generate', 'encode', 'calibrate') and not given & {'--encoder', '--model-paths', '--encoder-component'}:
+        from .encoder_checkpoint import configured_component
+        selected = configured_component(machine)
+        if selected is not None:
+            defaults['encoder_component'] = selected['id']
     # Saved profiles already include budgets; explicit command arguments win.
     if '--profile' in given:
         defaults.pop('vram_gib', None)

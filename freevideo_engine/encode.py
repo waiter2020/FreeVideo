@@ -12,6 +12,7 @@ from .music_request import without_music
 from .paths import comfy_root
 from .policy import choose
 from . import processes
+from .resident_process import ENV as RESIDENT_ENV
 from .system import ram_budget_is_estimate, inference_emergency_floor
 
 
@@ -39,12 +40,20 @@ def run(args):
                 'metrics': str(destination.with_suffix('.encoding.json')),
                 'release_gpu': bool(getattr(args, 'release_gpu', False)),
                 'empty_cache': bool(getattr(args, 'empty_cache', False)),
+                **{name: getattr(args, name) for name in ('readonly_registration', 'extra_reserve_gib')
+                   if hasattr(args, name)},
+                **({'encoder_component': args.encoder_component} if getattr(args, 'encoder_component', None) else {}),
                 **({'h3_image_references': [str(Path(p).resolve()) for p in args.h3_image_references]}
                    if getattr(args, 'h3_image_references', None) else {})}) + '\n', encoding='utf-8')
             env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]),
                        PYTORCH_ALLOC_CONF=policy.allocator_config,
                        PYTORCH_CUDA_ALLOC_CONF=policy.allocator_config,
                        HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', PYTHONUNBUFFERED='1')
+            if hasattr(args, 'resident_endpoint'):
+                if args.resident_endpoint:
+                    env[RESIDENT_ENV] = args.resident_endpoint
+                else:
+                    env.pop(RESIDENT_ENV, None)
             env[LOCK_ENV] = str(descriptor)
             child([args.comfy_python, '-m', 'freevideo_engine.encode_worker', '--request', str(request)],
                   env, descriptor, destination.with_suffix('.encoding.log'), ram_budget_bytes=policy.ram_budget_bytes,

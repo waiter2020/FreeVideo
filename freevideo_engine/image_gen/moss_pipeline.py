@@ -159,14 +159,14 @@ class Kept:
             pass
 
 
-def _encode(module, folder, prompts, device, placement, stats):
+def _encode(module, folder, prompts, device, placement, stats, *, encoder_dir=None):
     """Encode ``prompts`` with the text encoder; returns a list of (embeds, mask) on the CPU."""
     import torch
     from transformers import AutoConfig, AutoModel, AutoTokenizer
     from .layer_stream import DiskLayerStream
     from .staged_weights import layer_key, open_index
     folder = Path(folder)
-    encoder_dir = folder / 'text_encoder'
+    encoder_dir = Path(encoder_dir) if encoder_dir is not None else folder / 'text_encoder'
     tokenizer = AutoTokenizer.from_pretrained(str(folder / 'tokenizer'), local_files_only=True)
     stream = None
     if placement == 'resident':
@@ -205,12 +205,12 @@ def _one(index, key, device):
         return handle.get_tensor(key).to(device)
 
 
-def _build_dit(module, folder, device, placement, keep=0):
+def _build_dit(module, folder, device, placement, keep=0, *, dit_dir=None):
     """The DiT with its non-layer weights on the card; returns (transformer, stream or None)."""
     import torch
     from .layer_stream import DiskLayerStream
     from .staged_weights import layer_key, open_index
-    folder = Path(folder) / 'transformer'
+    folder = Path(dit_dir) if dit_dir is not None else Path(folder) / 'transformer'
     if placement == 'resident':
         transformer = module.MOSSImageTransformer.from_pretrained(
             str(folder), torch_dtype=torch.bfloat16, local_files_only=True).eval().to(device)
@@ -229,7 +229,7 @@ def _build_dit(module, folder, device, placement, keep=0):
 
 
 def generate(prompt, width, height, seed, progress=None, cancel=None, *, folder, vram_gib=None, kept=None,
-             stats=None, steps=STEPS, guidance=GUIDANCE, enter=None):
+             stats=None, steps=STEPS, guidance=GUIDANCE, enter=None, components=None):
     """Return a PIL image. ``progress(stage, done, total)`` stages are encode, denoise, decode."""
     import torch
     progress = progress or (lambda *a: None)
@@ -244,7 +244,8 @@ def generate(prompt, width, height, seed, progress=None, cancel=None, *, folder,
             raise Cancelled()
 
     module = load_module(folder)
-    key = folder_key(folder)
+    key = (tuple((role, row['id'], row.get('sha256')) for role, row in sorted(components.items()))
+           if components else folder_key(folder))
     if kept.key != key:
         kept.close()
         kept.key = key
@@ -257,7 +258,8 @@ def generate(prompt, width, height, seed, progress=None, cancel=None, *, folder,
     if enter is not None:
         enter('encode')
     prompts = [prompt] + ([] if kept.negative is not None else [''])
-    encoded = _encode(module, folder, prompts, device, placement['encoder'], stats)
+    encoder_dir = components['text_encoder']['path'] if components else None
+    encoded = _encode(module, folder, prompts, device, placement['encoder'], stats, encoder_dir=encoder_dir)
     embeds, mask = (e.to(device) for e in encoded[0])
     if kept.negative is None:
         kept.negative = tuple(t.to(device) for t in encoded[1])
@@ -272,13 +274,16 @@ def generate(prompt, width, height, seed, progress=None, cancel=None, *, folder,
     if resident and kept.dit is not None:
         transformer, stream = kept.dit, None
     else:
-        transformer, stream = _build_dit(module, folder, device, placement['dit'], placement.get('keep', 0))
+        dit_dir = components['dit']['path'] if components else None
+        transformer, stream = _build_dit(module, folder, device, placement['dit'], placement.get('keep', 0),
+                                        dit_dir=dit_dir)
         if resident:
             kept.dit = transformer
     stats['dit_load_s'] = round(time.time() - started, 2)
     if kept.vae is None:
         from diffusers import AutoencoderKLFlux2
-        kept.vae = AutoencoderKLFlux2.from_pretrained(str(Path(folder) / 'vae'), torch_dtype=torch.float32,
+        vae_dir = components['vae']['path'] if components else Path(folder) / 'vae'
+        kept.vae = AutoencoderKLFlux2.from_pretrained(str(vae_dir), torch_dtype=torch.float32,
                                                       local_files_only=True).eval().to(device)
         kept.vae.enable_tiling()
     scheduler = module.MOSSImageScheduler()  # the repository's scheduler_config.json holds exactly these defaults

@@ -6,7 +6,8 @@ import torch
 from ..streamed_weights import _open_safetensors
 from .h3_dit import H3Dit
 from .int8_linear import ops
-from .qwen_weights import CONVROT_METADATA, COMFY_ATTENTION_HINT, _assign
+from .qwen_checkpoint import COMFY_ATTENTION_HINT, CONVROT_METADATA
+from .qwen_weights import _assign
 
 
 def _marker(checkpoint, key):

@@ -82,6 +82,20 @@ Restart ComfyUI, open **Workflow → Browse Templates → FreeVideo → FreeVide
 
 To update, run `git pull` in `custom_nodes/FreeVideo` (or update the node in ComfyUI-Manager) and restart ComfyUI.
 
+### Switch models on Windows
+
+After setting up the video engine on a CUDA GPU, open **Settings → Models → Video models**. Search by name or paste a Hugging Face model link. Check the resolved commit, license, and disk requirements before downloading. Once FreeVideo has verified the weights and generated a short test video, select **Use model**. Select the FreeVideo model in the same list to switch back.
+
+Supported repositories provide either the H3 Transformer and VDN-H3 8-step checkpoint (`h3-base/transformer` and `stage-dmd-step-250`), or a compatible FreeVideo FP8 or ConvRot INT8 prepared cache. Third-party prepared caches include the full AdaLN projections. Both routes use the text encoder and video/audio decoders from the current installation.
+
+The same settings page has a **Picture model switching** section. Install a built-in family first, then choose MiniMax H3 Image, Qwen-Image 2.1 Turbo, or MOSS-Image-SFT and check a Hugging Face repository link. FreeVideo imports compatible denoiser weights and uses the installed family's encoder and decoder. The Image workspace shows the active version beside that family. Each family can switch back to its built-in weights independently.
+
+To import a compatible model already on this computer, open FreeVideo directly on the Windows computer with the CUDA installation. Under **Settings → Models**, choose **Import from this computer** in the relevant section. For pictures, select the denoiser `.safetensors` or the MOSS shard index. For videos, select the prepared cache's `manifest.json` or the source folder containing `h3-base` and `stage-dmd-step-250`.
+
+To use native MiniMax H3 weights, choose **Scan ComfyUI H3 folder**. Select a checkpoint and its FL2VA (text or keyframes) or Ref2VA (references) preset. FreeVideo copies the selected checkpoint and any missing shared decoders to Windows. Keep the ComfyUI audio and video VAE files in the model library's `vae` folder. A WSL model directory can be used as the copy source. The preset runs in the local ComfyUI queue and saves the result to Creations. Switch back to FreeVideo for requests that require VDN-specific options.
+
+Review the compatibility result and required space, then select **Copy and verify**. FreeVideo copies the required files into the installation and tries the model when the GPU is idle. After the test passes, select **Use model**. Built-in, Hugging Face, and local models appear in the same installed list. The installed copy works after you move the selected files.
+
 ### Linux
 
 **Desktop:** [Download FreeVideo-Linux-x86_64.AppImage](https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Linux-x86_64.AppImage), make it executable and open it, then follow the same steps as on Windows.

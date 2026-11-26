@@ -30,9 +30,10 @@ def video_files(machine):
 
 
 def encoder_file(machine):
+    from .encoder_checkpoint import configured_encoder_file
     try:
-        path = Path(machine['encoder_model_root']) / 'text_encoders' / machine['encoder']
-    except (KeyError, TypeError):
+        path = configured_encoder_file(machine)
+    except (KeyError, TypeError, ValueError):
         return []
     return [path] if path.is_file() else []
 
@@ -140,6 +141,7 @@ class VideoWarmer:
     def place(endpoint, machine, environment, descriptor, halt):
         from . import resident_process
         from .hardware import detect
+        from .encoder_checkpoint import encoder_options
         from .idle_encoder import place_now
         from .kernel_capabilities import available_backends
         from .policy import choose
@@ -151,8 +153,7 @@ class VideoWarmer:
                         allow_capacity_trial=True)
         environment = dict(environment)
         environment.pop(resident_process.ENV, None)
-        return place_now(endpoint, dict(encoder=machine.get('encoder'), comfy_root=machine.get('comfy_root'),
-                                        model_paths=machine.get('model_paths')),
+        return place_now(endpoint, encoder_options(machine),
                          descriptor=descriptor, environment=environment, directory=Path(endpoint).parent,
                          gpu_budget_bytes=policy.gpu_budget_bytes, ram_budget_bytes=policy.ram_budget_bytes,
                          allocator=policy.allocator_config, limits=dict(system=hardware.system), stop=halt)

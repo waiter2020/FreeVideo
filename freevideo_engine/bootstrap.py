@@ -728,6 +728,17 @@ def plan(args, *, local_progress=None, stage=None):
     model_dir = Path(args.models or saved.get('model_root') or root / 'models' / 'vdn').expanduser().resolve()
     encoder_dir = Path(args.encoder_models or saved.get('encoder_model_root') or prior.get('encoder_dir') or root / 'models' / 'encoder').expanduser().resolve()
     reuse_cache = args.cache.expanduser().resolve() if args.cache else None
+    keep_video_selection = (not args.cache and not getattr(args, 'rebuild_cache', False)
+                            and not getattr(args, 'prefetch_only', False)
+                            and getattr(args, 'model_source', 'prepared') == 'prepared'
+                            and getattr(args, 'prepared_format', 'auto') in (None, 'auto')
+                            and getattr(args, 'only', 'all') == 'all')
+    active_hub_model = saved.get('hf_video_model')
+    if keep_video_selection and active_hub_model:
+        if saved.get('cache'):
+            reuse_cache = Path(saved['cache']).expanduser().resolve()
+        else:
+            errors.append('The selected Hugging Face video model is missing its cache path.')
     own_model = False
     if reuse_cache is None and not getattr(args, 'rebuild_cache', False):
         revision = json.loads((PACKAGE / 'dependencies.json').read_text(encoding='utf-8'))['models']['vdn_revision']
@@ -1008,6 +1019,8 @@ def plan(args, *, local_progress=None, stage=None):
             'dependencies': dependencies,
             'model_dir': str(model_dir), 'encoder_dir': str(encoder_dir),
             'reuse_cache': str(reuse_cache) if reuse_cache else None,
+            'keep_video_selection': keep_video_selection,
+            'hf_video_model': active_hub_model if keep_video_selection else None,
             'prepared_model': prepared, 'sampling_caches': sampling_caches,
             'prepared_format': prepared_format, 'model_scale_granularity': cache_format.get('scale_granularity'),
             'model_source': 'prepared' if prepared else 'existing' if reuse_cache else 'source',
@@ -1222,7 +1235,7 @@ def confirmed(args, value, ask=input, ui=None):
         model_repair.reuse_names(value.get('replace_models', []), reviewed.get('replace_models', []))
         value['replace_models_text'] = {language: model_repair.review_lines(value.get('replace_models', []), zh=language == 'zh')
                                         for language in ('en', 'zh')}
-        keys = ('root', 'engine_version', 'environment_layout', 'model_dir', 'encoder_dir', 'vram_gib', 'ram_gib', 'reuse_cache', 'storage', 'storage_cleanup', 'model_downloader', 'prepared_model', 'prepared_format', 'model_source', 'disk_mode', 'frontend', 'sampling_caches')
+        keys = ('root', 'engine_version', 'environment_layout', 'model_dir', 'encoder_dir', 'vram_gib', 'ram_gib', 'reuse_cache', 'keep_video_selection', 'hf_video_model', 'storage', 'storage_cleanup', 'model_downloader', 'prepared_model', 'prepared_format', 'model_source', 'disk_mode', 'frontend', 'sampling_caches')
         changed = any(reviewed.get(key) != value.get(key) for key in keys)
         changed |= reviewed.get('replace_models', []) != value.get('replace_models', [])
         changed |= reviewed.get('device_backend') != value.get('device_backend')
@@ -1458,6 +1471,8 @@ class Installer:
             shutil.copyfile(previous, self.run_dir / 'machine.before.json')
             saved = read_state(previous)
         self.saved = saved
+        if value.get('keep_video_selection') and saved.get('hf_video_model') != value.get('hf_video_model'):
+            raise ValueError('The active Hugging Face model changed after setup was checked. Check setup again.')
         # Changed PyTorch files (runtime_libraries) stop torch from importing,
         # so no GPU check can pass until the torch step below reinstalls them.
         self.damaged_before = []
@@ -2460,7 +2475,7 @@ class Installer:
 
     def machine_configuration(self, python, encoder_python, comfy, prepared):
         """The complete machine.json written once every setup step has passed."""
-        return {'schema_version': 1, 'root': str(self.root), 'source': str(SOURCE),
+        configuration = {'schema_version': 1, 'root': str(self.root), 'source': str(SOURCE),
             'storage': self.plan.get('storage', 'compact'),
             'disk_mode': self.plan.get('disk_mode', 'normal'),
             'environment_layout': self.layout,
@@ -2482,6 +2497,13 @@ class Installer:
             'model_revision': self.spec['models']['vdn_revision'],
             'prepared_format': self.plan.get('prepared_format', 'fp8'),
             'setup_run': str(self.run_dir), 'ready': True}
+        old_cache, new_cache = self.saved.get('cache'), configuration.get('cache')
+        if (self.saved.get('hf_video_model') and old_cache and new_cache
+                and Path(old_cache).resolve() == Path(new_cache).resolve()):
+            for key in ('hf_video_model', 'hf_video_official'):
+                if key in self.saved:
+                    configuration[key] = self.saved[key]
+        return configuration
 
     def device_configuration(self):
         return {'gpu_uuid': self.plan['inventory']['selected_gpu']['uuid']}

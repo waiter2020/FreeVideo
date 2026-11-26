@@ -916,15 +916,19 @@ def _run(args):
                 if machine_path.is_file():
                     try:
                         machine = json.loads(machine_path.read_text(encoding='utf-8'))
+                        from .encoder_checkpoint import encoder_options, BUILTIN_ENCODER
+                        active_encoder = encoder_options(machine)
+                        requested_encoder = getattr(args, 'encoder_component', None) or BUILTIN_ENCODER
                         same_inputs = (base_cache.resolve() == Path(machine['cache']).resolve()
                             and args.encoder == machine['encoder']
+                            and requested_encoder == active_encoder['encoder_component']
                             and Path(args.comfy_python).absolute() == Path(machine['comfy_python']).absolute()
                             and (args.comfy_root or comfy_root()).resolve() == Path(machine['comfy_root']).resolve()
                             and args.model_paths and args.model_paths.resolve() == Path(machine['model_paths']).resolve())
                         if same_inputs:
                             # The text cache needs only the encoder and its code: no git, no video models.
                             from .input_cache import InputCache
-                            input_cache = InputCache(tuning.text_identity(machine, hardware))
+                            input_cache = InputCache(tuning.text_identity(machine, hardware, encoder_component=requested_encoder))
                             report['input_cache'].update(enabled=True, directory=str(input_cache.root))
                             identity = tuning.identity(machine, hardware)
                             state, reason = tuning.load_state(identity)
@@ -974,6 +978,8 @@ def _run(args):
                             'ram_budget_bytes': round(profile['inference_ram_budget_gb'] * 1e9),
                             'metrics': str(destination.with_suffix('.encoding.json')),
                             'diagnostic_output': str(destination)}
+                if getattr(args, 'encoder_component', None):
+                    encoding['encoder_component'] = args.encoder_component
                 if getattr(args, 'allow_empty_prompt', False):
                     encoding['allow_empty_prompt'] = True
                 if media:
@@ -1008,7 +1014,9 @@ def _run(args):
                         print(json.dumps(dict(event='reference_trimmed', **trimmed)), flush=True)
                 else:
                     try:
-                        preflight_encoder(args.comfy_root or comfy_root(), args.encoder, encoding['model_paths'])
+                        preflight_encoder(args.comfy_root or comfy_root(), args.encoder, encoding['model_paths'],
+                                          **({'encoder_component': encoding['encoder_component']}
+                                             if 'encoder_component' in encoding else {}))
                     except Exception as error:
                         # Only a missing encoder stops the run; the worker stays the judge of anything else.
                         if str(error).startswith('ENCODER_MODEL_MISSING:'):

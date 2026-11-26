@@ -41,6 +41,8 @@ jobs:
       - name: Check CLI, ComfyUI entry and packaged resources
         run: |
           python scripts/check_installation.py
+          python -m unittest discover -s scripts -p 'test_hf_*.py'
+            python -m unittest discover -s scripts -p 'test_local_*.py'
           bash -n setup.sh test.sh freevideo scripts/bootstrap_linux.sh
           ./setup.sh --help
           ./test.sh --help

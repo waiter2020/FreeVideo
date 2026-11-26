@@ -310,7 +310,7 @@ def place_now(endpoint, encoding, *, descriptor, environment, directory, gpu_bud
     for path in (result_path, cancelled):
         path.unlink(missing_ok=True)
     result = dict(state='skipped', scope='Idle GPU encoder weights; no prompt encoding')
-    save(worker_request, dict({k: encoding[k] for k in ('encoder', 'comfy_root', 'model_paths') if k in encoding},
+    save(worker_request, dict({k: encoding[k] for k in ('encoder', 'comfy_root', 'model_paths', 'encoder_component') if k in encoding},
                               idle_preload=True, cancel=str(cancelled), metrics=str(result_path),
                               idle_resources=dict(limits or {}, automatic=True), gpu_budget_gb=gpu_budget_bytes/1e9,
                               ram_budget_bytes=int(ram_budget_bytes)))
@@ -367,7 +367,16 @@ def run(request):
         original = json.loads((Path(previous['artifacts'])/'encode.json').read_text(encoding='utf-8'))
         # Deliberately do not forward text, images, seed or other next-request
         # inputs. Preloading uses only the already validated encoder recipe.
-        encoding = {k: original[k] for k in ('encoder', 'comfy_root', 'model_paths') if k in original}
+        encoding = {k: original[k] for k in ('encoder', 'comfy_root', 'model_paths', 'encoder_component') if k in original}
+        from .encoder_checkpoint import encoder_options, BUILTIN_ENCODER
+        from .paths import data_root
+        machine_path = data_root() / 'machine.json'
+        if machine_path.is_file():
+            machine = json.loads(machine_path.read_text(encoding='utf-8'))
+            active = encoder_options(machine)['encoder_component']
+            if (encoding.get('encoder_component') or BUILTIN_ENCODER) != active:
+                result['reason'] = 'The active H3 text encoder has changed'
+                return result
         profile = previous['profile']
         budget = profile['gpu_budget_gb']*1e9
         if profile.get('benchmark_allocator_limit_bytes') is not None:

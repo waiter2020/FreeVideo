@@ -18,7 +18,9 @@ class NoModelImports(importlib.abc.MetaPathFinder):
 
 def main():
     sys.meta_path.insert(0, NoModelImports())
-    from freevideo_engine import cli, comfy_launcher, comfy_launcher_runtime, modern_launcher
+    from freevideo_engine import (cli, comfy_launcher, comfy_launcher_runtime, hf_image_catalog,
+                                  hf_image_models, hf_video_catalog, hf_video_models, local_image_catalog,
+                                  local_model_copy, local_model_picker, local_video_catalog, modern_launcher)
     from freevideo_engine.desktop_runtime import check_launcher_payload, materialize_source, source_files
 
     spec = importlib.util.spec_from_file_location('freevideo_install_check', ROOT / '__init__.py',
@@ -30,6 +32,10 @@ def main():
     assert (ROOT / entry.WEB_DIRECTORY).is_dir()
     assert callable(cli.main) and callable(comfy_launcher.main)
     assert callable(modern_launcher.main)
+    assert callable(hf_video_catalog.inspect) and callable(hf_video_models.VideoModels)
+    assert callable(hf_image_catalog.inspect) and callable(hf_image_models.ImageModels)
+    assert callable(local_image_catalog.inspect) and callable(local_video_catalog.inspect)
+    assert callable(local_model_picker.select) and callable(local_model_copy.copy_files)
     assert (ROOT / 'freevideo_engine/launcher/Main.qml').is_file()
 
     workflow = json.loads((ROOT / 'example_workflows' / comfy_launcher_runtime.TEMPLATE).read_text(encoding='utf-8'))
@@ -40,6 +46,14 @@ def main():
         payload = check_launcher_payload(source, root)
         assert all((source / path.relative_to(ROOT)).read_bytes() == path.read_bytes()
                    for path in source_files(ROOT))
+        for name in ('freevideo_engine/hf_video_catalog.py', 'freevideo_engine/hf_video_models.py',
+                     'freevideo_engine/hf_image_catalog.py', 'freevideo_engine/hf_image_models.py',
+                     'freevideo_engine/image_gen/qwen_checkpoint.py',
+                     'freevideo_engine/image_gen/variant_smoke.py', 'freevideo_engine/hf_model_jobs.py',
+                     'freevideo_engine/local_image_catalog.py', 'freevideo_engine/local_video_catalog.py',
+                     'freevideo_engine/local_model_copy.py', 'freevideo_engine/local_model_picker.py',
+                     'web/settings_video_models.js'):
+            assert (source / name).is_file(), 'Missing model selector resource: ' + name
         assert not any((source / name).exists() for name in ('benchmarks', 'docs', 'tests', 'AGENTS.md'))
         for name in ('rewriter.py', 'rewriter_setup.py', 'rewriter_models.json'):
             assert not (source / 'freevideo_engine' / name).exists(), 'Retired feature in package: ' + name

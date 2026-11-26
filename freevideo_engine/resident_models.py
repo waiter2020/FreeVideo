@@ -906,6 +906,7 @@ class ModelBank:
                     host_cache_release_supported=can_release_host,
                     memory=memory, gpu_capacity=gpu_capacity,
                     ram_credit_scope='Owned pinned model storage and parked engine weights; deduplicated, reclaimable on eviction. No mapped-page or swap credit; commit only for private storage.',
-                    gpu_uuid=uuid, models=[dict(role=role, gpu_bytes=gpu_bytes(entry['model']))
+                    gpu_uuid=uuid, models=[dict(role=role, gpu_bytes=gpu_bytes(entry['model']),
+                                                **({'identity': entry['identity']} if role == 'encoder' else {}))
                                            for role, entry in self.entries.items()], decisions=self.decisions,
                     evictions=list(self.evictions), preloads=list(self.preloads))

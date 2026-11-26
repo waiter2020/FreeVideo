@@ -20,11 +20,12 @@ def folder(model_root):
 class MossRunner:
     full_card = False
 
-    def __init__(self, pack_dir, *, device='cuda', progress=None):
+    def __init__(self, pack_dir, *, device='cuda', progress=None, components=None):
         self.pack_dir = Path(pack_dir)
         self.model_root = self.pack_dir.parent
         self.device = device
         self.folder = folder(self.model_root)
+        self.components = components
         self.last_plan = None
         self.last_stats = None
         self.kept = None
@@ -55,7 +56,7 @@ class MossRunner:
         try:
             return moss_pipeline.generate(
                 prompt, width, height, seed, report, (lambda: bool(cancel and cancel())), folder=self.folder,
-                vram_gib=setup.get('vram_gib'), kept=self.kept, stats=stats, enter=stage)
+                vram_gib=setup.get('vram_gib'), kept=self.kept, stats=stats, enter=stage, components=self.components)
         except moss_pipeline.Cancelled:
             raise InterruptedError('cancelled') from None
         finally:

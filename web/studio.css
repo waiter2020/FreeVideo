@@ -1,6 +1,7 @@
 .fv-studio{box-sizing:border-box;position:fixed;inset:0;margin:auto;width:calc(100vw - 32px);height:calc(100dvh - 32px);max-width:none;max-height:none;padding:0;color:var(--fv-ink);background:var(--fv-bg);border:1px solid var(--fv-border);border-radius:var(--fv-r-lg);box-shadow:0 32px 110px #0008;font:14px/1.6 var(--fv-font);overflow:hidden;color-scheme:dark}
 .fv-studio::backdrop{background:#070a0db8;backdrop-filter:blur(8px)}
 .fv-studio *{box-sizing:border-box}.fv-studio [hidden]{display:none!important}
+.fv-studio[data-comfy-h3=true] :is(.fv-length-controls,.fv-length-plan,.fv-length-hint,.fv-length-model,.fv-range,.fv-request-assets){display:none!important}
 .fv-studio button,.fv-studio input,.fv-studio select,.fv-studio textarea{font:inherit}
 .fv-studio button,.fv-studio a{transition:background .2s,border-color .2s,color .2s,box-shadow .2s,transform .2s}
 .fv-studio button{cursor:pointer}.fv-studio button:disabled{opacity:.45;cursor:default}

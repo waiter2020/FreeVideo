@@ -221,6 +221,11 @@ def bootstrap_baseline(spec, machine, expected, destination, seconds, env, ui):
         '--out', str(case / 'video.mp4'), '--seed', str(spec['seed']),
         '--width', str(canvas['width']), '--height', str(canvas['height']), '--frames', str(canvas['frames']),
         '--attention', spec['attention'], '--no-tuning', '--no-two-pass']
+    if not preencoded:
+        from .encoder_checkpoint import configured_component
+        selected = configured_component(machine)
+        if selected is not None:
+            command += ['--encoder-component', selected['id']]
     for key in ('vram_gib', 'ram_gib'):
         if machine.get(key) is not None:
             command += ['--' + key.replace('_', '-'), str(machine[key])]

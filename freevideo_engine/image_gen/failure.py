@@ -10,9 +10,7 @@ import traceback
 
 from .. import __version__
 from ..disk_space import ran_out
-from .image_model import H3, QWEN
-
-MODEL_IDS = (H3, QWEN)
+from .image_model import MODELS
 from ..exit_diagnostics import clean_reading, clean_sample, clean_memory_during_request
 from ..diagnostic_resources import commit_exhausted
 from ..failure_details import Redactor
@@ -20,6 +18,7 @@ from .loras import ERRORS as LORA_ERRORS, MESSAGE_ZH as LORA_MESSAGE_ZH
 
 
 ERRORS = frozenset(('no_memory', 'small_memory', 'busy_video', 'busy', 'pack_missing', 'model_unavailable', 'model_unreadable',
+                    'model_component_unavailable',
                     'device_unavailable', 'worker_exit', 'timeout', 'cancelled', 'disk_full',
                     'invalid_request', 'invalid_prompt', 'invalid_dimensions', 'invalid_seed', 'too_many_images', 'output_unwritable',
                     'invalid_media', 'invalid_points', 'segment_not_installed', 'generation_failed')) | LORA_ERRORS
@@ -37,6 +36,7 @@ MESSAGE_ZH = {
     'pack_missing': '请先在启动器里下载“图像生成模型”。',
     'model_unavailable': '这台电脑不支持所选的图片模型。请改用 Qwen-Image 2.1。',
     'model_unreadable': '图像生成模型的文件读不出来。在启动器里修复后再试。',
+    'model_component_unavailable': '所选图片模型部件缺失或已更改。请在设置中重新导入或选择可用部件。',
     'device_unavailable': '显卡暂时用不了，稍后再试。',
     'worker_exit': '图像生成意外停止了，请再试一次。',
     'timeout': '这一张用时太长，已停止。请再试一次。',
@@ -119,6 +119,8 @@ def classify_exception(error, *, stage='start', cancelled=False):
         if _DEVICE.search(str(item)) or type(item).__name__ == 'DeferredCudaCallError' or cuda_init:
             return 'device_unavailable'
     for item in chain:
+        if type(item).__name__ == 'ComponentError':
+            return 'model_component_unavailable'
         model_frame = any(frame.f_globals.get('__name__') in (
             'freevideo_engine.image_gen.qwen_weights', 'freevideo_engine.image_gen.qwen_te_weights',
             'freevideo_engine.streamed_weights') for frame, _ in traceback.walk_tb(item.__traceback__))
@@ -181,6 +183,26 @@ def safe_plan(value, redactor):
     return {field.name: clean(value[field.name], redactor) for field in fields(ImagePlan) if field.name in value}
 
 
+def component_facts(value):
+    """Read only the public identity of the components that the worker resolved."""
+    if not isinstance(value, dict):
+        return {}
+    facts = {}
+    for role in ('dit', 'text_encoder', 'vae'):
+        row = value.get(role)
+        if not isinstance(row, dict):
+            continue
+        identity, label, digest = (row.get(key) for key in ('id', 'label', 'sha256'))
+        if not isinstance(identity, str) or not re.fullmatch(r'[a-z0-9_:-]{1,96}', identity):
+            continue
+        facts[role] = {'id': identity}
+        if isinstance(label, str):
+            facts[role]['label'] = label.replace('\\', '/').rsplit('/', 1)[-1][:200]
+        if isinstance(digest, str) and re.fullmatch(r'[a-f0-9]{64}', digest):
+            facts[role]['sha256'] = digest
+    return facts
+
+
 def exception_details(error, redactor, code):
     # Stack locations without source lines or locals: neither can safely enter a report.
     trace, seen = [], set()
@@ -238,6 +260,7 @@ class Context:
         self.machine = {}
         self.plan = None
         self.pack = None
+        self.components = {}
         self.start_memory = None
         # The card as the admission check read it (memory_budget): numbers only.
         self.gpu_reading = {}
@@ -284,8 +307,8 @@ class Context:
         if self.kind in ('generate', 'edit', 'cast'):
             self.kind = value.get('kind') if value.get('kind') in ('generate', 'edit', 'cast') else ('edit' if references else 'generate')
         self.request = dict(references=references)
-        # Which model was asked for: one of the two fixed ids, never free text.
-        if value.get('model') in MODEL_IDS:
+        # Which model family was asked for, never free text.
+        if value.get('model') in MODELS:
             self.request['model'] = value['model']
         for key in ('width', 'height', 'steps', 'seed'):
             item = value.get(key)
@@ -360,6 +383,8 @@ class Context:
         # Macs only: which attention kernel ran and why it left MLX (mlx_attention.summary).
         attention = row.get('attention')
         extra = dict(attention=clean(attention, self.redactor)) if isinstance(attention, dict) else {}
+        if self.components:
+            extra['components'] = self.components
         if isinstance(forecast, dict):
             extra['forecast'] = {key: value for key, value in forecast.items() if key in ('basis', 'typical_seconds', 'predicted') and clean(value, self.redactor) is not None}
         return dict(schema='freevideo.image-report', schema_version=1, **extra,

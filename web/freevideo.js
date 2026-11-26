@@ -990,7 +990,13 @@ app.registerExtension({
             return;
         }
         if (!["FreeVideoMedia", "FreeVideoGenerate", "FreeVideoLoRAStack"].includes(nodeData.name)) return;
-        if (nodeData.name === "FreeVideoGenerate") nodeType.prototype.freevideoStarterPrompt = nodeData.input?.required?.text?.[1]?.default || '';
+        if (nodeData.name === "FreeVideoGenerate") {
+            nodeType.prototype.freevideoStarterPrompt = nodeData.input?.required?.text?.[1]?.default || '';
+            const inputs = nodeData.input?.optional;
+            if (inputs) {
+                for (const name of ['native_h3_preset', 'native_h3_error', 'native_h3_video']) delete inputs[name];
+            }
+        }
         if (nodeData.name !== "FreeVideoLoRAStack") {
             const configured = nodeType.prototype.onConfigure;
             nodeType.prototype.onConfigure = function (...args) { const result = configured?.apply(this, args); localizeNode(this); return result; };

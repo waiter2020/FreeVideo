@@ -14,6 +14,56 @@ from contextlib import contextmanager
 
 
 PACKAGE = Path(__file__).resolve().parent
+ACTIVE_ENCODER = object()
+BUILTIN_ENCODER = 'builtin'
+
+
+def configured_component(machine, identity=ACTIVE_ENCODER):
+    """Resolve the managed H3 encoder shared by pictures and video."""
+    if identity in (None, '', BUILTIN_ENCODER) or identity is ACTIVE_ENCODER and not machine.get('root'):
+        return None
+    from .image_components import shared_encoder
+    if identity is ACTIVE_ENCODER:
+        return shared_encoder(machine)
+    selected = shared_encoder(machine, identity=identity)
+    if selected is None:
+        raise ValueError('The selected H3 text encoder is unavailable. Select an installed encoder in Settings.')
+    return selected
+
+
+def configured_encoder_file(machine, identity=ACTIVE_ENCODER):
+    selected = configured_component(machine, identity)
+    if selected is not None:
+        return Path(selected['path'])
+    return Path(machine['encoder_model_root']) / 'text_encoders' / machine['encoder']
+
+
+def encoder_options(machine):
+    selected = configured_component(machine)
+    return dict(encoder=machine.get('encoder'), comfy_root=machine.get('comfy_root'),
+                model_paths=machine.get('model_paths'), encoder_component=selected['id'] if selected else BUILTIN_ENCODER)
+
+
+def encoder_resident_key(path, comfy_root):
+    from .adaln_assets import digest
+    from .long_paths import io_path, plain
+    from .storage import fingerprint
+    path = io_path(Path(path)).resolve()
+    checkpoint = dict(path=plain(path), stamp=fingerprint(path))
+    return digest(dict(file=checkpoint, library=plain(Path(comfy_root).resolve()), type='MINIMAX'))
+
+
+def resolve_request_encoder(folder_paths, name, component_id=None):
+    if component_id in (None, '', BUILTIN_ENCODER):
+        return resolve_encoder(folder_paths, name)
+    from .long_paths import io_path
+    from .paths import data_root
+    machine = json.loads(io_path(data_root() / 'machine.json').read_text(encoding='utf-8'))
+    selected = configured_component(machine, component_id)
+    path = io_path(Path(selected['path']))
+    return str(path), dict(state='read_only_mmap' if sys.platform == 'win32' else 'native_mmap',
+                           bytes=path.stat().st_size, component_id=selected['id'],
+                           component_label=selected['label'], component_sha256=selected['sha256'])
 
 
 def resolve_encoder(folder_paths, name):
@@ -62,7 +112,7 @@ def resolve_encoder(folder_paths, name):
     return path, checkpoint
 
 
-def preflight_encoder(root, name, model_paths=None):
+def preflight_encoder(root, name, model_paths=None, *, encoder_component=None):
     """Use the worker's native path configuration without importing its tensor runtime."""
     previous = list(sys.path)
     sys.path.insert(0, str(Path(root).resolve()))
@@ -72,7 +122,7 @@ def preflight_encoder(root, name, model_paths=None):
         if model_paths:
             load_extra_path_config(str(model_paths))
         try:
-            return resolve_encoder(folder_paths, name)
+            return resolve_request_encoder(folder_paths, name, encoder_component)
         except FileNotFoundError as error:
             raise FileNotFoundError(
                 "ENCODER_MODEL_MISSING: Model in folder 'text_encoders' with filename '%s' not found. "

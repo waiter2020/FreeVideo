@@ -12,7 +12,7 @@ import sys
 import time
 from .monitoring import save
 from .processes import worker_signals
-from .encoder_checkpoint import resolve_encoder
+from .encoder_checkpoint import encoder_resident_key, resolve_request_encoder
 
 
 def encoder_on_gpu(clip):
@@ -408,15 +408,17 @@ def _encode(args, request, resident, trace):
     from freevideo_engine.conditioning import to_cache
     phase('encoder_lookup')
     name = request.get('encoder', 'qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors')
-    path, loading['checkpoint'] = resolve_encoder(folder_paths, name)
+    path, loading['checkpoint'] = resolve_request_encoder(folder_paths, name, request.get('encoder_component'))
+    checkpoint = loading['checkpoint']
+    loading['text_encoder'] = ({key: checkpoint[f'component_{key}'] for key in ('id', 'label', 'sha256')}
+                               if 'component_id' in checkpoint else {'id': 'builtin', 'label': name})
     print(json.dumps({'event': 'encoder_cache_lookup', 'encoder': name}), flush=True)
     phase('encoder_load')
     # Same native loader and model type as CLIPLoader; CPU initialization prevents
     # eager full-GPU loading before the native memory planner runs.
     clip = None
     if resident is not None:
-        from .resident_models import file_identity, key
-        encoder_key = key(dict(file=file_identity(path), library=str(args.comfy_root.resolve()), type='MINIMAX'))
+        encoder_key = encoder_resident_key(path, args.comfy_root)
         clip = resident.take('encoder', encoder_key)
         estimated = Path(path).stat().st_size * 1.4 + 2*2**30
         if not idle and clip is None:

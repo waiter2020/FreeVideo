@@ -236,11 +236,11 @@ dialog.fv-set .st-label{display:block;margin:0 0 var(--fv-sp-12)}
 dialog.fv-set .st-label>span{display:block;margin-bottom:var(--fv-sp-8);font-size:var(--fv-fs-1);font-weight:var(--fv-fw-2);color:var(--fv-fg2)}
 dialog.fv-set .st-field{display:flex;align-items:center;min-height:var(--fv-ctl);padding:0 var(--fv-sp-12);border-radius:var(--fv-rad-ctl);background:var(--fv-ctl-bg);box-shadow:inset 0 0 0 1px var(--fv-line)}
 dialog.fv-set .st-field:focus-within{box-shadow:inset 0 0 0 1px var(--fv-accent-line),0 0 0 3px var(--fv-accent-soft)}
-dialog.fv-set .st-field :is(input,textarea){flex:1;min-width:0;width:100%;border:0;outline:0;background:none;color:var(--fv-fg);font:inherit;font-size:var(--fv-fs-2);padding:0}
+dialog.fv-set .st-field :is(input,textarea,select){flex:1;min-width:0;width:100%;border:0;outline:0;background:none;color:var(--fv-fg);font:inherit;font-size:var(--fv-fs-2);padding:0}
 dialog.fv-set .st-field.is-area{padding:var(--fv-sp-8) var(--fv-sp-12)}
 dialog.fv-set .st-field textarea{resize:vertical;line-height:var(--fv-lh-2)}
 dialog.fv-set .st-field.mono :is(input,textarea){font-family:var(--fv-font-mono);font-size:var(--fv-fs-1)}
-dialog.fv-set .st-field :is(input,textarea):disabled{opacity:.5}
+dialog.fv-set .st-field :is(input,textarea,select):disabled{opacity:.5}
 dialog.fv-set .st-field input::placeholder{color:var(--fv-fg3)}
 /* bars: transform only */
 dialog.fv-set .st-bar{position:relative;height:4px;border-radius:var(--fv-rad-xs);background:var(--fv-line2);overflow:hidden}
@@ -323,6 +323,15 @@ dialog.fv-set .st-detail{margin:0;font-size:var(--fv-fs-1);line-height:var(--fv-
 dialog.fv-set .st-mrow{height:var(--fv-sp-64);padding-top:0;padding-bottom:0}
 dialog.fv-set .st-mrow>.st-mbar{position:absolute;left:60px;right:var(--fv-sp-16);bottom:0;height:2px;border-radius:var(--fv-r-xs)}
 dialog.fv-set .st-mrow .st-re .st-btn{min-width:72px}
+dialog.fv-set .st-video-model-actions{flex-wrap:wrap}
+dialog.fv-set .st-video-model-results{padding-top:0;padding-bottom:0}
+dialog.fv-set .st-video-model-comfy{margin-top:var(--fv-sp-12)}
+dialog.fv-set .st-video-model-comfy .st-field{min-width:6em}
+dialog.fv-set .st-video-model-comfy .st-rt b{overflow-wrap:anywhere}
+dialog.fv-set :is(.st-video-model-results,.st-video-model-variants)>.st-row{padding-inline:0}
+dialog.fv-set :is(.st-video-model-results,.st-video-model-variants)>.st-row+.st-row{border-top:1px solid var(--fv-line)}
+dialog.fv-set .st-facts.st-video-model-facts dd{white-space:normal;overflow-wrap:anywhere;font-size:var(--fv-fs-2)}
+dialog.fv-set .st-video-model-facts a{color:var(--fv-accent-ink);text-decoration:underline}
 
 /* ── The plan sheet (g3, modal over the room) ── */
 dialog.fv-set .st-dlg{position:fixed;inset:0;margin:auto;width:min(600px,calc(100vw - 2 * var(--st-gap)));height:fit-content;max-height:calc(100dvh - 2 * var(--fv-sp-32));padding:0;

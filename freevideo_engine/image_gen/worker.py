@@ -11,7 +11,7 @@ import threading
 import time
 
 from . import keep
-from .failure import Context, classify_exception, exception_details, host_memory_shortage, safe_plan
+from .failure import Context, classify_exception, component_facts, exception_details, host_memory_shortage, safe_plan
 from .step_preview import LIMIT as PREVIEW_LIMIT
 
 
@@ -281,24 +281,35 @@ def idle_wait(runner, requested, idle_seconds, *, at_least=0.):
         return idle_seconds, None
 
 
-def load_runner(pack_dir, device, *, progress=None):
+def load_runner(pack_dir, device, *, progress=None, components=None):
     # Importing this module in ComfyUI or in CPU protocol tests never loads torch.
     from .image_runner import ImageRunner
-    return ImageRunner(pack_dir, device=device, progress=progress)
+    return ImageRunner(pack_dir, device=device, progress=progress, components=components)
 
 
-def load_h3_runner(pack_dir, device, *, progress=None):
+def load_h3_runner(pack_dir, device, *, progress=None, components=None):
     from .h3_runner import H3Runner
-    return H3Runner(pack_dir, device=device, progress=progress)
+    return H3Runner(pack_dir, device=device, progress=progress, components=components)
 
 
-def load_moss_runner(pack_dir, device, *, progress=None):
+def load_moss_runner(pack_dir, device, *, progress=None, components=None):
     from .moss_runner import MossRunner
-    return MossRunner(pack_dir, device=device, progress=progress)
+    return MossRunner(pack_dir, device=device, progress=progress, components=components)
+
+
+def runner_source(pack_dir, model, engine_root):
+    if engine_root is None:
+        return pack_dir, (model, pack_dir), None
+    from ..image_components import resolve
+    from ..long_paths import io_path
+
+    machine = json.loads(io_path(Path(engine_root) / 'machine.json').read_text(encoding='utf-8'))
+    resolved = resolve(dict(machine, root=str(engine_root)), model)
+    return Path(resolved['pack']), (model, resolved['identity']), resolved['components']
 
 
 def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None, factory=None, h3_factory=None,
-          moss_factory=None, server_root=None, lock_path=None):
+          moss_factory=None, server_root=None, lock_path=None, engine_root=None):
     global SERVER_ROOT, LOCK_PATH
     SERVER_ROOT = server_root
     LOCK_PATH = lock_path
@@ -345,14 +356,16 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
                     try:
                         if load:
                             held.enter_context(lease())
+                            model_pack, model_identity, components = runner_source(pack_dir, model, engine_root)
                         # A light warm-up only reads files ahead: it neither loads nor drops a model.
-                        if load and runner is not None and runner_model != model:
+                        if load and runner is not None and runner_model != model_identity:
                             runner = drop(runner)
                             release_memory()
                         if load and runner is None:
                             # No progress rows: nothing on the page is waiting for this.
-                            runner = factories.get(model, factory)(pack_dir, device)
-                            runner_model = model
+                            options = {'components': components} if components is not None else {}
+                            runner = factories.get(model, factory)(model_pack, device, **options)
+                            runner_model = model_identity
                         warm_up(runner, value, should_stop, send)
                     except Exception as error:
                         print('image worker warm-up failed: %s' % type(error).__name__, file=sys.stderr, flush=True)
@@ -376,14 +389,18 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
                         send(phase='progress', stage=stage, fraction=fraction)
 
                     model = value.get('model') or 'qwen-image-2.1-turbo'
-                    if runner is not None and runner_model != model:
+                    context.timing.enter('load')
+                    model_pack, model_identity, components = runner_source(pack_dir, model, engine_root)
+                    if components is not None:
+                        send(phase='model', components=component_facts(components))
+                    if runner is not None and runner_model != model_identity:
                         # One model's weights at a time on the card.
                         runner = drop(runner)
                         release_memory()
                     if runner is None:
-                        context.timing.enter('load')
-                        runner = factories.get(model, factory)(pack_dir, device, progress=progress)
-                        runner_model = model
+                        options = {'components': components} if components is not None else {}
+                        runner = factories.get(model, factory)(model_pack, device, progress=progress, **options)
+                        runner_model = model_identity
                     if hasattr(runner, 'last_plan'):
                         runner.last_plan = None
                     context.timing.enter('start')
@@ -467,6 +484,8 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
                 result = dict(phase='error', code=code, stage=context.timing.stage, reloaded=reload,
                               seconds=context.timing.seconds(), stages=context.timing.snapshot(), plan=plan,
                               error=exception_details(error, context.redactor, code))
+                if code == 'model_component_unavailable' and getattr(error, 'role', None) in ('dit', 'text_encoder', 'vae'):
+                    result['component'] = error.role
                 if code == 'no_memory' and host_memory_shortage(error):
                     result['memory'] = 'host'
                 try:
@@ -528,6 +547,7 @@ def main():
                         help='server mode: the process the server starts from (its tree is not "another program")')
     parser.add_argument('--lock-path', type=Path, default=None,
                         help='server mode: the GPU lease file the worker takes for each picture and model load')
+    parser.add_argument('--engine-root', type=Path, help='Read active image profiles from the installation.')
     args = parser.parse_args()
     if args.server_root is not None and args.server_root <= 0:
         parser.error('--server-root must be a process id')
@@ -552,7 +572,7 @@ def main():
         except OSError as error:
             print('private stdin unavailable, reading stdin directly: %s' % error, file=sys.stderr, flush=True)
     serve(args.pack_dir, device=args.device, idle_seconds=args.idle_seconds, stream=stream,
-          server_root=args.server_root, lock_path=args.lock_path)
+          server_root=args.server_root, lock_path=args.lock_path, engine_root=args.engine_root)
     return 0
 
 

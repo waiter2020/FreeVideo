@@ -245,6 +245,8 @@ def environment(machine):
 
 
 def command_for(machine, case, destination, args):
+    from .encoder_checkpoint import configured_component
+
     command = [machine['python'], '-m', 'freevideo_engine', 'generate', '--prompt-file', str(destination / 'prompt.txt'),
         '--cache', machine['cache'], '--base', machine['base'], '--checkpoint', machine['checkpoint'],
         '--encoder-python', machine['comfy_python'], '--encoder-root', machine['comfy_root'],
@@ -252,6 +254,9 @@ def command_for(machine, case, destination, args):
         '--out', str(destination / 'video.mp4'), '--seed', str(case.get('seed', 2026090901)),
         '--width', str(case.get('width', 1344)), '--height', str(case.get('height', 768)),
         '--attention', args.attention]
+    selected = configured_component(machine)
+    if selected is not None:
+        command += ['--encoder-component', selected['id']]
     if getattr(args, 'no_tuning', False):
         command.append('--no-tuning')
     if case.get('seconds') is not None:

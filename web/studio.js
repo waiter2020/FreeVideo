@@ -44,7 +44,8 @@ import { createFrameChip, createFrameIcon, createPopChip } from './glass/frame_p
 import { createWarm } from './studio_warm.js';
 import { attach as attachPlayer } from './glass/player_bar.js';
 import { framesOf, savedPrompt } from './result_reuse.js';
-import { addVideoLabel, addVideoModel, missingVideoText, videoModelState } from './video_model.js';
+import { activeVideoModel, addVideoLabel, addVideoModel, applyVideoModelSnapshot, COMFY_H3_SAMPLING,
+    missingVideoText, VIDEO_MODEL_CHANGED, videoModelState } from './video_model.js';
 import { createPromptEnhancer } from './prompt_enhance.js';
 import { requestText, shownRewrite } from './prompt_sections.js';
 import { createRequestAssets, enabledLoras, referenceFiles } from './request_assets.js';
@@ -755,6 +756,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     // modal is above them and must remain interactive when the launcher reopens it.
     dialog.style.pointerEvents = 'auto';
     current = {node, dialog}; const cleanup = [];
+    let videoModel, comfyH3Model = null;
     let firstStart = null, exampleFocused = false;
     // The console (studio_console.js) is put together once every control exists; until then nothing reads it.
     let consoleUI = null, promptLibrary = null, reverseKey = null, reversePick = null;
@@ -1438,7 +1440,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
         // A saved workflow that already uses it with other steps is shown as custom and left unchanged.
         const onePassLevel = !twoPass.checked && !baseLinked && Boolean(effortFor(Number(baseSteps.value), false, Number(refineSteps.value), stepCacheNow(), effort.levels()));
         const unavailable = Number(baseSteps.value) !== 8 && !twoPass.checked && !onePassLevel;
-        twoPass.disabled = Boolean(extension.source) || unavailable || linked(node, 'two_pass') || !widget(node, 'two_pass');
+        twoPass.disabled = Boolean(comfyH3Model || extension.source) || unavailable || linked(node, 'two_pass') || !widget(node, 'two_pass');
         twoPassStatus.textContent = Number(baseSteps.value) !== 8 && !onePassLevel ? t('Needs 8 first-pass steps', '一采需 8 步') : '';
         twoPassLabel.classList.toggle('fv-two-pass-unavailable', unavailable);
         // A preview stops after the first pass, so it needs two-pass sampling.
@@ -1450,11 +1452,11 @@ export function openStudio(node, {extendFrom = null} = {}) {
             previewFirst.checked = false; set(node, 'preview', false);
             if (runButtonReady) updateRunButton();
         }
-        previewFirst.disabled = !twoPass.checked || previewStepsWrong() || linked(node, 'preview') || !widget(node, 'preview');
+        previewFirst.disabled = Boolean(comfyH3Model) || !twoPass.checked || previewStepsWrong() || linked(node, 'preview') || !widget(node, 'preview');
         blockOriginal('preview', previewFirst.checked && !previewFirst.disabled, {release() { choosePassMode('on'); return ['Preview first was turned off for "Use as is".', '已为“原样使用”关闭“先出预览”。']; }});
         syncPassMode();
-        baseSteps.disabled = baseLinked || !widget(node, 'base_steps') || Boolean(extension.source);
-        refineSteps.disabled = !twoPass.checked || linked(node, 'refine_steps') || !widget(node, 'refine_steps') || Boolean(extension.source);
+        baseSteps.disabled = baseLinked || !widget(node, 'base_steps') || Boolean(comfyH3Model || extension.source);
+        refineSteps.disabled = !twoPass.checked || linked(node, 'refine_steps') || !widget(node, 'refine_steps') || Boolean(comfyH3Model || extension.source);
         baseSteps.min = twoPass.checked ? '2' : '1';
         refineSteps.max = baseLinked ? '31' : String(Math.max(3, Math.min(31, Number(baseSteps.value || 8) - 1)));
         refineSteps.setCustomValidity(twoPass.checked && !baseLinked && !refineSteps.disabled && Number(refineSteps.value) !== 3 && Number(refineSteps.value) >= Number(baseSteps.value)
@@ -1483,6 +1485,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
         return level?.name === 'Medium' ? t('A continuation uses the Medium level.', '接着生成使用标准档。') : t('A continuation uses the Light level.', '接着生成使用轻量档。');
     }
     function showEffortEstimate(steps = Number(baseSteps.value), twoPassPlan = twoPass.checked, cache = stepCacheNow(), factor = upscaleNow()) {
+        if (comfyH3Model) return;
         effort.setWarning('');
         const parts = lengthControl.plan?.count > 1 ? t(`${lengthControl.plan.count} parts`, `分 ${lengthControl.plan.count} 段`) : '';
         // A request that fits one run keeps its own estimate while the longest run is unknown.
@@ -1524,6 +1527,13 @@ export function openStudio(node, {extendFrom = null} = {}) {
         effort.setEstimate(`${t('~', '约 ')}${low}–${high} ${unit}${extra}`);
     }
     function refreshEffortEstimate(force = false) {
+        if (comfyH3Model) {
+            clearTimeout(effortEstimateTimer);
+            effortEstimateRequest?.abort();
+            requestAssetsQuery = null;
+            requestAssets.refresh();
+            return;
+        }
         capabilityView?.update();
         let task = 'external';
         let requestRefs = [];
@@ -2340,7 +2350,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
         const parts = (effort?.element?.querySelector('.fv-effort-estimate')?.textContent || '').trim().split(' · ').filter(Boolean);
         keySetup = parts.some(setupPart);
         // A preview has no estimate of its own (the figures are for the whole two-pass run), so the line stays empty rather than show the wrong time.
-        const estimate = keyShowsEta && !(previewFirst.checked && !previewFirst.disabled) ? parts.filter(part => !setupPart(part)).join(' · ') : '';
+        const estimate = keyShowsEta && !comfyH3Model && !(previewFirst.checked && !previewFirst.disabled) ? parts.filter(part => !setupPart(part)).join(' · ') : '';
         if (keyEta.textContent !== estimate) keyEta.textContent = estimate;
         // Kept in place when empty (not hidden), so the label above it never moves.
         keyEta.dataset.empty = String(!estimate);
@@ -2367,7 +2377,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     liftMenu(keyMore, keyMenu);
     const syncKeyMore = () => {
         const state = passState();
-        keyMore.hidden = runMode !== 'single' || videoMissing || Boolean(state.hidden.preview) || Boolean(extension.source);
+        keyMore.hidden = runMode !== 'single' || videoMissing || Boolean(comfyH3Model || state.hidden.preview || extension.source);
         for (const b of keyChoices) setAttr(b, 'aria-pressed', String((b.dataset.choice === 'preview') === (state.mode === 'preview')));
         keyChoices[1].disabled = state.disabled.preview && !(state.mode === 'preview');
         keyMenuWhy.hidden = !previewStepsWrong(); keyMenuWhy.textContent = keyMenuWhy.hidden ? '' : previewNeedsSteps();
@@ -2379,6 +2389,8 @@ export function openStudio(node, {extendFrom = null} = {}) {
     let videoMissing = false;
     const addVideoNote = el('p', '', 'fv-add-video-note'); addVideoNote.hidden = true;
     addVideoNote.setAttribute('role', 'status');
+    const comfyH3Notice = el('p', '', 'fv-muted'); comfyH3Notice.hidden = true;
+    comfyH3Notice.setAttribute('role', 'status');
     // A length the device cannot make greys the main button: the reason and the next step are said beside it, not only on hover.
     const lengthWhy = el('p', '', 'fv-length-why'); lengthWhy.hidden = true;
     lengthWhy.setAttribute('role', 'status');
@@ -2500,7 +2512,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     function updateRunButton() {
         const submitting = capturing || queueState?.submitting;
         updateFirstFrame();
-        const multiple = lengthControl.plan?.count > 1;
+        const multiple = !comfyH3Model && lengthControl.plan?.count > 1;
         // A long/continued video temporarily uses one run. Keep the user's mode
         // preference so returning to a short video and reloading show the same choice.
         runMode = multiple || extension.source ? 'single'
@@ -2513,7 +2525,8 @@ export function openStudio(node, {extendFrom = null} = {}) {
             ? t('Joining the parts…', '正在接合各段…')
             : chain?.state === 'queued' ? (chain.waiting ? waitingText(chain.waiting, t) : t('Queued…', '排队中…'))
             : t(`Generating part ${position.index + 1}…`, `正在生成第 ${position.index + 1} 段…`);
-        generate.disabled = submitting || chainWait || (lengthControl.blocked && !lengthControl.retryable) || (runMode === 'loop' && queueState?.looping) || enhancer.reversing;
+        generate.disabled = submitting || chainWait || (!comfyH3Model && lengthControl.blocked && !lengthControl.retryable)
+            || (runMode === 'loop' && queueState?.looping) || enhancer.reversing;
         paintReverse?.();
         // Planning the parts and adding a batch are different waits; a count is only shown when the queue really has one.
         const adding = queueState?.batch ? t(`Adding ${Math.min(queueState.batch.done + 1, queueState.batch.total)}/${queueState.batch.total}…`,
@@ -2540,15 +2553,15 @@ export function openStudio(node, {extendFrom = null} = {}) {
             : runMode === 'loop' ? t(...TIPS['studio.mode.loop'].use)
             : busy ? t('Starts when the current video finishes', '当前视频完成后自动开始')
             // Why the key makes no preview although the saved settings asked for one (a reason is read only on a greyed key).
-            : previewHeld() && previewStepsWrong() ? previewNeedsSteps()
+            : !comfyH3Model && previewHeld() && previewStepsWrong() ? previewNeedsSteps()
             : (borrowed ? borrowed.previews?.() : previewFirst.checked && !previewFirst.disabled) ? t(...TIPS['studio.twoPass.preview'].use) : t(...TIPS['studio.generate'].use);
         const why = !generate.disabled ? ''
             : submitting ? t('Adding to the queue. One moment.', '正在加入队列，请稍候')
             : chainWait ? t('Parts are generating. Wait, or cancel them in the queue.', '分段视频生成中，完成或在队列里取消后可再生成')
             : enhancer.reversing ? t('Writing the prompt. One moment.', '正在生成提示词，请稍候')
-            : lengthControl.blocked ? lengthControl.message || ''
+            : !comfyH3Model && lengthControl.blocked ? lengthControl.message || ''
             : t('A loop is running. Stop it to start again.', '正在循环生成，停止后可重新开始');
-        const lengthSaid = lengthControl.blocked && !videoMissing ? lengthControl.visibleMessage : '';
+        const lengthSaid = !comfyH3Model && lengthControl.blocked && !videoMissing ? lengthControl.visibleMessage : '';
         if (lengthWhy.textContent !== lengthSaid) lengthWhy.textContent = lengthSaid;
         if (lengthWhy.hidden !== !lengthSaid) lengthWhy.hidden = !lengthSaid;
         const words = {fvTipName: keyLabel.textContent.replace(/…$/, ''), fvTipUse: use && keySetup && keyShowsEta ? `${use} · ${t('Includes first-time setup', '含首次准备')}` : use, fvTipKey: TIPS['studio.generate'].key, fvTipWhy: why};
@@ -2731,15 +2744,25 @@ export function openStudio(node, {extendFrom = null} = {}) {
         }
         const emptyAllowed = options?.allowEmpty === true;
         if (capturing || queueState?.submitting) return;
+        const selectedModel = videoModel;
+        const nativeModel = comfyH3Model;
+        if (nativeModel && (extension.source || Object.keys(COMFY_H3_SAMPLING).some(name => linked(node, name)))) {
+            status.dataset.error = 'true';
+            status.textContent = extension.source
+                ? t('This model cannot continue a video. Leave continuation mode or switch video models in Settings.', '此模型不支持接着生成。请退出续写模式，或在设置里切换视频模型。')
+                : t('This model uses its own sampling preset. Disconnect linked sampling inputs in Nodes view.', '此模型使用独立采样预设。请在节点视图断开采样输入的连线。');
+            return;
+        }
         // Pressing Generate puts the open tray away; it does not open again while the video is made.
         consoleUI?.close();
         // Ctrl+Enter leaves focus in a field: commit its edit (change fires on blur) first.
         const editing = dialog.contains(document.activeElement) ? document.activeElement : null;
         if (editing && editing !== generate) { editing.blur(); editing.focus({preventScroll: true}); }
-        lengthControl.settleUnusedBlock();
+        if (!nativeModel) lengthControl.settleUnusedBlock();
         // The fields of this request, shown or in a closed tray. A field in a form of its own (the preset name) is that form's
         // to check; the frame window's two boxes only mirror the width and height, which are checked themselves.
-        const invalid = [...dialog.querySelectorAll('input:not(:disabled)')].find(e => !e.form && !e.classList.contains('fvp-dim') && !e.checkValidity());
+        const invalid = [...dialog.querySelectorAll('input:not(:disabled)')].find(e => !e.form && !e.classList.contains('fvp-dim')
+            && (!nativeModel || !e.closest('.fv-length-controls')) && !e.checkValidity());
         if (invalid) {
             const details = invalid.closest('details'); if (details) details.open = true;
             if (invalid.dataset.fvLength === 'block') { lengthControl.reportBlock(); invalid.focus(); invalid.scrollIntoView({block: 'center'}); return; }
@@ -2768,6 +2791,11 @@ export function openStudio(node, {extendFrom = null} = {}) {
             if (stepValue?.checkVisibility()) { stepValue.click(); return; }
             invalid.focus(); return;
         }
+        if (nativeModel && !linked(node, 'seconds') && Math.ceil(Number(seconds.value) * 24) > 362) {
+            status.dataset.error = 'true';
+            status.textContent = t('Choose a duration of 15 seconds or less for this model.', '请为此模型选择不超过 15 秒的时长。');
+            return;
+        }
         // One prompt per line with no lines: say what to write (generating without a prompt is not offered here).
         if (byLine() && !lineTexts().length) { status.dataset.error = 'true'; status.textContent = t('Write one prompt per line, then add them.', '每行写一条描述后再添加。'); prompt.focus(); return; }
         if (!emptyAllowed && !extension.source && !prompt.disabled && !prompt.value.trim() && !untouched() && !swapState(mediaNode)) {
@@ -2792,18 +2820,18 @@ export function openStudio(node, {extendFrom = null} = {}) {
         try {
             stopNote = ''; lastQueueError = null; failure.clear(); node.freevideoFailure = ''; node.freevideoFailureReport = null;
             capturing = true; updateRunButton(); status.dataset.error = 'false'; runOptions.open = false;
-            lengthControl.freeze();
+            if (!nativeModel) lengthControl.freeze();
             // Lines are sent as written: an enhanced rewrite would merge them into one description.
             if (!texts && (!extension.source || prompt.value.trim()) && !swapState(mediaNode) && await enhancer.beforeGenerate() === false) return;
             if (disposed) return;
             if (selected === 'input' && !dimensionsLinked) await inputRatio(true);
-            const lengthPlan = await lengthControl.ready();
-            if (disposed || lengthControl.blocked) return;
-            if (lengthControl.absent && !durationNote.settle()) return;
+            const lengthPlan = nativeModel ? null : await lengthControl.ready();
+            if (disposed || (!nativeModel && lengthControl.blocked)) return;
+            if (!nativeModel && lengthControl.absent && !durationNote.settle()) return;
             if (originalOn && lengthPlan?.count > 1 && !twoPass.checked) { status.dataset.error = 'true'; status.textContent = partsNeedTwoPassText(t); return; }
             if (lengthPlan?.count > 1 && chosenMode !== 'single') { status.textContent = t('Videos made in parts cannot use batch or loop.', '分段视频不能批量或循环生成。'); return; }
-            const lengthOptions = lengthControl.options();
-            const usageContext = capabilityContext(node, {custom: true});
+            const lengthOptions = nativeModel ? null : lengthControl.options();
+            const usageContext = nativeModel ? null : capabilityContext(node, {custom: true});
             const usageQuery = usageContext && !extension.source && !seconds.disabled ? new URLSearchParams(usageContext) : null;
             // Missing material dimensions or linked settings cannot describe the same request reliably.
             if (usageQuery && (!usageQuery.get('task').startsWith('ref2va') || usageQuery.has('references'))) {
@@ -2826,6 +2854,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
             for (const section of controls.querySelectorAll('.fv-section')) section.inert = true;
             held = turnNodeOn(node);
             const graph = cleanOptionalPrompt(clonePrompt(await app.graphToPrompt()));
+            applyVideoModelSnapshot(graph, node.id, selectedModel);
             if (emptyAllowed && !prompt.value.trim() && !extension.source) allowEmptyPrompt(graph, node.id);
             snapshot = singleRunSnapshot(extendSnapshot(graph, node.id, source,
                 {multiple: lengthPlan?.count > 1}), node.id, lengthPlan);
@@ -2857,7 +2886,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
             if (accepted) held?.done(); else held?.restore();
             // A prompt that was generated goes to the top of the history, with the size, length and level it used.
             if (accepted && prompt.value.trim()) rememberPrompt({text: prompt.value, w: Number(value(node, 'width')), h: Number(value(node, 'height')),
-                seconds: Number(seconds.value), level: effortFor(Number(baseSteps.value), twoPass.checked, Number(refineSteps.value), stepCacheNow(), effort.levels(), upscaleNow())?.name || null});
+                seconds: Number(seconds.value), level: nativeModel ? null : effortFor(Number(baseSteps.value), twoPass.checked, Number(refineSteps.value), stepCacheNow(), effort.levels(), upscaleNow())?.name || null});
             capturing = false;
             for (const section of controls.querySelectorAll('.fv-section')) section.inert = false;
             updateRunButton();
@@ -2871,9 +2900,10 @@ export function openStudio(node, {extendFrom = null} = {}) {
     dialog.addEventListener('pointerdown', closeMenus);
     function updateDuration() {
         const requested = Math.ceil(Number(seconds.value) * 24), frames = requested + ((5 - requested) % 17 + 17) % 17;
-        const length = lengthControl.plan?.count > 1 ? lengthControl.plan.seconds : Number.isFinite(frames) ? frames / 24 : null;
+        const multiple = !comfyH3Model && lengthControl.plan?.count > 1;
+        const length = multiple ? lengthControl.plan.seconds : Number.isFinite(frames) ? frames / 24 : null;
         const whole = Math.round(length), minutes = Math.floor(whole / 60), rest = whole % 60;
-        duration.textContent = length === null ? '—' : `${length <= 60 ? `${lengthControl.plan?.count > 1 ? length : length.toFixed(3)} s`
+        duration.textContent = length === null ? '—' : `${length <= 60 ? `${multiple ? length : length.toFixed(3)} s`
             : rest ? t(`${minutes} min ${rest} s`, `${minutes} 分 ${rest} 秒`) : t(`${minutes} min`, `${minutes} 分钟`)} · 24 fps`;
     }
     function updateCanvas() {
@@ -3368,7 +3398,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
             }},
             {id: 'advanced', tray: 'advanced', icon: 'sliders', read: () => ({label: '', tip: [t('Advanced', '高级选项'), t('Run mode, seed, steps and parts', '生成方式、种子、步数和分段')]})},
         ],
-        status: [requestAssets.element, addVideoNote, lengthWhy, otherUsage.element], onTray: open => {
+        status: [requestAssets.element, addVideoNote, comfyH3Notice, lengthWhy, otherUsage.element], onTray: open => {
             placeTray(); fitPreview();
             // An open tray: the play bar and the bar under the picture step back (CSS); they show again when it closes.
             void open;
@@ -3376,6 +3406,33 @@ export function openStudio(node, {extendFrom = null} = {}) {
     // The two panels repaint whenever the console's row does.
     { const sync = consoleUI.sync; consoleUI.sync = () => { sync(); paintDuration(); paintQuality(); }; }
     paintDuration(); paintQuality();
+    let videoProfileChanged = false;
+    function showActiveVideoModel(model) {
+        if (disposed || model === undefined) return;
+        videoModel = model;
+        const native = model?.kind === 'comfy_h3' ? model : null;
+        if (native?.id === comfyH3Model?.id) return;
+        comfyH3Model = native;
+        const enabled = Boolean(native);
+        dialog.dataset.comfyH3 = String(enabled);
+        qualityChip.element.hidden = samplingFields.hidden = samplingWarning.hidden = enabled;
+        comfyH3Notice.hidden = !enabled;
+        if (enabled) {
+            const preset = native.preset === 'ref2va' ? 'Ref2VA' : native.preset?.toUpperCase();
+            const title = [native.label, preset].filter(Boolean).join(' · ');
+            const steps = COMFY_H3_SAMPLING.base_steps;
+            comfyH3Notice.textContent = t(`${title} · Single pass, ${steps} steps, up to 15 s. Previews, continuation and LoRA are unavailable.`,
+                `${title} · 单次采样 ${steps} 步，最长约 15 秒。此模型不支持预览、续写和 LoRA。`);
+            twoPass.disabled = previewFirst.disabled = baseSteps.disabled = refineSteps.disabled = true;
+            refreshEffortEstimate(true);
+        } else syncSamplingSteps();
+        updateDuration();
+        updateRunButton();
+    }
+    const modelChanged = event => { videoProfileChanged = true; showActiveVideoModel(event.detail); };
+    window.addEventListener(VIDEO_MODEL_CHANGED, modelChanged);
+    cleanup.push(() => window.removeEventListener(VIDEO_MODEL_CHANGED, modelChanged));
+    activeVideoModel(api.fetchApi.bind(api)).then(model => { if (!videoProfileChanged) showActiveVideoModel(model); });
     // Space plays or pauses the stage video and M turns its sound on or off, unless a field or a control has the key.
     cleanup.push(listenDialogKey(dialog, 'keydown', event => {
         if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing || event.repeat) return;

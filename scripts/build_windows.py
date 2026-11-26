@@ -155,14 +155,28 @@ write_prune_report({str(out)!r}, dict(files=removed_binaries['files'] + removed_
 a.datas, deduplicated = deduplicate_toc(a.datas, {str(out)!r})
 write_data_report({str(out)!r}, deduplicated)
 '''
-    injection = user + injection
+    # Qt links the ICU wrapper supplied by Windows. A third-party PATH entry
+    # can make Analysis collect a DLL with the same name and versioned exports.
+    # Drop those imports from the archive so the loader uses the system wrappers.
+    windows_icu = r'''
+import re as _re
+from pathlib import PureWindowsPath as _WindowsPath
+a.binaries = [entry for entry in a.binaries if not _re.fullmatch(
+    r'icu(?:uc|in|dt)?[0-9]*\.dll', _WindowsPath(entry[0]).name, _re.IGNORECASE)]
+'''
+    injection = user + windows_icu + injection
     text = spec.read_text(encoding='utf-8')
     if text.count('pyz = PYZ(') != 1:
         raise ValueError('Unexpected PyInstaller spec layout')
     spec.write_text(text.replace('pyz = PYZ(', injection + '\npyz = PYZ('), encoding='utf-8')
+    # Qt imports the Windows ICU API. Other tools can put an ICU DLL with
+    # versioned exports on PATH, which would shadow the system DLL at runtime.
+    environment = dict(os.environ)
+    if windows_root := environment.get('SystemRoot'):
+        environment['PATH'] = str(Path(windows_root) / 'System32') + os.pathsep + environment.get('PATH', '')
     subprocess.run([sys.executable, '-m', 'PyInstaller', '--noconfirm',
                     '--distpath', str(out / 'dist'), '--workpath', str(workpath or out / 'build'), str(spec)],
-                   cwd=ROOT, check=True)
+                   cwd=ROOT, env=environment, check=True)
     if onefolder:
         dist = out / 'dist/FreeVideo'
         write_prune_report(out, prune_qt_bundle(dist))

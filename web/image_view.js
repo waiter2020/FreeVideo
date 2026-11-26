@@ -1752,6 +1752,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         // Leaving only stops watching: the job runs on, the floating window carries it, and its picture reaches the works.
         rememberView(); document.removeEventListener('keydown', strayKeys); expand.dispose?.();
         alive = false; place.dispose(); stopScene(); enhancer.dispose(); promptBarWatch?.disconnect(); document.removeEventListener('click', closeMore, true);
+        window.removeEventListener('freevideo-image-model-changed', refreshModelProfiles);
         unwatch?.(); unwatch = null; references.forEach(r => URL.revokeObjectURL(r.url)); clearStep(); dialog.remove();
         // ── end run ──
         if (kept?.dialog === dialog) kept = null;
@@ -1821,6 +1822,16 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         area = Math.min(limits.max, Math.max(limits.min, sizes[model.id] || RANGES[model.id].presets.standard));
         keepSize();
     }
+    async function refreshModelProfiles() {
+        try {
+            const value = await client.info();
+            if (!alive) return;
+            info = value;
+            render();
+            if (historyLoaded) rememberView();
+        } catch { /* The next info request can pick up the profile. */ }
+    }
+    window.addEventListener('freevideo-image-model-changed', refreshModelProfiles);
     client.info().then(value => {
         settleModel(value);
         const poller = setInterval(() => { if (!alive) return clearInterval(poller); if (IMAGE_MODELS.some(m => modelState(info, m.id).state === 'downloading')) client.info().then(v => { info = v; render(); }).catch(() => {}); }, 2000);

@@ -1,6 +1,6 @@
 # Windows PowerShell 5.1 / PowerShell 7. No activation or machine-wide PATH changes.
 $ErrorActionPreference = 'Stop'
-$freevideoArguments = @($args)
+[string[]]$freevideoArguments = @($args)
 $freevideoExit = 1
 $freevideoConsoleEncoding = [Console]::OutputEncoding
 $freevideoSavedEnvironment = @{}
@@ -186,7 +186,11 @@ try {
     # Restore only our download defaults before Python determines user overrides.
     # A null saved value removes the variable from the child environment.
     foreach ($name in @('UV_HTTP_TIMEOUT', 'UV_HTTP_RETRIES')) {
-        [Environment]::SetEnvironmentVariable($name, $freevideoSavedEnvironment[$name], 'Process')
+        if ($null -eq $freevideoSavedEnvironment[$name]) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $freevideoSavedEnvironment[$name], 'Process')
+        }
     }
     & $freevideoPython @freevideoPythonPrefix -B -X utf8 (Join-Path $PSScriptRoot 'freevideo_engine\installed_entry.py') freevideo_engine.managed @freevideoArguments
     $freevideoExit = $LASTEXITCODE
@@ -222,7 +226,11 @@ try {
 } finally {
     [Console]::OutputEncoding = $freevideoConsoleEncoding
     foreach ($name in $freevideoSavedEnvironment.Keys) {
-        [Environment]::SetEnvironmentVariable($name, $freevideoSavedEnvironment[$name], 'Process')
+        if ($null -eq $freevideoSavedEnvironment[$name]) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            [Environment]::SetEnvironmentVariable($name, $freevideoSavedEnvironment[$name], 'Process')
+        }
     }
 }
 exit $freevideoExit

@@ -168,6 +168,7 @@ def main():
         command.add_argument('--encoder-root', '--comfy-root', dest='comfy_root', type=Path)
         command.add_argument('--model-paths', type=Path, help='Optional ComfyUI extra_model_paths.yaml')
         command.add_argument('--encoder', default='qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors')
+        command.add_argument('--encoder-component', help=argparse.SUPPRESS)
     bench = sub.add_parser('bench', help='Compare attention backends under one explicit policy')
     bench.add_argument('arguments', nargs=argparse.REMAINDER)
     calibrate = sub.add_parser('calibrate',

@@ -11,6 +11,9 @@ import * as studioQueue from '../web/studio_queue.js';
 import {referenceInputs, mediaRows} from '../web/prompt_references.js';
 import {expandCast} from '../web/cast_mention.js';
 import {cleanAudioUse, cleanOptionalPrompt, cleanOptionalWidgets, optionalInputValue} from '../web/optional_inputs.js';
+import {hfModelSettings} from '../web/settings_video_models.js';
+import {t as settingsText} from '../web/settings_words.js';
+import {activeVideoModel, applyVideoModelSnapshot} from '../web/video_model.js';
 
 class Element {
     constructor(tag) {
@@ -759,4 +762,180 @@ test('every node report placement and the Studio output put stall immediately be
     assert.equal(placements.length, 4, 'Check initial, resumed, reattached and completed node output');
     for (const [, argumentsText] of placements) assert.match(argumentsText, /progress\.stall,\s*progress\.report$/);
     assert.match(studio, /output\.append\([^;]*progress\.stall,\s*progress\.report[,)]/);
+});
+
+const descendants = element => element.children.flatMap(child => [child, ...descendants(child)]);
+
+class SettingsElement extends Element {
+    constructor(tag) {
+        super(tag);
+        this.tagName = tag.toUpperCase();
+        this.value = '';
+        this.isConnected = true;
+    }
+    append(...children) {
+        super.append(...children.map(child => typeof child === 'string'
+            ? Object.assign(new SettingsElement('#text'), {textContent: child}) : child));
+        if (this.tag === 'select' && !this.value) this.value = children[0]?.value || '';
+    }
+    querySelectorAll(tag) { return descendants(this).filter(node => node.tag === tag); }
+    querySelector(selector) {
+        return this.children.find(node => selector === ':scope > .st-btn-t' && node.className === 'st-btn-t');
+    }
+}
+
+test('local H3 scans keep checkpoints independent through review, copy and activation', async () => {
+    const original = globalThis.document;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    try {
+        const builtin = {id: 'official', label: 'MiniMax H3'};
+        const imported = {id: 'ref-profile', label: 'Checkpoint One', kind: 'comfy_h3', source_kind: 'local',
+            compatible: true, preset: 'ref2va', bytes: 2 ** 30, format: 'comfy_int8'};
+        const presets = [{id: 'fl2va', label: 'FL2VA'}, {id: 'ref2va', label: 'Ref2VA'}];
+        const initial = {available: true, local_available: true, comfy_h3_available: true, installed: [builtin], active: builtin};
+        const waiting = {phase: 'copying', id: imported.id, source_kind: 'local'};
+        const ready = {...initial, installed: [builtin, imported]};
+        const requests = [];
+        let activated, refreshes = 0, picker = 0;
+        const panel = hfModelSettings({refresh: () => { refreshes++; }, onActivate: model => { activated = model; },
+            request: async (action, payload) => {
+                requests.push([action, payload]);
+                if (action === 'video-model-local-pick') {
+                    if (picker++ === 1) return {video_models: initial};
+                    return {video_models: initial, candidates: [
+                        {id: 'one', label: imported.label, bytes: imported.bytes, format: imported.format, compatible: true, presets},
+                        {id: 'two', label: 'Other Checkpoint', bytes: 2 ** 28, format: 'comfy_float', compatible: true, presets},
+                        {id: 'bad', label: 'Unsupported File', compatible: false, presets, compatibility_reason: 'Invalid tensor layout.'},
+                    ]};
+                }
+                if (action === 'video-model-local-comfy-inspect') return {candidate: imported};
+                if (action === 'video-model-local-copy') return {video_models: {...initial, task: waiting}};
+                if (action === 'video-model-activate') return {video_models: {...ready, active: imported}};
+                assert.fail(`Unexpected action ${action}`);
+            }});
+        const all = () => panel.elements.flatMap(descendants);
+        const named = text => all().find(node => node.textContent === text);
+        const button = text => named(text)?.parentNode;
+        const row = example => named(example).parentNode.parentNode;
+        panel.update({...initial, comfy_h3_available: false});
+        const scanLabel = settingsText('Scan ComfyUI H3 folder', '扫描 ComfyUI H3 权重目录');
+        const copyLabel = settingsText('Copy and verify', '复制并验证');
+        assert.equal(button(scanLabel).hidden, true);
+        panel.update(initial);
+        const scan = button(scanLabel);
+        assert.equal(scan.hidden, false);
+        await scan.onclick();
+        assert.equal(named('Invalid tensor layout.').className, 'is-warn');
+        assert.equal(row('Unsupported File').querySelectorAll('button')[0].hidden, true);
+        assert.ok(named('ComfyUI INT8 · 1.0 GiB'));
+        const one = row('Checkpoint One'), two = row('Other Checkpoint');
+        const [firstPreset] = one.querySelectorAll('select'), [secondPreset] = two.querySelectorAll('select');
+        firstPreset.value = 'ref2va';
+        firstPreset.onchange();
+        assert.equal(secondPreset.value, 'fl2va');
+        await scan.onclick();
+        assert.equal(firstPreset.value, 'ref2va', 'Cancelling the picker retains the previous scan and choice');
+        await one.querySelectorAll('button')[0].onclick();
+        assert.deepEqual(requests.at(-1), ['video-model-local-comfy-inspect', {id: 'one', preset: 'ref2va'}]);
+        assert.equal(button(copyLabel).disabled, false);
+        await button(copyLabel).onclick();
+        assert.deepEqual(requests.at(-1), ['video-model-local-copy', {id: 'ref-profile', accepted: true}]);
+        assert.ok(named(settingsText('Importing', '正在导入')));
+        assert.equal(two.querySelectorAll('button')[0].disabled, true);
+        panel.update(ready);
+        assert.ok(named(settingsText('Installed', '已安装')));
+        await one.querySelectorAll('button')[0].onclick();
+        assert.deepEqual(requests.at(-1), ['video-model-activate', {id: 'ref-profile'}]);
+        assert.equal(activated, imported);
+        assert.ok(refreshes >= 3);
+        assert.equal(one.querySelectorAll('button')[0].hidden, true);
+    } finally { globalThis.document = original; }
+});
+
+test('settings import and activate the shared H3 encoder independently of H3 Image readiness', async () => {
+    const original = globalThis.document;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    try {
+        const model = 'minimax-h3-image', component = 'text_encoder';
+        const builtin = {id: `official:${model}:${component}`, model, component, label: 'FreeVideo encoder'};
+        const imported = {id: 'encoder-profile', model, component, label: 'New shared encoder', format: 'nvfp4',
+            source_kind: 'local', compatible: true, bytes: 2 ** 30};
+        const status = (active, installed, task = {}) => ({available: true, local_available: true,
+            families: [{id: model, ready: false, label: 'MiniMax H3 Image'}], installed: [], task,
+            components: {[model]: {dit: {ready: false, installed: []}, [component]: {ready: true, active, installed}}}});
+        const requests = [];
+        let activations = 0;
+        const waiting = {id: imported.id, candidate: imported, operation: 'activate', phase: 'waiting_for_gpu'};
+        const panel = hfModelSettings({kind: 'image', refresh() {}, onActivate: () => { activations++; },
+            request: async (action, payload) => {
+                requests.push([action, payload]);
+                if (action === 'image-model-local-pick') return {candidate: imported};
+                if (action === 'image-model-local-copy') return {image_models: status(builtin, [builtin], {phase: 'copying'})};
+                if (action === 'image-model-activate') return {image_models: status(builtin, [builtin, imported], waiting)};
+                assert.fail(`Unexpected action ${action}`);
+            }});
+        const all = () => panel.elements.flatMap(descendants);
+        const button = (en, zh) => all().find(node => node.textContent === settingsText(en, zh))?.parentNode;
+        panel.update(status(builtin, [builtin]));
+        panel.focusComponent(model, component);
+        const [family, role] = all().filter(node => node.tag === 'select');
+        assert.deepEqual([family.value, role.value], [model, component]);
+        assert.ok(all().some(node => node.textContent?.includes('Qwen3-VL 32B') &&
+            node.textContent.includes(settingsText('NVFP4 AWQ or plain NVFP4', 'NVFP4 AWQ 或普通 NVFP4'))));
+        await button('Choose local file', '选择本地文件').onclick();
+        assert.deepEqual(requests.at(-1), ['image-model-local-pick', {model, component}]);
+        await button('Copy and verify', '复制并验证').onclick();
+        assert.deepEqual(requests.at(-1), ['image-model-local-copy', {id: imported.id, accepted: true, model, component}]);
+        panel.update(status(builtin, [builtin, imported]));
+        await button('Use model', '使用模型').onclick();
+        assert.deepEqual(requests.at(-1), ['image-model-activate', {id: imported.id, model, component}]);
+        assert.equal(activations, 0);
+        panel.update(status(imported, [builtin, imported], {...waiting, phase: 'ready'}));
+        panel.update(status(imported, [builtin, imported], {...waiting, phase: 'ready'}));
+        assert.equal(activations, 1);
+    } finally { globalThis.document = original; }
+});
+
+test('Qwen encoder settings name the built-in checkpoint and link the inspected examples', () => {
+    const original = globalThis.document;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    try {
+        const model = 'qwen-image-2.1-turbo', role = 'text_encoder';
+        const builtin = {id: `official:${model}:${role}`, model, component: role, label: 'FreeVideo Encoder', format: 'FreeVideo'};
+        const panel = hfModelSettings({kind: 'image', refresh() {}, request: () => assert.fail('Rendering should be local')});
+        panel.update({available: true, families: [{id: model, label: 'Qwen-Image 2.1', ready: true}],
+            components: {[model]: {[role]: {ready: true, active: builtin, installed: [builtin]}}}});
+        const all = () => panel.elements.flatMap(descendants);
+        assert.ok(all().some(node => node.textContent === settingsText('qwen3vl_8b_int8_convrot.safetensors (default)',
+            'qwen3vl_8b_int8_convrot.safetensors（默认）')));
+        const links = all().filter(node => node.tag === 'a' && node.href?.includes('/blob/'));
+        assert.equal(links.length, 4);
+        assert.equal(links[0].parentNode.parentNode.hidden, true);
+        panel.focusComponent(model, role);
+        assert.equal(links[0].parentNode.parentNode.hidden, false);
+        assert.ok(links[0].href.includes('/Comfy-Org/Qwen-Image-2.1/blob/'));
+        assert.ok(links[1].href.includes('/pottokao/Qwen-Image-2.1-Text-Encoder-Heretic-int8-convrot/blob/'));
+        assert.ok(links[2].href.includes('/NidAll/Qwen3VL-8B-Abliterated-INT8-ConvRot/blob/'));
+        assert.ok(links[3].href.includes('/paralaif/Huihui-Qwen3-VL-8B-Instruct-abliterated-comfy-int8-convrot/blob/'));
+        assert.ok(all().some(node => node.textContent?.includes('BF16') && node.textContent.includes('256')));
+    } finally { globalThis.document = original; }
+});
+
+test('Studio applies native H3 defaults to a frozen request without changing its saved VDN settings', async () => {
+    const native = {id: 'managed-ref', kind: 'comfy_h3', preset: 'ref2va'};
+    assert.equal(await activeVideoModel(async path => {
+        assert.equal(path, '/freevideo/setup');
+        return {ok: true, json: async () => ({video_models: {active: native}})};
+    }), native);
+    const inputs = {base_steps: 8, two_pass: true, preview: true, step_cache: 'fbcache',
+        upscale_factor: '1.2', seed: 42, text: 'An original note', loras: ['1', 0]};
+    const graph = {output: {1: {class_type: 'FreeVideoGenerate', inputs},
+        2: {class_type: 'FreeVideoGenerate', inputs: {...inputs}}}};
+    const snapshot = applyVideoModelSnapshot(structuredClone(graph), 1, native);
+    assert.deepEqual(snapshot.output[1].inputs, {...inputs, native_h3_preset: 'managed-ref', base_steps: 20,
+        two_pass: false, preview: false, step_cache: 'none', upscale_factor: '2'});
+    assert.deepEqual(snapshot.output[2], graph.output[2]);
+    assert.equal(graph.output[1].inputs.two_pass, true);
+    const vdn = applyVideoModelSnapshot(structuredClone(graph), 1, {id: 'official'});
+    assert.deepEqual(vdn.output[1].inputs, {...inputs, native_h3_preset: ''});
 });

@@ -29,8 +29,8 @@ from ..disk_space import ran_out
 from ..download_settings import observed_speed
 from ..exit_diagnostics import clean_reading
 from ..monitoring import save
-from .failure import (Context, classify_exception, HOST_MESSAGE_ZH, host_memory_shortage, ERRORS, FailureError, MESSAGE_ZH, NO_REPORT, STAGES, UNIFIED_MESSAGE_ZH,
-                      classify_exception)
+from .failure import (Context, classify_exception, component_facts, HOST_MESSAGE_ZH, host_memory_shortage, ERRORS,
+                      FailureError, MESSAGE_ZH, NO_REPORT, STAGES, UNIFIED_MESSAGE_ZH)
 
 def write_refused(error):
     """Whether an OSError says a folder or file cannot be written (no permission, read-only volume, in use)."""
@@ -623,6 +623,19 @@ class Service:
                          else self.pack_row(self.moss_installer, moss_ready, moss_problem)))
         if mac:
             rows[-1]['unavailable_reason'] = 'platform'
+        if machine.get('root'):
+            from ..image_components import ComponentError, resolve
+            for row in rows:
+                if not row['ready']:
+                    continue
+                try:
+                    components = resolve(machine, row['id'])['components']
+                except ComponentError as error:
+                    row['component_error'] = getattr(error, 'role', None)
+                    continue
+                row['components'] = component_facts(components)
+                if not components['dit'].get('builtin'):
+                    row['profile'] = row['components']['dit']
         return rows
 
     def _active_pack(self):
@@ -1064,6 +1077,8 @@ class Service:
             for key in ('origin', 'cast_name'):
                 if isinstance(kept.get(key), str):
                     row[key] = kept[key]
+            if components := component_facts(kept.get('components')):
+                row['components'] = components
             return row
         page = names[offset:offset + limit]
         return dict(items=[item(name) for name in page], more=offset + limit < len(names), total=len(names))
@@ -1684,6 +1699,9 @@ class Service:
                 from . import compose
                 value = compose.build(value, self.input_directory())
             value = self.request(value)
+            if machine.get('root'):
+                from ..image_components import resolve
+                resolve(machine, model or image_model.QWEN)
             value['kind'] = context.kind
             if h3:
                 # What the worker needs to run the video text encoder for this prompt and to plan against the card.
@@ -1853,6 +1871,7 @@ class Service:
         to yield. Returns the worker's report."""
         from .. import resident_process
         from ..comfy_bridge import source_root
+        from ..encoder_checkpoint import encoder_options
         from ..hardware import detect
         from ..idle_encoder import place_now
         from ..kernel_capabilities import available_backends
@@ -1867,47 +1886,36 @@ class Service:
         directory = Path(endpoint).parent
         environment = dict(env, PYTHONPATH=str(source_root()))
         environment.pop(resident_process.ENV, None)
-        return place_now(endpoint, dict(encoder=machine.get('encoder'), comfy_root=machine.get('comfy_root'),
-                                        model_paths=machine.get('model_paths')),
+        return place_now(endpoint, encoder_options(machine),
                          descriptor=descriptor, environment=environment, directory=directory,
                          gpu_budget_bytes=policy.gpu_budget_bytes, ram_budget_bytes=policy.ram_budget_bytes,
                          allocator=policy.allocator_config, limits=dict(system=hardware.system),
                          stop=stop or self.session_stop)
 
     @staticmethod
-    def group_files(machine, group):
-        try:
-            rows = [image_pack.target(row, machine['model_root']) for row in image_pack.rows(group=group)]
-        except Exception:
-            return []
-        return [str(item) for item in rows if Path(item).is_file()]
-
-    @classmethod
-    def qwen_files(cls, machine):
-        """The picture model's files to read ahead for a light warm-up of the default model."""
-        return cls.group_files(machine, 'image')
-
-    @classmethod
-    def model_files(cls, machine, model):
+    def model_files(machine, model):
         """The files to read ahead for a picture model: each model's own, from one table."""
-        if model == image_model.H3:
-            return cls.warm_files(machine)
-        if model == image_model.MOSS:
-            return cls.group_files(machine, MOSS_GROUP)
-        return cls.qwen_files(machine)
+        from ..image_components import ComponentError, resolve
+        try:
+            components = resolve(machine, model)['components']
+        except ComponentError:
+            return []
+        files = []
+        for role in ('dit', 'text_encoder', 'vae'):
+            if model == image_model.H3 and role == 'text_encoder':
+                continue  # Its resident placement already reads the encoder.
+            path = Path(components[role]['path'])
+            if path.is_dir():
+                files.extend(str(weight) for weight in sorted(path.glob('*.safetensors')) if weight.is_file())
+            elif path.is_file():
+                files.append(str(path))
+        return files
 
-    @staticmethod
-    def warm_files(machine):
+    @classmethod
+    def warm_files(cls, machine):
         """H3 Image's picture model files to read ahead into the OS file cache, in the order a picture reads them.
         The encoder is not among them: placing it reads it, and a second copy in the file cache would only crowd it."""
-        from .h3_runner import files
-        rows = []
-        try:
-            found = files(Path(image_pack.base(machine['model_root'])).parent)
-            rows += [Path(found['dit']), Path(found['vae'])]
-        except Exception:
-            pass
-        return [str(item) for item in rows if item.is_file()]
+        return cls.model_files(machine, image_model.H3)
 
     def remember(self, key, state):
         self.finished[key] = deepcopy(state)
@@ -2103,6 +2111,10 @@ class Service:
         stage = row.get('stage') if isinstance(row, dict) else None
         stage = stage if stage in STAGES else context.timing.stage
         result = dict(phase='failed', error=code, report_id=None, stage=stage)
+        if code == 'model_component_unavailable':
+            component = row.get('component') if isinstance(row, dict) else getattr(error, 'role', None)
+            if component in ('dit', 'text_encoder', 'vae'):
+                result['component'] = component
         if code in MESSAGE_ZH:
             result['message_zh'] = MESSAGE_ZH[code]
             if context.machine.get('device_backend') == 'mps' and code in UNIFIED_MESSAGE_ZH:
@@ -2471,7 +2483,7 @@ class Service:
         from .. import processes
         command = processes.module_command('freevideo_engine.image_gen.worker', image_pack.base(machine['model_root']),
                                            '--device', machine.get('device_backend', 'cuda'),
-                                           '--idle-seconds', self.idle_seconds)
+                                           '--idle-seconds', self.idle_seconds, '--engine-root', root)
         if server_mode.coresident():
             # The worker stays until this installation stops or a program outside it needs the card or host memory;
             # its own processes (the video worker) are not "another program" that makes it leave.
@@ -2617,8 +2629,11 @@ class Service:
                                 # The placement is speculative: whatever goes wrong in it, the session and a picture
                                 # that arrived meanwhile carry on (the picture places the encoder itself).
                                 try:
+                                    from ..encoder_checkpoint import configured_encoder_file, encoder_resident_key
                                     endpoint = self.resident_endpoint()
-                                    if endpoint is not None and placed_encoder_bytes(endpoint) > 0:
+                                    identity = (encoder_resident_key(configured_encoder_file(machine), machine['comfy_root'])
+                                                if endpoint is not None else None)
+                                    if endpoint is not None and placed_encoder_bytes(endpoint, identity) > 0:
                                         placed = dict(state='kept', reason='The encoder is already on the card')
                                     else:
                                         with self.mutex:
@@ -2645,7 +2660,8 @@ class Service:
                                     # The worker left at its idle limit while the encoder was placed.
                                     respawn()
                                 try:
-                                    session.send(**dict(value, files=[], h3=dict(resident_endpoint=self.resident_endpoint())))
+                                    setup = dict(resident_endpoint=self.resident_endpoint(), comfy_root=machine.get('comfy_root'))
+                                    session.send(**dict(value, files=[], h3=setup))
                                 except OSError:
                                     pass
                             continue
@@ -2919,6 +2935,8 @@ class Service:
                 self.keep_preview(row)
             elif phase == 'plan':
                 context.note_plan(row.get('plan'))
+            elif phase == 'model':
+                context.components = component_facts(row.get('components'))
             elif phase in ('result', 'error'):
                 if self.stop.is_set() or row.get('code') == 'cancelled':
                     result = dict(phase='cancelled')
@@ -2944,7 +2962,10 @@ class Service:
                         raise RuntimeError('worker_exit')
                     self.keep_forecast(context)
                     self.note_model(path, value.get('model') or image_model.QWEN)
-                    self.note_record(path, getattr(context, 'work_record', None))
+                    work_record = getattr(context, 'work_record', None)
+                    if context.components:
+                        work_record = {**(work_record or {}), 'components': context.components}
+                    self.note_record(path, work_record)
                     self.copy_to_output(path)
                     receipts = row.get('receipts')
                     from ..private_refs import hold
@@ -2961,6 +2982,8 @@ class Service:
                                 self.reports.popitem(last=False)
                     result = dict(phase='complete', file='freevideo-image/' + path.name,
                                   seconds=seconds, plan=row.get('plan'), report_id=report_id)
+                    if context.components:
+                        result['components'] = context.components
                     if isinstance(row.get('attention'), dict):
                         result['attention'] = row['attention']
                 with self.mutex:

@@ -319,6 +319,8 @@ def output_summary(report, relative_video):
                     else '.request.json').as_posix())
     if report.get('keep_source_audio_failed'):
         result['keep_source_audio_failed'] = True
+    if isinstance(encoding.get('text_encoder'), dict):
+        result['text_encoder'] = encoding['text_encoder']
     if type(report.get('output_frames')) is int and report['output_frames'] > 0:
         # Resource reports keep the generated canvas; result cards show only saved frames.
         result['geometry'].update(frames=report['output_frames'],

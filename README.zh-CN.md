@@ -82,6 +82,20 @@ git clone https://github.com/FlashML-org/FreeVideo.git
 
 更新时，在 `custom_nodes/FreeVideo` 中运行 `git pull`（或在 ComfyUI-Manager 中更新该节点），然后重启 ComfyUI。
 
+### 在 Windows 上切换模型
+
+在 CUDA 显卡上完成视频引擎安装后，打开 **设置 → 模型 → 视频模型**。可按名称搜索或粘贴 Hugging Face 模型链接，下载前查看固定提交、许可证和磁盘需求。FreeVideo 校验权重并生成一段测试视频后，点击 **使用模型**。在同一列表选择 FreeVideo 模型即可切回。
+
+支持成套的 H3 Transformer 和 VDN-H3 8 步检查点（`h3-base/transformer` 和 `stage-dmd-step-250`），以及兼容的 FreeVideo FP8 或 ConvRot INT8 预制缓存。第三方预制缓存须包含完整的 AdaLN 投影。两种格式均使用当前安装中的文本编码器和音视频解码器。
+
+同一设置页还提供 **图像模型切换**。安装内置系列后，可选择 MiniMax H3 Image、Qwen-Image 2.1 Turbo 或 MOSS-Image-SFT，再检查 Hugging Face 仓库链接。导入兼容的去噪权重时会复用该系列的编码器和解码器。图像工作区会显示正在使用的版本，每个系列都能独立切回内置权重。
+
+如果权重已在电脑上，请在装有 CUDA 版 FreeVideo 的 Windows 电脑上直接打开 FreeVideo，在 **设置 → 模型** 的对应区域使用 **从本地导入**。图像模型可选择去噪器 `.safetensors` 或 MOSS 分片索引。视频模型可选择预制缓存的 `manifest.json`，或包含 `h3-base` 和 `stage-dmd-step-250` 的原始权重目录。
+
+使用 MiniMax H3 原生权重时，点击 **扫描 ComfyUI H3 权重目录**，选中权重后确认 FL2VA（文字或首尾帧）或 Ref2VA（参考素材）预设。FreeVideo 会把选中的权重和缺少的共享解码器复制到 Windows。请把 ComfyUI 格式的音视频 VAE 放在模型库的 `vae` 目录。WSL 目录也可以作为复制来源。原生预设通过本机 ComfyUI 队列生成，成片保存在「作品」中。使用 VDN 专用功能时，请切回 FreeVideo 模型。
+
+确认兼容性和所需磁盘空间后，点击 **复制并验证**。FreeVideo 将所需文件复制到安装目录，在 GPU 空闲时试运行。验证通过后，点击 **使用模型**。本地导入、Hugging Face 和内置权重共用已安装列表。移动所选源文件后，已安装的副本仍可用于生成。
+
 ### Linux
 
 **桌面：** [下载 FreeVideo-Linux-x86_64.AppImage](https://github.com/FlashML-org/FreeVideo/releases/latest/download/FreeVideo-Linux-x86_64.AppImage)，加上可执行权限后打开，之后的步骤与 Windows 相同。

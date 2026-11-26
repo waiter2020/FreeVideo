@@ -11,13 +11,10 @@ import torch
 from torch import nn
 
 from ..streamed_weights import _open_safetensors
+from .qwen_checkpoint import ATTENTION_HINT, COMFY_ATTENTION_HINT, quant_marker_supported
 from .qwen_dit import QwenImageDiT
 from .qwen_vae import QwenImageVAE, comfy_vae_key_to_diffusers, vae_key_map
 from .load_progress import TensorProgress
-
-
-CONVROT_METADATA = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
-COMFY_ATTENTION_HINT = {"attention": "comfy_kitchen_int8"}
 
 
 def _config(metadata, model_class, override):
@@ -125,7 +122,7 @@ def load_dit(path, device="cpu", *, config=None, progress=None, mapped=False):
                 marker = json.loads(bytes(checkpoint.get_tensor(marker_key).tolist()).decode("utf-8"))
             except (ValueError, UnicodeError) as exc:
                 raise ValueError(f"Invalid Comfy quantization JSON: {marker_key}") from exc
-            if marker != CONVROT_METADATA or type(marker.get("convrot")) is not bool or type(marker.get("convrot_groupsize")) is not int:
+            if not quant_marker_supported(marker):
                 raise ValueError(f"Unsupported Comfy quantization format for {name}: {marker!r}")
             if reads is not None:
                 reads.tensors(marker_key)
@@ -146,7 +143,7 @@ def load_dit(path, device="cpu", *, config=None, progress=None, mapped=False):
             quantized[name] = targets
         # Comfy writes one attention hint per block ({"attention": "comfy_kitchen_int8"}); this
         # engine runs the reference BF16 attention, so the hint is validated and not used.
-        for key in sorted(k for k in keys if k.endswith(".attn.comfy_attention.config")):
+        for key in sorted(k for k in keys if k.endswith(ATTENTION_HINT)):
             try:
                 hint = json.loads(bytes(checkpoint.get_tensor(keys[key]).tolist()).decode("utf-8"))
             except (ValueError, UnicodeError) as exc:

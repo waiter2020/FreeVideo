@@ -431,13 +431,19 @@ def get_latent_cache_key_dict(**kwargs):
     return make_latent_cache_key(**kwargs)[1]
 
 
-def _latent_cache(root, base, device, *, folder='vae', recipe='reference-latent-v2', cache_kind='reference-latent'):
+def _latent_cache(root, base, device, *, folder='vae', recipe='reference-latent-v2', cache_kind='reference-latent',
+                  weight_file=None, weight_sha256=None):
     """Per-input latent receipts; another encoder, recipe or device never matches."""
     import torch
     from .input_cache import InputCache, digest
     from .paths import data_root
-    directory = Path(base) / folder
-    files = sorted(directory.glob('*.safetensors'))
+    if weight_file is None:
+        directory = Path(base) / folder
+        files = sorted(directory.glob('*.safetensors'))
+    else:
+        weight_file = Path(weight_file)
+        directory = weight_file.parent
+        files = [weight_file] if weight_file.is_file() else []
     if not files:
         return None
     kind = torch.device(device).type
@@ -452,6 +458,8 @@ def _latent_cache(root, base, device, *, folder='vae', recipe='reference-latent-
                 'gpu': torch.cuda.get_device_name() if (kind == 'cuda' and hasattr(torch, 'cuda') and hasattr(torch.cuda, 'is_available') and torch.cuda.is_available()) else None,
                 'config': digest(directory / 'config.json') if (directory / 'config.json').exists() else None,
                 'weights': [[f.name, f.stat().st_size, f.stat().st_mtime_ns] for f in files]}
+    if weight_sha256 is not None:
+        identity['weights'] = [weight_sha256]
     target_root = root or (data_root() / 'input-cache')
     return InputCache(identity, root=target_root, kind=cache_kind)
 

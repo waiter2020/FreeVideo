@@ -277,6 +277,7 @@ def main(argv=None):
                         help='Encode this prompt once first, then measure with it')
     for name in ('--encoder-python', '--encoder-root', '--model-paths', '--encoder'):
         parser.add_argument(name)
+    parser.add_argument('--encoder-component', help=argparse.SUPPRESS)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--repeats', type=int, default=2)
     parser.add_argument('--warmup-steps', type=int, default=1)
@@ -309,7 +310,7 @@ def main(argv=None):
         args.conditioning = args.out / 'conditioning.pt'
         command = [sys.executable, '-B', '-m', 'freevideo_engine', 'encode',
                    '--prompt-file', str(args.prompt_file), '--out', str(args.conditioning)]
-        for name in ('encoder_python', 'encoder_root', 'model_paths', 'encoder'):
+        for name in ('encoder_python', 'encoder_root', 'model_paths', 'encoder', 'encoder_component'):
             value = getattr(args, name, None)
             if value:
                 command += ['--' + name.replace('_', '-'), str(value)]

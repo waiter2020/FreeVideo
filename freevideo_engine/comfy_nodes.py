@@ -1,5 +1,6 @@
 """Optional ComfyUI V3 nodes. Never import these from the standalone CLI."""
 import logging
+import os
 from pathlib import Path
 
 from comfy_api.latest import ComfyExtension, InputImpl, io, ui
@@ -44,7 +45,58 @@ def clean_prompt(json_data):
             workflow_repairs.record(comfy_bridge.installation_root(), 'request', repaired)
         except (OSError, ValueError) as error:
             logging.warning('[FreeVideo] Could not note the reset inputs: %s', error)
+    if os.name == 'nt' and isinstance(prompt, dict) and any(
+        isinstance(node, dict) and node.get('class_type') == 'FreeVideoGenerate' for node in prompt.values()
+    ):
+        from .comfy_h3_runtime import expand_prompt
+        return expand_prompt(json_data, _comfy_h3_profile)
     return json_data
+
+
+def _comfy_h3_profile(identity=None, *, encoder_component=None):
+    from .hf_video_models import active_comfy_h3, resolve_comfy_h3
+    try:
+        root, machine = comfy_bridge.installation()
+    except (OSError, ValueError):
+        if identity:
+            raise
+        return None
+    profile = (resolve_comfy_h3(root, identity, machine, encoder_component=encoder_component)
+               if identity else active_comfy_h3(root, machine))
+    if profile is not None:
+        from server import PromptServer
+        server = PromptServer.instance
+        if (getattr(server, '_freevideo_h3_lifecycle', None) is None
+                or getattr(server, '_freevideo_front', None) is not None):
+            raise ValueError('The selected H3 model needs a compatible local Windows ComfyUI queue. Switch to FreeVideo or check setup.')
+    return profile
+
+
+def _save_comfy_h3(cls, video, profile_id, text, width, height, seconds, seed, steps):
+    import json
+    import folder_paths
+    from comfy.cli_args import args as comfy_args
+    from server import PromptServer
+    from .comfy_assets import output_summary, saved_video
+    from .comfy_h3_runtime import save_native_video
+    from .comfy_progress import publish
+
+    node_id = cls.hidden.unique_id
+    output_root = Path(folder_paths.get_output_directory()).resolve()
+    metadata = None if comfy_args.disable_metadata else cls.hidden.extra_pnginfo or {}
+    graph = dict(prompt=cls.hidden.prompt, workflow=metadata.get('workflow')) if metadata is not None else None
+    prompt_graph = cls.hidden.prompt or {}
+    encoder_component = prompt_graph.get(f'freevideo_h3_{node_id}_models', {}).get('inputs', {}).get('encoder_component')
+    output, report = save_native_video(video, output_root, preset=profile_id, prompt=text,
+                                       width=width, height=height, seconds=seconds, seed=seed,
+                                       metadata=metadata, graph=graph, steps=steps, encoder_component=encoder_component)
+    preview = ui.PreviewVideo([saved_video(output, output_root)]).as_dict()
+    summary = output_summary(report, output.relative_to(output_root))
+    summary.update({key: report[key] for key in ('model_id', 'model_label', 'native_h3_variant', 'text_encoder') if key in report})
+    preview['freevideo_summary'] = [summary]
+    publish(PromptServer.instance, node_id, {'label': 'Video saved', 'phase': 'complete',
+            'overall': {'status': 'complete', 'fraction': 1.}, 'result': summary})
+    return io.NodeOutput(InputImpl.VideoFromFile(str(output)), json.dumps(report, ensure_ascii=False), ui=preview)
 
 
 def register_prompt_cleanup():
@@ -165,6 +217,9 @@ class FreeVideoGenerate(io.ComfyNode):
                 io.String.Input('upscale_to', display_name='Upscale size', default='', optional=True, advanced=True,
                     socketless=True, tooltip='Set by Upscale in Creations: empty for one 1.5x step, 4k for the 4K size '
                                              'made frame by frame by a small upscale model.'),
+                io.String.Input('native_h3_preset', default='', optional=True, advanced=True, socketless=True),
+                io.String.Input('native_h3_error', default='', optional=True, advanced=True, socketless=True),
+                io.Video.Input('native_h3_video', optional=True, advanced=True),
             ],
             outputs=[io.Video.Output('video'), io.String.Output('report', display_name='Report JSON')],
             hidden=[io.Hidden.unique_id, io.Hidden.prompt, io.Hidden.extra_pnginfo],
@@ -174,11 +229,13 @@ class FreeVideoGenerate(io.ComfyNode):
     @classmethod
     def validate_inputs(cls, text, width, height, seconds, seed, continue_from='', frames=0, two_pass=True,
                         preview=False, refine_from='', base_steps=8, refine_steps=3, step_cache='none',
-                        upscale_factor='2', allow_empty_prompt=False, upscale_from='', upscale_to=''):
+                        upscale_factor='2', allow_empty_prompt=False, upscale_from='', upscale_to='', native_h3_error=''):
         # ComfyUI marks every input named here when a check fails, so only the checked widgets are
         # listed. Linked pictures, media and conditioning have no value before the run anyway.
         # step_cache and upscale_factor are named so ComfyUI skips their option lists: an older saved
         # workflow puts '' there, and execute uses no cache and the 2x upscale for a value that is not an option.
+        if native_h3_error:
+            return native_h3_error
         refine_from = optional_text(refine_from)
         if optional_text(upscale_from):
             # The bridge reads the finished video's own request; the node's widgets do not apply.
@@ -221,11 +278,18 @@ class FreeVideoGenerate(io.ComfyNode):
                 references=None, loras=None, conditioning=None, media=None, two_pass=True,
                 force_regenerate=False, base_steps=8, refine_steps=3, preview=False, refine_from='',
                 continue_from='', frames=0, first_frame_reference=False, voice_reference=False, hide_tail=False,
-                step_cache='none', upscale_factor='2', allow_empty_prompt=False, upscale_from='', upscale_to=''):
+                step_cache='none', upscale_factor='2', allow_empty_prompt=False, upscale_from='', upscale_to='',
+                native_h3_preset='', native_h3_error='', native_h3_video=None):
         from .comfy_environment import control_process
         from .gpu_pool import pool_enabled
         if control_process() and pool_enabled():
             raise RuntimeError('Generation requires a dispatched executor')
+        if native_h3_error:
+            raise ValueError(native_h3_error)
+        if native_h3_preset or native_h3_video is not None:
+            if not native_h3_preset or native_h3_video is None:
+                raise ValueError('The ComfyUI H3 workflow is incomplete. Submit it again from FreeVideo.')
+            return _save_comfy_h3(cls, native_h3_video, native_h3_preset, text, width, height, seconds, seed, base_steps)
         from server import PromptServer
         from .comfy_chain import block_context, block_finished, report_fields
         refine_from, continue_from = optional_text(refine_from), optional_text(continue_from)
@@ -700,4 +764,11 @@ class FreeVideoExtension(ComfyExtension):
         except Exception as error:
             # Optional: the first request compiles what it needs, as before.
             logging.warning('[FreeVideo] Background compile not started: %s', error)
-        return [FreeVideoGenerate, FreeVideoMedia, FreeVideoReference, FreeVideoLoRA, FreeVideoLoRAStack, FreeVideoFrames]
+        nodes = [FreeVideoGenerate, FreeVideoMedia, FreeVideoReference, FreeVideoLoRA, FreeVideoLoRAStack, FreeVideoFrames]
+        if os.name == 'nt':
+            try:
+                from .comfy_h3_runtime import register_runtime
+                nodes.extend(await register_runtime(_comfy_h3_profile))
+            except (AttributeError, ImportError, RuntimeError, TypeError) as error:
+                logging.warning('[FreeVideo] Native H3 imports are unavailable: %s', error)
+        return nodes

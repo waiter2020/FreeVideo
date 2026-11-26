@@ -60,7 +60,8 @@ def startup_files(machine, habit):
         files = sorted(item for item in Path(machine['checkpoint']).rglob('*') if item.is_file())
         if files:
             return files
-    return [Path(machine['encoder_model_root']) / 'text_encoders' / machine['encoder']]
+    from .encoder_checkpoint import configured_encoder_file
+    return [configured_encoder_file(machine)]
 
 
 def available_memory():

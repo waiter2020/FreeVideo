@@ -241,6 +241,8 @@ export function imageGenError(code, info, t) {
         model_unavailable: ['This computer does not support the chosen picture model. Use Qwen-Image 2.1.', '这台电脑不支持所选的图片模型。请改用 Qwen-Image 2.1。'],
         model_unreadable: ['The image generation model files could not be read. Repair them in the launcher and try again.',
             '图像生成模型的文件读不出来。在启动器里修复后再试。'],
+        model_component_unavailable: ['The selected image model component is missing or has changed. Import it again or choose an available component in Settings.',
+            '所选图片模型部件缺失或已更改。请在设置中重新导入或选择可用部件。'],
         device_unavailable: ['The graphics card is not available right now. Try again later.', '显卡暂时用不了，稍后再试。'],
         worker_exit: ['Image generation stopped unexpectedly. Try again.', '图像生成意外停止了，请再试一次。'],
         timeout: ['This image took too long and was stopped. Try again.', '这一张用时太长，已停止。请再试一次。'],

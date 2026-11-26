@@ -63,6 +63,8 @@ def offer(root):
         return dict(status='unavailable', reason='installation-unknown')
     if not machine.get('ready') or machine.get('device_backend') == 'mps':
         return dict(status='unavailable', reason='not-applicable')
+    if machine.get('hf_video_model'):
+        return dict(status='unavailable', reason='custom-model')
     catalog = load_catalog()
     if machine.get('prepared_format') == TARGET:
         return unused(root, catalog, TARGET) or dict(status='unavailable', reason='current')
