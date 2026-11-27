@@ -139,6 +139,8 @@ def main():
                           help='Approximate reuse between sampling steps (disabled by default)')
     generate.add_argument('--fast-mode', choices=FAST_MODES,
                           help='Pi-H3 DWD: two or four sampling steps with the corresponding adapter')
+    generate.add_argument('--video-package', default='',
+                          help='pi-H3 model package. Empty uses the package saved for this fast mode.')
     generate.add_argument('--base-steps', type=int, choices=range(1, 33), metavar='1..32',
                           help='First-pass steps (default: 8, or explicit profile). Changes may reduce quality.')
     generate.add_argument('--refine-steps', type=int, choices=range(1, 32), default=3, metavar='1..31',

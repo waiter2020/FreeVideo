@@ -38,8 +38,8 @@ def configured_encoder_file(machine, identity=ACTIVE_ENCODER):
     return Path(machine['encoder_model_root']) / 'text_encoders' / machine['encoder']
 
 
-def encoder_options(machine):
-    selected = configured_component(machine)
+def encoder_options(machine, identity=ACTIVE_ENCODER):
+    selected = configured_component(machine, identity)
     return dict(encoder=machine.get('encoder'), comfy_root=machine.get('comfy_root'),
                 model_paths=machine.get('model_paths'), encoder_component=selected['id'] if selected else BUILTIN_ENCODER)
 

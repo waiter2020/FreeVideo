@@ -1,9 +1,4 @@
-"""Which picture model a request uses, and the sizes each model is asked for.
-
-The picture page keeps its choice in the browser; the Agent runs on the server, so the page's last request
-also leaves the choice in a small file next to the models (`remember`). With one model installed that model
-is used; with both, the remembered one (H3 Image before any choice, as the page does).
-"""
+"""Picture model families, package identity and supported canvas sizes."""
 import json
 import math
 from pathlib import Path
@@ -41,14 +36,39 @@ def remember(root, model):
             pass  # The choice only goes unremembered.
 
 
-def choose(info, remembered_model=None):
-    """The model id for a request that names none, from the service's `info()`; Qwen when it lists no models."""
-    ready = [row['id'] for row in (info or {}).get('models') or () if row.get('ready') and row.get('id') in MODELS]
+def open_package(machine, model, package=None, expected=None):
+    """Resolve picture weights and check the identity stored when the request was accepted."""
+    from ..image_components import ComponentError, digest, resolve
+    from ..model_packages import PackageError, resolve_image
+
+    try:
+        if model is None:
+            resolved = resolve_image(machine, package_id=package)
+        else:
+            resolved = resolve(machine, model, package=package) if package else resolve(machine, model)
+    except PackageError as error:
+        raise ComponentError(str(error)) from error
+    identity = digest(resolved['identity'])
+    if expected is not None and identity != expected:
+        raise ComponentError('The image model package changed after this request was accepted. Try again.')
+    return resolved, identity
+
+
+def choose(info, prefer=None):
+    """Choose the caller's preferred family, the active package's family, or a ready default."""
+    info = info or {}
+    ready = [row['id'] for row in info.get('models') or ()
+             if row.get('ready') and row.get('available', True) and 'component_error' not in row and row.get('id') in MODELS]
+    active = next((row for row in info.get('image_packages') or () if row.get('active')), None)
+    if active and not active.get('ready'):
+        ready = [family for family in ready if family != active.get('family')]
     if not ready:
         return QWEN
-    if len(ready) == 1:
-        return ready[0]
-    return remembered_model if remembered_model in ready else (H3 if H3 in ready else ready[0])
+    if prefer in ready:
+        return prefer
+    if active and active.get('family') in ready:
+        return active['family']
+    return H3 if H3 in ready else ready[0]
 
 
 def size(model, aspect, tier='standard'):

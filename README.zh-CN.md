@@ -88,7 +88,7 @@ git clone https://github.com/FlashML-org/FreeVideo.git
 
 支持成套的 H3 Transformer 和 VDN-H3 8 步检查点（`h3-base/transformer` 和 `stage-dmd-step-250`），以及兼容的 FreeVideo FP8 或 ConvRot INT8 预制缓存。第三方预制缓存须包含完整的 AdaLN 投影。两种格式均使用当前安装中的文本编码器和音视频解码器。
 
-同一设置页还提供 **图像模型切换**。安装内置系列后，可选择 MiniMax H3 Image、Qwen-Image 2.1 Turbo 或 MOSS-Image-SFT，再检查 Hugging Face 仓库链接。导入兼容的去噪权重时会复用该系列的编码器和解码器。图像工作区会显示正在使用的版本，每个系列都能独立切回内置权重。
+打开 **设置 → 模型 → 图像模型包**，为已安装的图像模型系列创建命名包，选择去噪器、文本编码器和 VAE。可从 Hugging Face 或本地模型目录导入兼容权重。点击 **用于出图** 设置默认包。图像工作区会记住自己的选择，并用它预热和出图。
 
 如果权重已在电脑上，请在装有 CUDA 版 FreeVideo 的 Windows 电脑上直接打开 FreeVideo，在 **设置 → 模型** 的对应区域使用 **从本地导入**。图像模型可选择去噪器 `.safetensors` 或 MOSS 分片索引。视频模型可选择预制缓存的 `manifest.json`，或包含 `h3-base` 和 `stage-dmd-step-250` 的原始权重目录。
 

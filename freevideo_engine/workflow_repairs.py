@@ -25,6 +25,7 @@ TOLERATED = {
     'step_cache': ('choice', 'none', ('none', 'easycache-av', 'fbcache')),
     'upscale_factor': ('choice', '2', ('2', '1.5', '1.2')),
     'fast_mode': ('choice', 'none', ('none', *FAST_MODES)),
+    'video_package': ('text', '', None),
 }
 KEPT = 50
 

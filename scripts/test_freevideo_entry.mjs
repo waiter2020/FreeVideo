@@ -13,8 +13,12 @@ import {expandCast} from '../web/cast_mention.js';
 import {cleanAudioUse, cleanOptionalPrompt, cleanOptionalWidgets, optionalInputValue} from '../web/optional_inputs.js';
 import {hfModelSettings} from '../web/settings_video_models.js';
 import {createModelManagement} from '../web/model_management.js';
+import {createModelPackages} from '../web/model_packages.js';
 import {t as settingsText} from '../web/settings_words.js';
-import {activeVideoModel, applyVideoModelSnapshot, piVideoModeInfo, piVideoProblem} from '../web/video_model.js';
+import {activeVideoModel, applyVideoModelSnapshot, createVideoModelPicker, MODEL_PACKAGES_CHANGED,
+    piVideoModeInfo, piVideoProblem, sameVideoChoice} from '../web/video_model.js';
+import {imagePackageRows, imagePackageState, preferredImagePackage} from '../web/image_view_models.js';
+import {piVideoPacks} from '../web/pi_video_packs.js';
 
 class Element {
     constructor(tag) {
@@ -791,7 +795,9 @@ class SettingsElement extends Element {
         if (this.tag === 'select' && !this.value) this.value = children[0]?.value || '';
     }
     querySelectorAll(tag) { return descendants(this).filter(node => node.tag === tag); }
+    hasAttribute(name) { return Object.hasOwn(this.attributes, name); }
     querySelector(selector) {
+        if (selector.startsWith('.')) return descendants(this).find(node => node.className?.split(' ').includes(selector.slice(1)));
         return this.children.find(node => selector === ':scope > .st-btn-t' && node.className === 'st-btn-t');
     }
 }
@@ -854,27 +860,109 @@ test('model library reviews, installs and switches a replacement without removin
     } finally { globalThis.document = original; }
 });
 
-test('model library filters by checkpoint and delegates existing controls', () => {
+test('system models and pi-H3 pair imports have separate controls', async () => {
     const original = globalThis.document;
     globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
     try {
-        let managed;
         const video = {id: 'video-h3', group: 'video', label: 'Video checkpoint', manager: 'video', default: {id: 'builtin', label: 'MiniMax H3'}};
         const speech = {id: 'voice-clone', group: 'audio', label: 'Voice cloning', default: {id: 'builtin', label: 'CosyVoice3'}};
-        const panel = createModelManagement({t: settingsText, onManage: item => { managed = item; }});
-        panel.update({slots: [video, speech], local_available: false});
+        const image = {id: 'qwen-image-2.1-turbo-dit', group: 'image', label: 'Qwen denoiser', manager: 'image'};
+        const fast = {id: 'pi-h3-2-step', group: 'video', label: 'pi-H3 2-step adapter', supported: true, actions: ['inspect', 'install']};
+        const prompt = {id: 'prompt-vlm', group: 'prompt', label: 'Prompt enhancement', default: {id: 'builtin', label: 'Qwen'}};
+        const panel = createModelManagement({t: settingsText});
+        panel.update({slots: [video, speech, image, fast, prompt], local_available: false});
         const all = () => descendants(panel.element);
+        const toggles = () => all().filter(node => node.dataset.modelToggle).map(node => node.dataset.modelToggle);
+        assert.deepEqual(toggles().sort(), [prompt.id, speech.id].sort());
+        assert.equal(all().some(node => node.className === 'st-gh' && node.textContent?.includes('视频生成')), false);
         const search = all().find(node => node.type === 'search');
-        search.value = 'minimax';
-        search.oninput();
-        assert.deepEqual(all().filter(node => node.dataset.modelToggle).map(node => node.dataset.modelToggle), [video.id]);
-        all().find(node => node.dataset.modelToggle === video.id).onclick();
-        assert.equal(managed, video);
         search.value = 'cosyvoice';
         search.oninput();
+        assert.deepEqual(toggles(), [speech.id]);
         all().find(node => node.dataset.modelToggle === speech.id).onclick();
         assert.equal(all().some(node => node.tag === 'form'), false);
+        search.value = 'pi-h3';
+        search.oninput();
+        assert.deepEqual(toggles(), []);
+        const calls = [], weights = createModelManagement({t: settingsText, piWeights: true, request: async (action, payload) => {
+            calls.push([action, payload]);
+            return {candidate: {id: 'pair', files: ['adapter', 'constants']}};
+        }});
+        weights.update({slots: [video, speech, image, fast, prompt], local_available: true, native_picker: false});
+        const controls = () => descendants(weights.element);
+        const [toggle] = controls().filter(node => node.dataset.modelToggle);
+        assert.equal(toggle.dataset.modelToggle, fast.id);
+        toggle.onclick();
+        const path = controls().find(node => node.type === 'text');
+        path.value = '/model-library/pi-h3-pair'; path.oninput();
+        await controls().find(node => node.tag === 'form').onsubmit({preventDefault() {}});
+        assert.deepEqual(calls, [['model-component', {action: 'inspect', slot: fast.id, source: 'local', path: path.value}]]);
     } finally { globalThis.document = original; }
+});
+
+test('package editing preserves drafts while an import adds a new binding choice', async () => {
+    const original = globalThis.document;
+    const hadWindow = Object.hasOwn(globalThis, 'window');
+    const originalWindow = globalThis.window;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    globalThis.window = {dispatchEvent() {}};
+    try {
+        const imported = 'ab'.repeat(12), calls = [];
+        const spec = {
+            id: 'qwen-image-2.1', category: 'image', family: 'qwen-image-2.1-turbo',
+            label: 'Qwen-Image 2.1', label_zh: 'Qwen-Image 2.1',
+            roles: [{id: 'dit', label: 'Denoiser', label_zh: '去噪器', choices: [
+                {id: 'builtin', label: 'Built-in', label_zh: '内置', builtin: true},
+            ]}],
+            parameters: [],
+        };
+        const doc = {
+            types: [spec],
+            packages: [{id: 'pkg_' + 'cd'.repeat(16), type: spec.id, name: 'Mine', builtin: false,
+                bindings: {dit: 'builtin'}, parameters: {}, ready: true}],
+            active: {image: 'builtin:qwen-image-2.1'}, legacy_fast: {}, shared_encoder: 'builtin',
+        };
+        const panel = createModelPackages({t: settingsText, onImportImage: (...args) => { calls.push(args); return true; },
+            request: async (action, payload) => { calls.push([action, payload]); return {}; }});
+        panel.update(doc);
+        const all = () => descendants(panel.element);
+        const pack = doc.packages[0], field = name => all().find(node => node.dataset.packageField === `${pack.id}/${name}`);
+        const button = (en, zh) => all().find(node => node.className === 'st-btn-t' && node.textContent === settingsText(en, zh)).parentNode;
+        field('name').value = 'Adjusted'; field('name').oninput();
+        button('Manage weights', '管理权重').onclick();
+        assert.deepEqual(calls, [[spec.family, 'dit']]);
+        const next = structuredClone(doc);
+        next.types[0].roles[0].choices.push({id: imported, label: 'Imported weight'});
+        panel.update(next);
+        assert.equal(field('name').value, 'Adjusted');
+        assert.ok(field('dit').children.some(choice => choice.value === imported));
+        field('dit').value = imported; field('dit').onchange();
+        await button('Save', '保存').onclick();
+        assert.deepEqual(calls.at(-1), ['model-package', {action: 'update', id: pack.id, name: 'Adjusted', bindings: {dit: imported}}]);
+    } finally {
+        globalThis.document = original;
+        if (hadWindow) globalThis.window = originalWindow;
+        else delete globalThis.window;
+    }
+});
+
+test('a local picture package survives a global switch and reports missing or damaged weights', () => {
+    const family = 'qwen-image-2.1-turbo';
+    const builtin = {id: 'builtin:qwen-image-2.1', family, builtin: true, ready: true, active: false};
+    const custom = {id: 'pkg_' + 'ab'.repeat(16), family, name: 'My Qwen', ready: true, active: true};
+    const info = {models: [{id: family, ready: true}], image_packages: [builtin, custom]};
+    const rows = imagePackageRows(info);
+    assert.equal(preferredImagePackage(info, rows, null).packageId, custom.id);
+    assert.equal(preferredImagePackage(info, rows, builtin.id).packageId, builtin.id);
+    info.image_packages = [builtin, {...custom, components_ready: false, ready: false}];
+    assert.equal(imagePackageState(info, family, rows[1]).state, 'unavailable');
+    info.image_packages = [builtin];
+    const removed = preferredImagePackage(info, imagePackageRows(info), custom.id, rows[1]);
+    assert.equal(removed.packageId, custom.id);
+    assert.equal(imagePackageState(info, family, removed).state, 'unavailable');
+    info.models[0].ready = false;
+    info.image_packages = [{...builtin, ready: false, components_ready: true}];
+    assert.equal(imagePackageState(info, family, rows[0]).state, 'missing');
 });
 
 test('local H3 scans keep checkpoints independent through review, copy and activation', async () => {
@@ -1119,12 +1207,80 @@ test('A pi-H3 snapshot fixes the adapter and steps without changing the draft or
         assert.deepEqual(submitted.output[1].inputs, {text: 'Rain', base_steps: steps, refine_steps: 3,
             two_pass: false, preview: false, step_cache: 'none', upscale_factor: '2', fast_mode: model, native_h3_preset: ''});
         assert.equal(cleanOptionalPrompt(submitted).output[1].inputs.fast_mode, model);
+        assert.equal(submitted.output[1].inputs.video_package, undefined);
     }
+    const packaged = applyVideoModelSnapshot(structuredClone(draft), 1, active, 'fast2', 'builtin:pi-h3-2-step');
+    assert.equal(packaged.output[1].inputs.video_package, 'builtin:pi-h3-2-step');
+    assert.equal(packaged.output[1].inputs.fast_mode, 'fast2');
+    assert.equal(packaged.output[1].inputs.base_steps, 2);
+    const rejected = applyVideoModelSnapshot(structuredClone(draft), 1, active, 'fast4', 'not-a-package');
+    assert.equal(cleanOptionalPrompt(rejected).output[1].inputs.video_package, 'not-a-package');
+    assert.equal(optionalInputValue('video_package', 'pkg_' + 'ab'.repeat(16)), 'pkg_' + 'ab'.repeat(16));
+    assert.equal(optionalInputValue('video_package', true), '');
     const current = applyVideoModelSnapshot(structuredClone(draft), 1, {id: 'official'}, 'current');
     assert.deepEqual(current.output[1].inputs, {...draft.output[1].inputs, fast_mode: 'none', native_h3_preset: ''});
+    assert.equal(applyVideoModelSnapshot(packaged, 1, {id: 'official'}, 'current').output[1].inputs.video_package, '');
     const linked = structuredClone(draft); linked.output[1].inputs.base_steps = ['2', 0];
     assert.throws(() => applyVideoModelSnapshot(linked, 1, active, 'fast4'), /pi_h3_linked_sampling/);
     assert.deepEqual(linked.output[1].inputs.base_steps, ['2', 0]);
+});
+
+test('the video catalog restores a custom package and a captured choice survives another choice in the same mode', async () => {
+    const names = ['document', 'window', 'localStorage', 'addEventListener', 'removeEventListener'];
+    const previous = names.map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]);
+    const make = tag => new SettingsElement(tag), noop = () => {};
+    const first = 'pkg_' + 'ab'.repeat(16), second = 'pkg_' + 'cd'.repeat(16);
+    const scope = 'package-test', selection = new Map([[`freevideo.video.model.${scope}`, first]]);
+    const events = new EventTarget(), changes = [], requests = [];
+    globalThis.document = {head: make('head'), createElement: make, createElementNS: (_, tag) => make(tag),
+        querySelectorAll: () => [], addEventListener: noop, removeEventListener: noop};
+    globalThis.window = events;
+    globalThis.localStorage = {getItem: key => selection.get(key), setItem: (key, value) => selection.set(key, value)};
+    globalThis.addEventListener = globalThis.removeEventListener = noop;
+    const type = 'pi-h3-2-step', spec = {id: type, category: 'video', mode: 'fast2', label: 'pi-H3 2-step'};
+    const packages = [{id: first, type, name: 'First', ready: true}, {id: second, type, name: 'Second', ready: true}];
+    let officialStatus = {present: false, published: true, compatible: true, install: {state: 'idle'}};
+    const fetchApi = async path => {
+        requests.push(path);
+        return {ok: true, json: async () => path.includes('view=video-packages')
+            ? {video_models: {active: {id: 'official'}}, model_packages: {types: [spec], packages}}
+            : path.includes('target=builtin') ? officialStatus : {present: true}};
+    };
+    const picker = createVideoModelPicker({t: settingsText, scope, onChange: () => changes.push(picker.choice()), fetchApi});
+    try {
+        assert.deepEqual(picker.choice(), {mode: null, packageId: first, pending: true});
+        await picker.ready();
+        const captured = picker.choice();
+        assert.deepEqual(captured, {mode: 'fast2', packageId: first, pending: false});
+        assert.deepEqual(changes, [captured]);
+        assert.deepEqual(requests.filter(path => path.startsWith('/freevideo/setup')), ['/freevideo/setup?view=video-packages']);
+        picker.select(second);
+        assert.equal(sameVideoChoice(captured, picker.choice()), false);
+        const draft = {output: {1: {class_type: 'FreeVideoGenerate', inputs: {}}}};
+        const input = applyVideoModelSnapshot(draft, 1, picker.active(), captured.mode, captured.packageId).output[1].inputs;
+        assert.equal(input.video_package, first);
+        const official = piVideoPacks(fetchApi, 'builtin');
+        await official.read('fast2');
+        officialStatus = {...officialStatus, install: {state: 'running', done: 10}};
+        await official.read('fast2');
+        officialStatus = {...officialStatus, install: {state: 'running', done: 20}};
+        await official.read('fast2');
+        assert.equal(requests.filter(path => path.startsWith('/freevideo/setup')).length, 1);
+        officialStatus = {...officialStatus, present: true, install: {state: 'done'}};
+        await official.read('fast2');
+        await picker.ready();
+        assert.equal(requests.filter(path => path.startsWith('/freevideo/setup')).length, 2);
+        packages.pop();
+        events.dispatchEvent(new Event(MODEL_PACKAGES_CHANGED));
+        await picker.ready();
+        assert.deepEqual(picker.choice(), {mode: null, packageId: second, pending: false});
+        assert.equal(picker.status('fast2', second).compatibility_reason, 'package');
+    } finally {
+        picker.dispose();
+        for (const [name, value] of previous) {
+            if (value) Object.defineProperty(globalThis, name, value); else delete globalThis[name];
+        }
+    }
 });
 
 test('Video admission reads the model-specific duration and preserves legacy fast2 grids', () => {

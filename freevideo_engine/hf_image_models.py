@@ -83,10 +83,12 @@ def recorded_device(record):
 
 def active_profile(engine_root, model, *, gpu_uuid=None):
     """Resolve only locally verified profiles for the native worker."""
-    identity = _choices(engine_root).get(model)
-    if identity is None:
-        return None
+    from .model_packages import image_selections
+
     try:
+        identity = image_selections(engine_root).get(model, {}).get('dit')
+        if identity is None:
+            return None
         folder, record = _profile(engine_root, identity)
         selected_device = gpu_uuid or device_identity(_read(Path(engine_root) / 'machine.json'))
         if record['model']['model'] == model and recorded_device(record) == selected_device:
@@ -129,11 +131,15 @@ class ImageModels(HubModelJobs):
         except ValueError:
             return dict(available=False, families=[], active={}, installed=[], task=task)
         families, installed, damaged, active, components = [], [], [], {}, {}
+        from .model_packages import binding_references, image_selections, load as load_packages
+
         try:
-            choices = image_components.read_selections(self.root)
+            packages = load_packages(self.root)
+            choices = image_selections(self.root, document=packages)
+            protected = binding_references(self.root, 'image', document=packages)
             selection_error = None
-        except image_components.ComponentError as error:
-            choices, selection_error = {}, str(error)
+        except (OSError, ValueError) as error:
+            choices, protected, selection_error = {}, set(), str(error)
         for model, (label, _) in FAMILIES.items():
             ready = bool(_ready(machine, model))
             families.append(dict(id=model, label=label, ready=ready))
@@ -173,7 +179,8 @@ class ImageModels(HubModelJobs):
                     row['damaged'] = True
                 slot = components[row['model']][row['component']]
                 row['active'] = choices.get(row['model'], {}).get(row['component']) == row['id']
-                row.update(removable=not row['active'], repairable=self._repairable(record))
+                row.update(removable=selection_error is None and row['id'] not in protected,
+                           repairable=self._repairable(record))
                 (slot['damaged'] if row.get('damaged') else slot['installed']).append(row)
                 if row['active']:
                     slot['active'] = row
@@ -310,9 +317,11 @@ class ImageModels(HubModelJobs):
         return self._maintenance(identity, 'remove', self._remove_version, identity, model, role)
 
     def _remove_version(self, identity, model, role):
+        from .model_packages import binding_references
+
         with self._maintenance_lease():
-            if image_components.read_selections(self.root).get(model, {}).get(role) == identity:
-                raise ValueError('Activate another image component before removing this version.')
+            if identity in binding_references(self.root, 'image'):
+                raise ValueError('Remove this weight from every model package and the shared encoder before deleting it.')
             self._delete_import(_folder(self.root, identity))
 
     def repair(self, identity, *, model=None, component=None, token=None):
@@ -375,10 +384,12 @@ class ImageModels(HubModelJobs):
         return None
 
     def _already_active(self, identity):
+        from .model_packages import image_selections
+
         machine = self._machine()
         try:
             row = image_components.installed(self.root, identity, machine)
-            return image_components.read_selections(self.root).get(row['model'], {}).get(row['component']) == identity
+            return image_selections(self.root).get(row['model'], {}).get(row['component']) == identity
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             return False
 
@@ -529,14 +540,36 @@ class ImageModels(HubModelJobs):
         if model is not None or component is not None or (not identity.startswith(BUILTIN)
                                                          and (_folder(self.root, identity) / image_components.RECEIPT).is_file()):
             return self._start_activation(identity, model, component)
-        if identity.startswith(BUILTIN):
-            if identity.removeprefix(BUILTIN) not in FAMILIES:
-                raise ValueError('Unknown built-in image model.')
-        else:
-            _folder(self.root, identity)
         return self._switch_when_idle(identity)
 
-    def _start_activation(self, identity, model, role):
+    def _activate(self, identity):
+        from .model_packages import note_image_selection
+
+        machine = self._machine()
+        if identity.startswith(BUILTIN):
+            model = identity.removeprefix(BUILTIN)
+            if model not in FAMILIES:
+                raise ValueError('Unknown built-in image model.')
+            binding = 'builtin'
+        else:
+            try:
+                _, record = _profile(self.root, identity)
+            except FileNotFoundError as error:
+                raise ValueError('Install this image model before activating it.') from error
+            model = record['model']['model']
+            if not _ready(machine, model):
+                raise ValueError('Install the built-in image model for this family first.')
+            image_components.installed(self.root, identity, machine, model=model, role='dit')
+            binding = identity
+        note_image_selection(self.root, model, 'dit', binding)
+
+    def switch_shared_encoder(self, identity):
+        model, role = image_model.H3, 'text_encoder'
+        if identity == 'builtin':
+            identity = image_components.builtin_id(model, role)
+        return self._start_activation(identity, model, role, video_only=True)
+
+    def _start_activation(self, identity, model, role, *, video_only=False):
         machine = self._machine()
         if identity.startswith(BUILTIN):
             parts = identity.split(':')
@@ -557,15 +590,17 @@ class ImageModels(HubModelJobs):
                 raise ValueError('Wait for the image component operation to finish.')
             self.stop = threading.Event()
             self.task = {}
-            self._update('waiting_for_gpu', id=identity, candidate=selected, operation='activate',
+            operation = 'set-shared-encoder' if video_only else 'activate'
+            self._update('waiting_for_gpu', id=identity, candidate=selected, operation=operation,
                          done_bytes=0, total_bytes=0)
-            self.thread = threading.Thread(target=self._verify_activation, args=(selected,),
+            self.thread = threading.Thread(target=self._verify_activation, args=(selected, video_only),
                                            name='freevideo-image-component-activation', daemon=True)
             self.thread.start()
         return self.status()
 
-    def _verify_activation(self, selected):
+    def _verify_activation(self, selected, video_only=False):
         from .long_paths import plain
+        from .model_packages import commit_shared_encoder, image_default, load as load_packages, note_image_selection
 
         model, role, identity = selected['model'], selected['component'], selected['id']
         builtin = identity == image_components.builtin_id(model, role)
@@ -573,14 +608,19 @@ class ImageModels(HubModelJobs):
         try:
             with runtime_lock(self.root / 'setup.lock', inherit=False):
                 machine = self._machine()
-                choices = image_components.read_selections(self.root)
-                proposed = {family: dict(slots) for family, slots in choices.items()}
-                proposed.setdefault(model, {})[role] = None if builtin else identity
-                if proposed == choices:
+                packages = load_packages(self.root)
+                default = image_default(self.root, model, document=packages)
+                current_encoder = packages['shared_encoder']
+                binding = 'builtin' if builtin else identity
+                unchanged_image = video_only or default['bindings'][role] == binding
+                if unchanged_image and (not shared or current_encoder == binding):
                     self._update('ready')
                     return
+                proposed = {name: value for name, value in default['bindings'].items() if value != 'builtin'}
+                proposed[role] = None if builtin else identity
                 encoder = image_components.shared_encoder(machine, identity=None if builtin else identity) if shared else None
-                picture = image_components.resolve(machine, model, selections=proposed[model]) if _ready(machine, model) else None
+                picture = (image_components.resolve(machine, model, selections=proposed)
+                           if not video_only and _ready(machine, model) else None)
                 native = self._native_presets(machine, encoder) if shared else []
                 vdn = shared and machine.get('video_model', True) and machine.get('cache')
                 with TemporaryDirectory(prefix='component-activation-', dir=io_path(self.root)) as temporary:
@@ -607,15 +647,19 @@ class ImageModels(HubModelJobs):
                     self.release_idle()
                     with self._smoke_lease():
                         self._check()
-                        if image_components.read_selections(self.root) != choices:
-                            raise ValueError('The active components changed during verification. Try again.')
                         if picture is not None:
-                            latest = image_components.resolve(machine, model, selections=proposed[model])
+                            latest = image_components.resolve(machine, model, selections=proposed)
                             if latest['identity'] != picture['identity']:
                                 raise ValueError('A component changed during verification. Import it again.')
                         if shared:
-                            image_components.shared_encoder(machine, identity=None if builtin else identity)
-                        image_components.write_selections(self.root, proposed)
+                            latest = image_components.shared_encoder(machine, identity=None if builtin else identity)
+                            if latest != encoder:
+                                raise ValueError('The shared encoder changed during verification. Import it again.')
+                        if video_only:
+                            commit_shared_encoder(self.root, binding, machine, expected=current_encoder)
+                        else:
+                            note_image_selection(self.root, model, role, binding, expected=default,
+                                                 shared_expected=current_encoder if shared else None)
                 self._update('ready', validation=None)
         except InterruptedError:
             self._update('cancelled', validation=None)
@@ -649,22 +693,3 @@ class ImageModels(HubModelJobs):
         if identities and (self.comfy_h3_smoke is None or not self.comfy_h3_smoke.available()):
             raise ValueError('Open the local ComfyUI queue to verify the shared encoder for installed H3 presets.')
         return [comfy_shared_encoder_profile(self.root, identity, machine, encoder) for identity in identities]
-
-    def _activate(self, identity):
-        machine = self._machine()
-        saved = _choices(self.root)
-        if identity.startswith(BUILTIN):
-            saved.pop(identity.removeprefix(BUILTIN), None)
-        else:
-            try:
-                folder, record = _profile(self.root, identity)
-            except FileNotFoundError as error:
-                raise ValueError('Install this image model before activating it.') from error
-            model = record['model']['model']
-            if recorded_device(record) != device_identity(machine):
-                raise ValueError('This model was tested on a different device. Import it again.')
-            if not _ready(machine, model):
-                raise ValueError('Install the built-in image model for this family first.')
-            _verify_stamps(folder, record)
-            saved[model] = identity
-        save(self.root / SELECTION, dict(schema_version=1, active=saved), durable=True)

@@ -1,6 +1,7 @@
 // An installation set up with MiniMax H3 Image alone has no video model. The video panel's main button then adds it:
 // the launcher reading this ComfyUI opens its installation with the video model, and its review installs it once accepted.
 import {modelPicker} from './image_view_models.js';
+import {clearFastMode, videoPackageId} from './optional_inputs.js';
 import {isPiVideoModel, PI_VIDEO_MODES, piVideoName, piVideoPackState, piVideoPacks, piVideoSteps,
     piVideoUnavailableText} from './pi_video_packs.js';
 export {isPiVideoModel, piVideoDownloadText, piVideoSteps} from './pi_video_packs.js';
@@ -38,16 +39,21 @@ export async function activeVideoModel(fetchApi) {
     } catch { /* Keep the last known profile while the engine is unavailable. */ }
 }
 
-export function applyVideoModelSnapshot(prompt, nodeId, model, selection = null) {
+export function applyVideoModelSnapshot(prompt, nodeId, model, selection = null, videoPackage = undefined) {
     const entry = prompt?.output?.[String(nodeId)];
     if (entry?.class_type !== 'FreeVideoGenerate' || !entry.inputs) return prompt;
     if (isPiVideoModel(selection)) {
         const fixed = {...COMFY_H3_SAMPLING, base_steps: piVideoSteps(selection), refine_steps: 3, fast_mode: selection};
         if (Object.keys(fixed).some(name => Array.isArray(entry.inputs[name]))) throw new Error('pi_h3_linked_sampling');
-        Object.assign(entry.inputs, fixed, {native_h3_preset: ''});
+        const patch = {native_h3_preset: ''};
+        if (videoPackage !== undefined && (videoPackage || 'video_package' in entry.inputs)) patch.video_package = videoPackage || '';
+        Object.assign(entry.inputs, fixed, patch);
         return prompt;
     }
-    if (selection === 'current' && !Array.isArray(entry.inputs.fast_mode)) entry.inputs.fast_mode = 'none';
+    if (selection === 'current' && !Array.isArray(entry.inputs.fast_mode)) {
+        clearFastMode(entry.inputs);
+        entry.inputs.fast_mode = 'none';
+    }
     if (model === undefined) return prompt;
     const native = model?.kind === 'comfy_h3';
     entry.inputs.native_h3_preset = native ? model.id : '';
@@ -55,7 +61,17 @@ export function applyVideoModelSnapshot(prompt, nodeId, model, selection = null)
     for (const [name, setting] of Object.entries(COMFY_H3_SAMPLING)) {
         if (!Array.isArray(entry.inputs[name])) entry.inputs[name] = setting;
     }
+    if (entry.inputs.fast_mode === 'none') clearFastMode(entry.inputs);
     return prompt;
+}
+
+export const MODEL_PACKAGES_CHANGED = 'freevideo-model-packages-changed';
+export const sameVideoChoice = (a, b) => a?.mode === b?.mode && a?.packageId === b?.packageId && a?.pending === b?.pending;
+
+export function videoChoiceProblem(t, choice) {
+    if (choice?.pending) return t('Checking the selected model package…', '正在检查所选模型包…');
+    if (choice?.packageId && !isPiVideoModel(choice.mode)) return piVideoUnavailableText(t, 'package');
+    return '';
 }
 
 export function createVideoModelPicker({fetchApi, t, scope, initial = null, onChange = () => {}, onActive = () => {}}) {
@@ -63,20 +79,26 @@ export function createVideoModelPicker({fetchApi, t, scope, initial = null, onCh
     if (![...document.querySelectorAll('link[rel=stylesheet]')].some(link => link.href === css)) {
         const link = document.createElement('link'); link.rel = 'stylesheet'; link.href = css; document.head.append(link);
     }
-    const key = `freevideo.video.model.${scope}`, packs = piVideoPacks(fetchApi);
-    let selected = initial, active, grid, disposed = false;
+    const key = `freevideo.video.model.${scope}`, packs = piVideoPacks(fetchApi), official = piVideoPacks(fetchApi, 'builtin');
+    let selected = initial, active, grid, disposed = false, catalogReady = false, catalog, reading, reload = false, activeRevision = 0;
+    const entries = new Map();
     try {
         const saved = localStorage.getItem(key);
-        if (saved === 'current' || isPiVideoModel(saved)) selected = saved;
+        if (saved === 'current' || isPiVideoModel(saved) || videoPackageId(saved)) selected = saved;
     } catch { /* The choice still works for this view. */ }
-    const models = [{id: 'current', name: t('Native H3', '原生H3'), short: t('Model', '模型')},
-        ...PI_VIDEO_MODES.map(id => ({id, name: piVideoName(t, id), short: 'pi-H3'}))];
-    const stateOf = (_, mode) => {
-        if (mode === 'current') return {state: 'ready'};
-        const row = fastRow(grid, mode), state = piVideoPackState(t, packs.status(mode));
-        if (state.state !== 'unavailable' && grid?.status === 'ready' && !row?.listed)
-            return {state: 'unavailable', reason: piVideoUnavailableText(t, row?.unlisted_reason)};
-        return {...state, pending: packs.pending(mode)};
+    const baseRows = () => [{id: 'current', name: t('Native H3', '原生H3'), short: t('Model', '模型'), mode: 'current', packageId: ''},
+        ...PI_VIDEO_MODES.map(id => ({id, name: piVideoName(t, id), short: 'pi-H3', mode: id, packageId: ''}))];
+    let rows = baseRows();
+    const packClient = packageId => packageId.startsWith('builtin:') ? official : packs;
+    const stateOf = (_, id) => {
+        const row = rows.find(item => item.id === id);
+        if (!row || row.mode === 'current') return {state: 'ready'};
+        if (!row.mode) return catalogReady ? {state: 'unavailable', reason: piVideoUnavailableText(t, 'package')} : {state: 'checking'};
+        const {mode, packageId} = row;
+        const fast = fastRow(grid, mode), state = piVideoPackState(t, status(mode, packageId));
+        if (state.state !== 'unavailable' && grid?.status === 'ready' && !fast?.listed)
+            return {state: 'unavailable', reason: piVideoUnavailableText(t, fast?.unlisted_reason)};
+        return {...state, pending: packClient(packageId).pending(mode)};
     };
     function statusLabel(state) {
         if (state.reason) return state.reason;
@@ -90,14 +112,14 @@ export function createVideoModelPicker({fetchApi, t, scope, initial = null, onCh
         }
         return t('Checking…', '正在检查…');
     }
-    const picker = modelPicker({models, readState: stateOf, menuClass: 'fv-video-model-menu', host: () => element.closest('dialog') || element.closest('.fv-studio, .fv-editor'),
+    const picker = modelPicker({models: rows, readState: stateOf, menuClass: 'fv-video-model-menu', host: () => element.closest('dialog') || element.closest('.fv-studio, .fv-editor'),
         describe: (model, state) => state.reason || (model.id === 'current'
             ? active?.label || t('Use the active video model from Settings.', '使用设置中启用的视频模型。')
-            : t('Generate a video with synchronized audio in {steps} steps.', '用 {steps} 步生成带同步音频的视频。', {steps: piVideoSteps(model.id)})),
+            : t('Generate a video with synchronized audio in {steps} steps.', '用 {steps} 步生成带同步音频的视频。', {steps: piVideoSteps(model.mode || model.id)})),
         labelStatus: statusLabel,
         onPick: model => select(model.id),
-        onInstall: model => { void ensure(model.id); },
-        onPause: model => { void packs.action(model.id, 'cancel'); },
+        onInstall: model => { void ensure(model.mode, model.packageId); },
+        onPause: model => { if (isPiVideoModel(model.mode)) void packClient(model.packageId).action(model.mode, 'cancel'); },
         actionLabel: state => state.pending || state.cancelling ? '' : ({missing: state.resume ? t('Resume', '继续') : t('Install', '安装'),
             failed: t('Retry', '重试'), downloading: t('Pause', '暂停')})[state.state] || '',
     });
@@ -105,34 +127,118 @@ export function createVideoModelPicker({fetchApi, t, scope, initial = null, onCh
     picker.element.dataset.minMenuWidth = '242'; element.append(picker.element);
     picker.element.querySelector('.fv-iv-mpick-status').setAttribute('aria-live', 'polite');
     const paint = () => { if (!disposed) picker.paint(null, selected || 'current', false); };
-    function select(mode) {
-        if (selected === mode || (mode !== 'current' && !isPiVideoModel(mode))) return;
-        selected = mode;
-        try { localStorage.setItem(key, selected); } catch { /* The view still retains the choice. */ }
+    function choice() {
+        const packageId = videoPackageId(selected);
+        return {mode: packageId ? entries.get(packageId)?.mode ?? null : selected, packageId,
+            pending: Boolean(packageId && !catalogReady)};
+    }
+    function remember(id) {
+        selected = id;
+        try { if (selected) localStorage.setItem(key, selected); } catch { /* The view still retains the choice. */ }
+    }
+    function applyPackages(doc) {
+        const next = baseRows();
+        const legacy = doc?.legacy_fast || {};
+        entries.clear();
+        for (const spec of doc?.types || []) {
+            if (spec.category !== 'video' || !isPiVideoModel(spec.mode)) continue;
+            const group = t(spec.label, spec.label_zh);
+            for (const pack of doc.packages || []) {
+                if (pack.type !== spec.id || !videoPackageId(pack.id)) continue;
+                const row = {id: pack.id, name: pack.builtin ? group : (pack.name || group), short: 'pi-H3',
+                    mode: spec.mode, packageId: pack.id, group, ready: pack.ready === true, reason: pack.compatibility_reason};
+                entries.set(pack.id, row);
+                if (!pack.builtin || legacy[spec.mode] !== pack.id || selected === pack.id) next.push(row);
+            }
+        }
+        if (videoPackageId(selected) && !entries.has(selected)) next.push({id: selected, packageId: selected, short: 'pi-H3',
+            name: t('pi-H3 package', 'pi-H3 模型包')});
+        rows = next;
+        picker.setModels(rows);
+    }
+    function select(id) {
+        const row = rows.find(item => item.id === id);
+        if (!row || selected === row.id) return;
+        remember(row.id);
+        applyPackages(catalog);
         paint(); onChange();
-        if (isPiVideoModel(mode)) void packs.read(mode);
+        if (isPiVideoModel(row.mode) && (!row.packageId || row.packageId.startsWith('builtin:'))) void packClient(row.packageId).read(row.mode);
     }
-    async function ensure(mode, isCurrent = () => true) {
-        if (!isPiVideoModel(mode) || disposed || stateOf(null, mode).state === 'unavailable') return false;
-        return await packs.ensure(mode) && !disposed && isCurrent();
+    function status(mode, packageId = '') {
+        if (!packageId) return packs.status(mode);
+        const row = entries.get(packageId);
+        if (!catalogReady && !row) return undefined;
+        if (!row || row.mode !== mode || row.reason) return {present: false, compatible: false, compatibility_reason: row?.reason || 'package'};
+        if (packageId.startsWith('builtin:')) return official.status(mode) || (row.ready ? {present: true} : undefined);
+        return row.ready ? {present: true} : {present: false, compatible: false, compatibility_reason: 'package'};
     }
-    const changed = event => setActive(event.detail);
+    async function ensure(mode, packageId = '', isCurrent = () => true) {
+        if (!isPiVideoModel(mode) || disposed || !isCurrent()) return false;
+        if (packageId && !catalogReady) await reading;
+        const checked = status(mode, packageId), fast = fastRow(grid, mode);
+        if (disposed || !isCurrent() || checked?.compatible === false || grid?.status === 'ready' && !fast?.listed) return false;
+        if (packageId && !packageId.startsWith('builtin:')) return checked?.present === true;
+        return await packClient(packageId).ensure(mode) && !disposed && isCurrent();
+    }
+    async function loadPackages() {
+        const revision = activeRevision;
+        try {
+            const response = await fetchApi('/freevideo/setup?view=video-packages', {cache: 'no-store'});
+            if (!response.ok || disposed) return;
+            const result = await response.json();
+            if (disposed) return;
+            catalog = result?.model_packages ?? null;
+            if (revision === activeRevision) setActive(result?.video_models?.active);
+        } catch { /* The built-in modes stay available. */ }
+        finally {
+            if (!disposed) {
+                const previous = choice();
+                catalogReady = true;
+                applyPackages(catalog);
+                paint();
+                if (!sameVideoChoice(previous, choice())) onChange();
+            }
+        }
+    }
+    function refreshPackages() {
+        if (disposed) return;
+        if (reading) { reload = true; return; }
+        reading = loadPackages().finally(() => {
+            reading = null;
+            if (reload) { reload = false; refreshPackages(); }
+        });
+    }
+    function watchPacks(client) {
+        const previous = new Map();
+        return client.subscribe(() => {
+            paint();
+            let settled = false;
+            for (const mode of PI_VIDEO_MODES) {
+                const next = client.status(mode), before = previous.get(mode);
+                if (!next) continue;
+                if (before && (before.present !== next.present || before.compatible !== next.compatible
+                    || (before.install?.state === 'running' && next.install?.state !== 'running'))) settled = true;
+                previous.set(mode, next);
+            }
+            if (settled) refreshPackages();
+        });
+    }
+    const changed = event => { activeRevision++; setActive(event.detail); };
     function setActive(model) { if (model !== undefined) { active = model; paint(); onActive(model); } }
     window.addEventListener(VIDEO_MODEL_CHANGED, changed);
-    const unsubscribe = packs.subscribe(paint);
-    void activeVideoModel(fetchApi).then(model => { if (active === undefined && !disposed) setActive(model); });
+    window.addEventListener(MODEL_PACKAGES_CHANGED, refreshPackages);
+    const unsubscribe = watchPacks(packs), stopOfficial = watchPacks(official);
+    applyPackages(catalog);
+    refreshPackages();
     paint();
-    return {element, selection: () => selected, select, active: () => active, setActive,
+    return {element, choice, selection: () => choice().mode, select, active: () => active, setActive,
+        ready: () => reading,
         setCapabilities(next) { if (next?.status === 'ready') { grid = next; paint(); } },
-        info: (mode, width, height, frames) => {
-            const status = packs.status(mode);
-            if (status?.compatible === false) return {known: true, listed: false, reason: status.compatibility_reason};
-            return piVideoModeInfo(grid, mode, width, height, frames);
-        },
-        ensure, status: packs.status, close: () => picker.close(false),
+        ensure, status, close: () => picker.close(false),
         dispose() {
-            disposed = true; unsubscribe(); picker.dispose();
+            disposed = true; unsubscribe(); stopOfficial(); picker.dispose();
             window.removeEventListener(VIDEO_MODEL_CHANGED, changed);
+            window.removeEventListener(MODEL_PACKAGES_CHANGED, refreshPackages);
         }};
 }
 

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from freevideo_engine import hf_image_models, image_components
+from freevideo_engine import hf_image_models, image_components, model_packages
 from freevideo_engine.image_gen import image_model
 from freevideo_engine.monitoring import save
 from freevideo_engine.storage import fingerprint
@@ -52,7 +52,7 @@ class ImageComponentActivationTests(unittest.TestCase):
         self.assertEqual({role: row['id'] for role, row in checked.items()}, dict(dit=dit, text_encoder=encoder, vae=vae))
         with patch.object(self.manager, '_activate_picture'):
             self.assertEqual(self.activate(image_components.builtin_id(family, 'text_encoder'), family, 'text_encoder'), 'ready')
-        self.assertEqual(image_components.read_selections(self.root)[family], dict(dit=dit, text_encoder=None, vae=vae))
+        self.assertEqual(model_packages.image_selections(self.root)[family], dict(dit=dit, vae=vae))
 
     def test_failed_validation_keeps_previous_selection(self):
         family = image_model.QWEN
@@ -87,6 +87,35 @@ class ImageComponentActivationTests(unittest.TestCase):
         self.assertEqual(shared, image_encoder)
         self.assertEqual(Path(shared['path']), file)
         self.assertIsNone(image_components.shared_encoder(self.machine, identity='builtin'))
+
+    def test_shared_encoder_switch_validates_video_before_changing_its_binding(self):
+        family, role = image_model.H3, 'text_encoder'
+        picture, previous, candidate = 'a' * 24, 'b' * 24, 'c' * 24
+        for identity in (picture, previous, candidate):
+            self.install(identity, family, role)
+        self.machine.update(video_model=True, cache='installed-int8')
+        save(self.root / 'machine.json', self.machine)
+        image_components.write_selections(self.root, {family: {role: picture}})
+        model_packages.set_shared_encoder(self.root, previous, self.machine)
+
+        def change(error=None):
+            with (patch('freevideo_engine.hf_video_models.smoke_shared_encoder', side_effect=error) as smoke,
+                  patch.object(self.manager, '_activate_picture') as activate_picture,
+                  patch.object(self.manager, '_native_presets', return_value=[])):
+                self.manager.switch_shared_encoder(candidate)
+                self.manager.thread.join(5)
+                self.assertFalse(self.manager.thread.is_alive())
+            activate_picture.assert_not_called()
+            return smoke
+
+        change(ValueError('video smoke failed'))
+        self.assertEqual(self.manager.status()['task']['phase'], 'failed')
+        self.assertEqual(model_packages.shared_encoder_binding(self.root), previous)
+        smoke = change()
+        self.assertEqual([call.kwargs['reference'] for call in smoke.call_args_list], [False, True])
+        self.assertEqual(self.manager.status()['task']['phase'], 'ready')
+        self.assertEqual(model_packages.shared_encoder_binding(self.root), candidate)
+        self.assertEqual(model_packages.image_selections(self.root)[family][role], picture)
 
 
 if __name__ == '__main__':

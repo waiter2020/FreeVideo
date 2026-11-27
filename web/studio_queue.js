@@ -1,7 +1,7 @@
 // ComfyUI owns execution. This controller only submits frozen workflows and
 // replenishes a loop after its previous request has actually completed.
 import {fetchQueueRead, readEngineJson, detectBrowserExtension, isNetworkTypeError, wrappedFetchOnly, addConnectionFacts, connectionFacts} from './browser_extension.js';
-import {clonePrompt} from './optional_inputs.js';
+import {clearFastMode, clonePrompt} from './optional_inputs.js';
 import {isStaleProgress} from './progress_connection.js';
 const clone = clonePrompt;
 
@@ -90,7 +90,7 @@ export async function upscaleResult(api, nodeId, result, currentPrompt) {
         : clone(await currentPrompt());
     if (!snapshot.output?.[nodeId]) throw new Error('missing_node');
     Object.assign(snapshot.output[nodeId].inputs, {preview: false, refine_from: result.video, force_regenerate: false});
-    if ('fast_mode' in snapshot.output[nodeId].inputs) snapshot.output[nodeId].inputs.fast_mode = 'none';
+    clearFastMode(snapshot.output[nodeId].inputs);
     const reply = await api.queuePrompt(0, snapshot);
     if (!reply?.prompt_id) throw new Error('submit_failed');
     api.dispatchCustomEvent?.('promptQueued', {number: 0, batchCount: 1});
@@ -106,7 +106,7 @@ export async function upscaleWork(api, nodeId, result, currentPrompt, {to = ''} 
     if (to !== '' && to !== '4k') throw new Error('unknown_size');
     const snapshot = clone(await currentPrompt());
     if (!snapshot.output?.[nodeId]) throw new Error('missing_node');
-    if ('fast_mode' in snapshot.output[nodeId].inputs) snapshot.output[nodeId].inputs.fast_mode = 'none';
+    clearFastMode(snapshot.output[nodeId].inputs);
     Object.assign(snapshot.output[nodeId].inputs, {preview: false, refine_from: '', upscale_from: result.video, upscale_to: to, force_regenerate: true});
     const reply = await api.queuePrompt(0, snapshot);
     if (!reply?.prompt_id) throw new Error('submit_failed');

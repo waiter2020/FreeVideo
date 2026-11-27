@@ -44,9 +44,11 @@ function input({placeholder = '', type = 'text'} = {}) {
     return node;
 }
 
-export function createModelManagement({request, refresh, t, onManage}) {
+export function createModelManagement({request, refresh, t, onManage, piWeights = false, onReady}) {
     const element = el('section', 'st-model-management');
-    const heading = groupHead(t('Model library', '模型库'));
+    const heading = groupHead(piWeights ? t('pi-H3 weight files', 'pi-H3 权重文件') : t('System models', '系统模型'));
+    const include = model => piWeights ? String(model.id || '').startsWith('pi-h3-')
+        : model.manager !== 'image' && model.manager !== 'video' && !String(model.id || '').startsWith('pi-h3-');
     const search = input({type: 'search', placeholder: t('Search models', '搜索模型')});
     search.setAttribute('aria-label', search.placeholder);
     const searchRow = el('div', 'st-model-search');
@@ -75,13 +77,13 @@ export function createModelManagement({request, refresh, t, onManage}) {
     const name = model => t(model.label, model.label_zh || model.label);
 
     function sayJob() {
-        const job = view.job;
+        const model = view.slots?.find(item => item.id === view.job?.slot);
+        const job = model && include(model) ? view.job : null;
         const busy = activeJob(job);
         if (!busy) stopping = false;
         const phase = stopping && busy ? 'cancelling' : job?.phase;
         const message = requestError || (job?.error && failureText(job.error)) || (phase && phase !== 'idle'
             ? t(...(phases[phase] || ['Working…', '正在处理…'])) : '');
-        const model = view.slots?.find(item => item.id === job?.slot);
         const bytes = busy && job.total_bytes > 0 ? `${job.done_bytes > 0 ? bytesText(job.done_bytes) : '0'} / ${bytesText(job.total_bytes)}` : '';
         const text = message && [requestError ? '' : model && name(model), message, bytes].filter(Boolean).join(' · ');
         if (notice.textContent !== text) notice.textContent = text;
@@ -105,8 +107,13 @@ export function createModelManagement({request, refresh, t, onManage}) {
 
     function update(next, blocked = setupBusy) {
         setupBusy = blocked;
+        const previous = view.job;
         if (next !== undefined) view = next || {};
-        element.hidden = !view.slots?.length;
+        if (activeJob(previous) && view.job?.slot === previous.slot && !activeJob(view.job) && !view.job?.error) {
+            const model = view.slots?.find(item => item.id === view.job.slot);
+            if (model && include(model)) onReady?.();
+        }
+        element.hidden = !view.slots?.some(include);
         paint();
     }
 
@@ -317,16 +324,14 @@ export function createModelManagement({request, refresh, t, onManage}) {
             consentInput = undefined;
             toggles.clear();
             const query = (search.value || '').trim().toLowerCase();
-            const sections = new Map();
+            const box = card();
             for (const model of view.slots || []) {
+                if (!include(model)) continue;
                 if (query && !searchValues(model).some(value => String(value || '').toLowerCase().includes(query))) continue;
                 const group = Object.hasOwn(groups, model.group) ? model.group : 'other';
-                if (!sections.has(group)) sections.set(group, card());
-                sections.get(group).append(...modelRow(model, groups[group][2]));
+                box.append(...modelRow(model, groups[group][2]));
             }
-            list.replaceChildren(...Object.entries(groups).flatMap(([group, [en, zh]]) => sections.has(group)
-                ? [groupHead(t(en, zh)), sections.get(group)] : []));
-            if (!list.childElementCount) list.append(el('p', 'st-p', t('No models match this search.', '没有找到符合条件的模型。')));
+            list.replaceChildren(box.childElementCount ? box : el('p', 'st-p', t('No models match this search.', '没有找到符合条件的模型。')));
         }
         syncControls();
         if (focusConsent && consentInput) { consentInput.focus(); focusConsent = false; }

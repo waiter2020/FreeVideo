@@ -568,19 +568,18 @@ export function createEditorGenbar(host, {state, t, actions, text = '', modelPic
         emptyWatch = watch;
         place();
     };
-    const press = async (allowEmpty = false, allowDownload = false) => {
+    const press = async (allowEmpty = false, allowDownload = false, videoChoice = actions.videoModel?.()) => {
         const key = JSON.stringify(state.selection ?? null);
         if (pressing.has(key)) return;
         pressing.add(key); say(''); render();
         commit();
         remember(input.value);
         const shown = input.value;
-        const selectedModel = actions.videoModel?.();
         let reason = '';
         try {
             // The press shows before any planning, however long that takes.
             await painted();
-            const options = allowEmpty || allowDownload || selectedModel !== undefined ? {allowEmpty, allowDownload, selectedModel} : undefined;
+            const options = allowEmpty || allowDownload || videoChoice !== undefined ? {allowEmpty, allowDownload, videoChoice} : undefined;
             const result = actions.press ? await actions.press(input.value, options) : await actions.generate({target: 'both', text: input.value});
             if (result?.confirmDownload) confirmDownload(result.confirmDownload);
             // Never over what the user typed meanwhile, for another part.
@@ -691,7 +690,7 @@ export function createEditorGenbar(host, {state, t, actions, text = '', modelPic
         return true;
     }
     return {element: host, duration, firstFrame, tray, say, downloadFailure, commit, dismiss, restoreModelPicker,
-        press: allowEmpty => press(allowEmpty === true), canGenerate: () => !generate.disabled,
+        press: (allowEmpty, videoChoice) => press(allowEmpty === true, false, videoChoice), canGenerate: () => !generate.disabled,
         service(value) {
             service = value;
             if (!value && note.contains(retryService)) { retryService.remove(); note.hidden = true; }

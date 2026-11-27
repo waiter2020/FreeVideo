@@ -137,6 +137,8 @@ def _main(argv=None, *, lock_paths=None):
             parser.error('Setup is incomplete. Rerun ./setup.sh with the same --root; saved files are reused.')
         from .testing import environment
         env = environment(machine)
+        if command == 'generate' and os.environ.get('FREEVIDEO_MODEL_ROOT'):
+            env['FREEVIDEO_MODEL_ROOT'] = str(Path(os.environ['FREEVIDEO_MODEL_ROOT']).expanduser())
         if descriptor is not None:
             os.set_inheritable(descriptor, True)
             env[LOCK_ENV] = str(descriptor)

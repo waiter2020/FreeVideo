@@ -196,7 +196,12 @@ def missing_bytes(root, spec=None, *, mode=DEFAULT_MODE):
     return sum(row['bytes'] for row in _missing_rows(io_path(root), spec or catalog(), mode))
 
 
-def default_present(root, spec=None, *, mode=DEFAULT_MODE):
+def _engine_rows(spec, mode, names):
+    return [row for row in rows(spec, mode=mode) if row.get('engine')
+            and (names is None or PurePosixPath(row['file']).name in names)]
+
+
+def default_present(root, spec=None, *, mode=DEFAULT_MODE, names=None):
     """Whether the files the engine reads are the ones that passed their sha256, unchanged since (the receipt).
 
     The licence and notes are fetched with them, and nothing depends on reading them.
@@ -204,18 +209,17 @@ def default_present(root, spec=None, *, mode=DEFAULT_MODE):
     spec = spec or catalog()
     root = io_path(root)
     ledger = _ledger(root, spec)
-    return all(_receipted(root, row, ledger) for row in rows(spec, mode=mode) if row.get('engine'))
+    files = _engine_rows(spec, mode, names)
+    return (names is None or len(files) == len(names)) and all(_receipted(root, row, ledger) for row in files)
 
 
-def default_files(root=None, spec=None, *, mode=DEFAULT_MODE):
+def default_files(root=None, spec=None, *, mode=DEFAULT_MODE, names=None):
     """Map verified engine files for the selected mode to their catalog names."""
     spec = spec or catalog()
     root = io_path(root if root is not None else model_folder())
     ledger = _ledger(root, spec)
     found, absent = {}, []
-    for row in rows(spec, mode=mode):
-        if not row.get('engine'):
-            continue
+    for row in _engine_rows(spec, mode, names):
         path = _target(root, row)
         there = _receipted(root, row, ledger)
         if not there:
@@ -478,15 +482,27 @@ class Installer:
         root, _, _ = self._location()
         return dict(_jobs(_jobs_path(root, catalog()))['records'].get(mode, IDLE))
 
-    def status(self, mode=DEFAULT_MODE):
+    def status(self, mode=DEFAULT_MODE, *, target=None):
         from .model_components import ComponentError
+        from .model_packages import PackageError, _check_fast_binding, _fast_filename, fast_default_bindings
         spec = catalog()
         root, engine, machine = self._location()
         state = _jobs(_jobs_path(root, spec))
         compatibility = setup_compatibility(machine)
         try:
-            todo = [] if selected_files(root, mode, engine_root=engine) else _missing_rows(root, spec, mode)
-        except ComponentError:
+            if target == 'builtin':
+                todo = _missing_rows(root, spec, mode)
+            elif engine is not None and io_path(Path(engine) / 'machine.json').is_file():
+                bindings = fast_default_bindings(engine, mode)
+                builtin = {_fast_filename(mode, role) for role, identity in bindings.items() if identity == 'builtin'}
+                for role, identity in bindings.items():
+                    if identity != 'builtin':
+                        _check_fast_binding(engine, mode, role, identity)
+                todo = ([row for row in _missing_rows(root, spec, mode)
+                         if not row.get('engine') or PurePosixPath(row['file']).name in builtin] if builtin else [])
+            else:
+                todo = [] if selected_files(root, mode, engine_root=engine) else _missing_rows(root, spec, mode)
+        except (ComponentError, PackageError, OSError):
             compatibility = dict(compatible=False, compatibility_reason='selected_component_changed')
             todo = rows(spec, mode=mode)
         return dict(bytes=sum(row['bytes'] for row in todo), resume_bytes=_resume_bytes(root, todo),
@@ -641,15 +657,19 @@ def register():
     async def fast_pack_status(request):
         try:
             mode = _mode(request.query.get('mode', DEFAULT_MODE))
+            target = request.query.get('target')
+            if target not in (None, 'builtin'):
+                raise ValueError('Invalid target')
         except ValueError:
             return reply({'reason': 'failed'}, 400)
-        return reply(await asyncio.to_thread(installer.status, mode))
+        return reply(await asyncio.to_thread(installer.status, mode, **({'target': target} if target else {})))
 
     @server.routes.post('/freevideo/fast-pack')
     async def fast_pack_install(request):
         try:
             body = await request.json()
-            if not isinstance(body, dict) or set(body) - {'action', 'mode', 'job_id'} or body.get('action') not in ('install', 'cancel'):
+            if (not isinstance(body, dict) or set(body) - {'action', 'mode', 'job_id', 'target'}
+                    or body.get('action') not in ('install', 'cancel') or body.get('target') not in (None, 'builtin')):
                 raise ValueError('Invalid request')
             mode = _mode(body.get('mode', DEFAULT_MODE))
             if 'job_id' in body and (body['action'] != 'cancel' or not isinstance(body['job_id'], str)
@@ -657,6 +677,7 @@ def register():
                 raise ValueError('Invalid download job')
         except (ValueError, TypeError):
             return reply({'reason': 'failed'}, 400)
+        status_options = {'target': body['target']} if body.get('target') else {}
         if body['action'] == 'cancel':
             arguments = (mode, body['job_id']) if 'job_id' in body else (mode,)
             try:
@@ -666,7 +687,7 @@ def register():
             except OSError:
                 return reply({'reason': 'failed'}, 409)
         else:
-            state = await asyncio.to_thread(installer.status, mode)
+            state = await asyncio.to_thread(installer.status, mode, **status_options)
             if state.get('compatible') is False:
                 reason = state['compatibility_reason']
                 return reply(dict(compatible=False, compatibility_reason=reason, reason=reason), 409)
@@ -675,4 +696,4 @@ def register():
                     await asyncio.to_thread(installer.start, mode)
                 except PackError as error:
                     return reply({'reason': error.reason}, 409)
-        return reply(await asyncio.to_thread(installer.status, mode))
+        return reply(await asyncio.to_thread(installer.status, mode, **status_options))

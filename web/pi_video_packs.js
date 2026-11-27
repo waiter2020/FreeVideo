@@ -5,6 +5,7 @@ export const piVideoSteps = mode => STEPS[mode];
 export const piVideoName = (t, mode) => t('pi-H3 · {steps} steps', 'pi-H3 · {steps} 步', {steps: piVideoSteps(mode)});
 
 export function piVideoUnavailableText(t, reason) {
+    if (reason === 'package') return t('This model package is unavailable. Choose a different package or repair its weights in Settings.', '此模型包不可用。请选择其他模型包，或在设置中修复它的权重。');
     if (reason === 'selected_component_changed') return t('The selected pi-H3 files changed. Repair them or restore the default in Model management.', '所选 pi-H3 文件已变更。请在模型管理中修复或恢复默认版本。');
     if (reason === 'engine') return t('pi-H3 needs the FreeVideo INT8 video model.', 'pi-H3 需要 FreeVideo INT8 视频模型。');
     if (reason === 'mac' || reason === 'gpu') return t('pi-H3 needs an NVIDIA GPU with CUDA.', 'pi-H3 需要支持 CUDA 的 NVIDIA 显卡。');
@@ -57,7 +58,7 @@ export function piVideoPackState(t, status) {
 
 // Every pack view in a document uses the same responses and only one poll. The installer keeps its job
 // when a view closes. A Generate button can wait for readiness without owning the download.
-export function createPiVideoPacks(fetchApi, {idleMs = 3000, runningMs = 1000} = {}) {
+export function createPiVideoPacks(fetchApi, {idleMs = 3000, runningMs = 1000, target = ''} = {}) {
     const values = new Map(), reads = new Map(), actions = new Map(), revisions = new Map(), misses = new Map();
     const subscriptions = new Set();
     let timer = 0;
@@ -99,11 +100,12 @@ export function createPiVideoPacks(fetchApi, {idleMs = 3000, runningMs = 1000} =
     async function call(mode, operation, revision) {
         const last = values.get(mode);
         const job = operation === 'cancel' && last?.install?.job_id;
-        const payload = {action: operation, mode, ...(job ? {job_id: job} : {})};
+        const payload = {action: operation, mode, ...(target ? {target} : {}), ...(job ? {job_id: job} : {})};
         const options = operation ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)} : {};
         const latest = () => (revisions.get(mode) || 0) === revision;
         try {
-            const response = await fetchApi(`/freevideo/fast-pack${operation ? '' : `?mode=${mode}`}`, {cache: 'no-store', ...options});
+            const query = new URLSearchParams({mode, ...(target ? {target} : {})});
+            const response = await fetchApi(`/freevideo/fast-pack${operation ? '' : `?${query}`}`, {cache: 'no-store', ...options});
             const body = await response.json();
             if (!latest()) return status(mode);
             if (response.ok) {
@@ -173,8 +175,8 @@ export function createPiVideoPacks(fetchApi, {idleMs = 3000, runningMs = 1000} =
     return {status, read, refresh, subscribe, ensure, action, pending: mode => actions.has(mode)};
 }
 
-let packs;
-export function piVideoPacks(fetchApi) {
-    packs ??= createPiVideoPacks(fetchApi);
-    return packs;
+const packClients = new Map();
+export function piVideoPacks(fetchApi, target = '') {
+    if (!packClients.has(target)) packClients.set(target, createPiVideoPacks(fetchApi, {target}));
+    return packClients.get(target);
 }

@@ -71,11 +71,11 @@ class PiH3Tests(TestCase):
         runner = ChainRunner.__new__(ChainRunner)
         machine = dict(model_root='models', prepared_format='int8_convrot')
         with (patch.object(comfy_bridge, 'installation', return_value=(Path('.'), machine)),
-              patch.object(fast_tier, 'files', side_effect=FileNotFoundError('Corrupt adapter')) as files,
+              patch.object(fast_tier, 'resolve', side_effect=FileNotFoundError('Corrupt adapter')) as resolve,
               self.assertRaisesRegex(PlanError, 'Corrupt adapter') as failure):
             runner.create(payload)
         self.assertEqual(failure.exception.code, 'fast_mode_files_missing')
-        self.assertEqual(files.call_args.args[1], 'fast4')
+        self.assertEqual(resolve.call_args.args[1], 'fast4')
 
     def test_workflow_repairs_preserve_each_valid_mode(self):
         for mode in (*fast_tier.MODES, 'none', ['2', 0]):

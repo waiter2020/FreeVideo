@@ -182,9 +182,12 @@ def video_snapshot(*, fast=None, two_pass=False, preview=False):
         slots.add('h3-latent-upscaler')
     if preview:
         slots.update(('video-preview-linear', 'video-preview-decoder'))
-    if fast in PI_SLOTS:
-        slots.add(PI_SLOTS[fast])
-    return {slot: identity for slot, identity in snapshot(None).items() if slot in slots}
+    found = {slot: identity for slot, identity in snapshot(None).items() if slot in slots}
+    if fast is not None:
+        slot = PI_SLOTS[fast['mode']]
+        found[slot] = fast['bindings']['adapter']
+        found[f'{slot}:constants'] = fast['bindings']['constants']
+    return found
 
 
 def retained_use(output_directory, identity):

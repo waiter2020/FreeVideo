@@ -277,7 +277,7 @@ class VideoModels(HubModelJobs):
             pass
         raise ValueError('Install the FreeVideo H3 video model before importing another model.')
 
-    def status(self):
+    def status(self, *, active_only=False):
         with self.mutex:
             task = dict(self.task)
         try:
@@ -287,7 +287,13 @@ class VideoModels(HubModelJobs):
         builtin = dict(_official(machine, self.root), repairable=False, removable=False)
         installed, damaged = [builtin], []
         active = machine.get(ACTIVE_KEY) or builtin
-        for directory in sorted((self.root / 'prepared' / 'huggingface').glob('*')):
+        profiles = self.root / 'prepared' / 'huggingface'
+        identity = active.get('id')
+        if active_only:
+            directories = (profiles / identity,) if isinstance(identity, str) and PROFILE_ID.fullmatch(identity) else ()
+        else:
+            directories = sorted(profiles.glob('*'))
+        for directory in directories:
             if not PROFILE_ID.fullmatch(directory.name):
                 continue
             row = None

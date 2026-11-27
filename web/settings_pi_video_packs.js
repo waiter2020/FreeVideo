@@ -2,12 +2,12 @@ import {bar, button, card, el, row, setText} from './settings_kit.js';
 import {bytesText} from './settings_words.js';
 import {PI_VIDEO_MODES, piVideoName, piVideoPackState, piVideoPacks} from './pi_video_packs.js';
 
-export function createSettingsPiVideoPacks({fetchApi, t}) {
-    const packs = piVideoPacks(fetchApi);
+export function createSettingsPiVideoPacks({fetchApi, t, target, onReady}) {
+    const packs = piVideoPacks(fetchApi, target);
     const element = card();
     element.classList.add('st-pi-video-packs');
     element.setAttribute('role', 'group');
-    element.setAttribute('aria-label', t('pi-H3 video models', 'pi-H3 视频模型'));
+    element.setAttribute('aria-label', target === 'builtin' ? t('Built-in pi-H3 files', 'pi-H3 内置文件') : t('pi-H3 video models', 'pi-H3 视频模型'));
     const rows = PI_VIDEO_MODES.map(mode => {
         const item = row({iconName: 'film', title: piVideoName(t, mode), cls: 'st-mrow'});
         const size = el('span', 'st-sz');
@@ -23,9 +23,12 @@ export function createSettingsPiVideoPacks({fetchApi, t}) {
         return {mode, item, size, status, action, meter};
     });
 
+    const seen = new Map();
     function paint() {
         for (const {mode, item, size, status, action, meter} of rows) {
             const state = piVideoPackState(t, packs.status(mode));
+            if (seen.has(mode) && !seen.get(mode) && state.state === 'ready') onReady?.();
+            if (state.state !== 'checking') seen.set(mode, state.state === 'ready');
             const busy = state.state === 'downloading';
             item.element.dataset.state = state.state;
             item.sub.hidden = false;

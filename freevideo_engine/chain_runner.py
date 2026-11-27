@@ -434,7 +434,15 @@ class ChainRunner:
         from .lora_triggers import apply_chain_triggers
         record = store.validate(payload)
         prompt = record['snapshot']['prompt']
-        mode = prompt[record['node']]['inputs'].get('fast_mode')
+        inputs = prompt[record['node']]['inputs']
+        mode = inputs.get('fast_mode')
+        try:
+            package = fast_tier.checked_package_id(inputs.get('video_package'))
+            if package and mode not in fast_tier.MODES:
+                raise ValueError('A video package needs the fastest mode.')
+        except ValueError as failure:
+            raise chain_plan.PlanError('fast_mode_incompatible', str(failure),
+                error_zh='请选择与快档匹配的 pi-H3 模型包。') from failure
         if mode in fast_tier.MODES:
             from .audio_use_request import graph_audio
             blocks = record['blocks']
@@ -449,10 +457,16 @@ class ChainRunner:
             from .comfy_bridge import installation, require_fast_model
             try:
                 _, machine = installation()
-                require_fast_model(machine, mode)
+                opened = require_fast_model(machine, mode, package_id=package)
             except FileNotFoundError as failure:
                 raise chain_plan.PlanError('fast_mode_files_missing', str(failure),
                     error_zh='所选 pi-H3 的文件缺失或未通过校验。请安装或重试下载。') from failure
+            except ValueError as failure:
+                raise chain_plan.PlanError('fast_mode_incompatible', str(failure),
+                    error_zh='所选 pi-H3 模型包与快档或当前设备不兼容。') from failure
+            if opened['package_id']:
+                inputs['video_package'] = opened['package_id']
+            record['fast_package_snapshot'] = fast_tier.snapshot(opened)
         apply_chain_triggers(record)
         with self.lock:
             # Before anything is written or queued: a refused chain leaves every record and file as it was.
@@ -763,7 +777,8 @@ class ChainRunner:
                 self._save(record)
             return dict(id=record['id'], block=block['id'], part=block['part'], index=block['index'],
                         count=len(record['blocks']), after=deepcopy(block['after']), before=deepcopy(block['before']),
-                        context=block['context'], sources=self._sources(record, block))
+                        context=block['context'], sources=self._sources(record, block),
+                        fast_package_snapshot=record.get('fast_package_snapshot'))
 
     def finished(self, prompt_id, node, output, report_id, continuation=None):
         with self.lock:

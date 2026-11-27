@@ -22,11 +22,12 @@ import { setMonitorShown, onMonitorShown } from './monitor_panel.js';
 import { preloadMode, setPreloadMode, onPreload } from './preload_setting.js';
 import { createUpdateNotice, releaseNotesInto, productVersion } from './updates.js';
 import { createImageGenClient } from './image_generation.js';
-import { IMAGE_MODELS, modelState, pausedText, continueUse } from './image_view_models.js';
+import { IMAGE_MODELS, IMAGE_MODEL_CHANGED, modelState, pausedText, continueUse } from './image_view_models.js';
 import { hfModelSettings } from './settings_video_models.js';
-import { createSettingsPiVideoPacks } from './settings_pi_video_packs.js';
 import { createModelManagement } from './model_management.js';
-import { VIDEO_MODEL_CHANGED } from './video_model.js';
+import { createModelPackages } from './model_packages.js';
+import { createSettingsPiVideoPacks } from './settings_pi_video_packs.js';
+import { MODEL_PACKAGES_CHANGED, VIDEO_MODEL_CHANGED } from './video_model.js';
 import { swapLoraFailureText } from './swap_lora.js';
 import { MODULES } from './health.js';
 import { userMessage } from './user_message.js';
@@ -250,44 +251,38 @@ export async function openSetup(options) {
         window.dispatchEvent(new CustomEvent(VIDEO_MODEL_CHANGED, {detail: active}));
     }});
     const imageModels = hfModelSettings({...modelRequest, kind: 'image', onActivate: () => {
-        window.dispatchEvent(new Event('freevideo-image-model-changed'));
+        window.dispatchEvent(new Event(IMAGE_MODEL_CHANGED));
         void pollImages();
     }});
-    const sharedEncoderModel = 'minimax-h3-image';
-    const sharedEncoderFormat = t('Qwen3-VL 32B NVFP4 AWQ or plain NVFP4 · Single .safetensors file',
-        'Qwen3-VL 32B NVFP4 AWQ 或普通 NVFP4 · 单个 .safetensors 文件');
-    const manageSharedEncoder = button(t('Manage weights', '管理权重'), {kind: 'fill'});
-    manageSharedEncoder.onclick = () => imageModels.focusComponent(sharedEncoderModel, 'text_encoder');
-    const sharedEncoderRow = row({iconName: 'film', title: t('MiniMax H3 text encoder shared with H3 Image', '与 H3 Image 共用的 MiniMax H3 文本编码器'),
-        sub: sharedEncoderFormat, end: [manageSharedEncoder]});
-    const sharedEncoderCard = card(sharedEncoderRow.element);
-    sharedEncoderCard.hidden = true;
-    function paintSharedEncoder(value) {
-        const encoder = value?.components?.[sharedEncoderModel]?.text_encoder;
-        sharedEncoderCard.hidden = !encoder?.ready;
-        const active = encoder?.active;
-        sharedEncoderRow.sub.textContent = [sharedEncoderFormat, active?.damaged ? t('Active weights unavailable', '当前权重不可用') :
-            active?.label && t(`In use: ${active.label}`, `使用中：${active.label}`)].filter(Boolean).join(' · ');
-    }
-    const piVideoModels = createSettingsPiVideoPacks({fetchApi: api.fetchApi.bind(api), t});
-    later(piVideoModels.dispose);
     const [videoHead, installedVideos, ...videoImport] = videoModels.elements;
+    const packageChanged = () => window.dispatchEvent(new Event(MODEL_PACKAGES_CHANGED));
+    const modelPackages = createModelPackages({...modelRequest, t, onImportImage: imageModels.focusComponent});
+    const piWeights = createModelManagement({...modelRequest, t, piWeights: true, onReady: packageChanged});
+    const piFiles = createSettingsPiVideoPacks({fetchApi: api.fetchApi.bind(api), t, target: 'builtin', onReady: () => { packageChanged(); void poll(); }});
+    later(piFiles.dispose);
     const modelManagement = createModelManagement({...modelRequest, t, onManage: model => {
         if (model.manager === 'video' && (model.manager_component === 'comfy_h3' ? videoModels.focusComfy() : videoModels.focusVideo())) return;
-        const target = model.manager === 'video' ? videoHead : model.manager === 'pi-video' ? piVideoModels.element : imageHead;
+        const target = model.manager === 'pi-video' ? modelPackages.element : model.manager === 'video' ? videoHead : imageHead;
         target.scrollIntoView?.({block: 'start'});
         target.tabIndex = -1;
         target.focus({preventScroll: true});
-        if (model.manager === 'image' && model.manager_model) imageModels.focusComponent(model.manager_model, model.manager_component || 'dit');
     }});
     function updateModelControls(info = {}) {
         modelManagement.update(info.model_components, busy);
-        videoModels.update(info.video_models, busy || modelManagement.busy());
-        imageModels.update(info.image_models, busy || modelManagement.busy());
-        modelManagement.update(undefined, busy || videoModels.busy() || imageModels.busy());
+        piWeights.update(info.model_components, busy);
+        const installing = busy || modelManagement.busy();
+        const image = info.image_models;
+        videoModels.update(info.video_models, installing || modelPackages.busy());
+        imageModels.update(image?.task?.operation === 'set-shared-encoder' ? {...image, task: null} : image,
+            installing || modelPackages.busy());
+        const blocked = busy || videoModels.busy() || imageModels.busy();
+        modelPackages.update(info.model_packages, blocked || modelManagement.busy());
+        modelManagement.update(undefined, blocked || modelPackages.busy());
+        piWeights.update(undefined, blocked || modelPackages.busy());
     }
     models.append(modelManagement.element);
-    models.append(videoHead, installedVideos, piVideoModels.element, ...videoImport, sharedEncoderCard);
+    models.append(videoHead, installedVideos, ...videoImport, groupHead(t('Built-in pi-H3 files', 'pi-H3 内置文件')),
+        piFiles.element, modelPackages.element, piWeights.element);
 
     // Picture models: both always listed, each with its own state (installed, not installed, downloading, failed).
     const imageCard = card(); const imageRows = new Map();
@@ -1505,10 +1500,9 @@ export async function openSetup(options) {
             token = info.discovery.token;
             render(info.task); showDownloads(info.discovery.downloads);
             updateModelControls(info);
-            paintSharedEncoder(info.image_models);
         }
         catch (error) { if (sequence !== pollSequence) return; fail(error); }
-        if (dialog.open && (busy || probeBusy || videoModels.busy() || imageModels.busy() || modelManagement.busy())) pollTimer = setTimeout(poll, 750);
+        if (dialog.open && (busy || probeBusy || videoModels.busy() || imageModels.busy() || modelManagement.busy() || modelPackages.busy())) pollTimer = setTimeout(poll, 750);
     }
     async function saveModelFolders() {
         const result = await request('model-directories', {extra_libraries: extra.value.split("\n")});
@@ -1581,10 +1575,9 @@ export async function openSetup(options) {
         ready = Boolean(info.discovery.ready);
         render(info.task || {});
         updateModelControls(info);
-        paintSharedEncoder(info.image_models);
         // A failure the last task left stays readable; only a quiet ready installation says it is ready.
         if (info.discovery.ready && !busy && info.task?.status !== 'failed') state.textContent = t("Ready to generate.", "已就绪，可以开始生成。");
-        if (busy || probeBusy || videoModels.busy() || imageModels.busy() || modelManagement.busy()) poll();
+        if (busy || probeBusy || videoModels.busy() || imageModels.busy() || modelManagement.busy() || modelPackages.busy()) poll();
         paintHero();
     } catch (error) { loaded = true; readFailed = true; fail(error); }
     return dialog;

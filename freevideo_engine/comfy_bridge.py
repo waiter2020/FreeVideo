@@ -943,14 +943,15 @@ def installation(source=None, environ=None):
     return root, plain_data(machine)
 
 
-def require_fast_model(machine, mode, *, environ=None):
+def require_fast_model(machine, mode, *, environ=None, package_id=None):
     """Check hardware and verify the requested adapter before enqueueing or starting it."""
     from . import fast_tier
     if machine.get('video_model') is False:
         raise ValueError('Install the FreeVideo INT8 video model to use pi-H3.')
     env = os.environ if environ is None else environ
     fast_tier.validate_setup(fast_tier.setup_reason(machine))
-    return fast_tier.files(env.get('FREEVIDEO_MODEL_ROOT') or machine['model_root'], mode, engine_root=machine.get('root'))
+    model_root = Path(env.get('FREEVIDEO_MODEL_ROOT') or machine['model_root']).expanduser()
+    return fast_tier.resolve(model_root, mode, engine_root=machine.get('root'), package_id=package_id)
 
 
 def validate_request(prompt, width, height, seconds, seed, *, continue_from=None, frames=None,
@@ -1431,10 +1432,14 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
              prompt_rewrite_report=None, preview=False, refine_from=None, report_extra=None,
              continue_from=None, frames=None, first_frame_reference=False, voice_reference=False, hide_tail=False,
              step_cache=None, upscale_factor=2, allow_empty_prompt=False, upscale_from=None, upscale_to=None,
-             fast_mode=None):
+             fast_mode=None, video_package=None, fast_package_snapshot=None):
     from .comfy_environment import control_process
     if control_process(environ):
         raise RuntimeError('Generation requires a dispatched executor')
+    from .fast_tier import checked_package_id
+    video_package = checked_package_id(video_package)
+    if video_package and fast_mode is None:
+        raise ValueError('A video package needs the fastest mode.')
     if upscale_to not in (None, '', '4k'):
         raise ValueError('Upscale size must be 4k')
     if upscale_to:
@@ -1571,8 +1576,11 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
         except ValueError:
             pass
     environment = engine_environment(root, source, environ)
+    fast_package = None
     if fast_mode is not None:
-        require_fast_model(machine, fast_mode, environ=environment)
+        fast_package = require_fast_model(machine, fast_mode, environ=environment, package_id=video_package)
+        fast_tier.check_snapshot(fast_package, fast_package_snapshot)
+        environment[fast_tier.SNAPSHOT_ENV] = fast_tier.snapshot(fast_package)
     environment.update(FREEVIDEO_HOME=str(root), PYTHONPATH=str(source), PYTHONUNBUFFERED='1',
                        PYTHONUTF8='1', PYTHONIOENCODING='utf-8', NO_COLOR='1', FREEVIDEO_UI_EVENTS='1')
     # The GPU monitor counts this process's other children (prompt model, pictures, music) as FreeVideo's own work.
@@ -1601,11 +1609,10 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
         command.append('--allow-empty-prompt')
     if step_cache is not None:
         command += ['--step-cache', step_cache]
-    if fast_mode is not None:
-        # The folder the engine process resolves, as the page's download does (fast_pack.model_folder). Before queueing, so a
-        # missing file is named at once.
-        fast_tier.files(engine_model_root(source, environment), fast_mode)
+    if fast_package is not None:
         command += ['--fast-mode', fast_mode]
+        if fast_package['package_id']:
+            command += ['--video-package', fast_package['package_id']]
     if two_pass and upscale_factor != 2:
         command += ['--upscale-factor', '%g' % upscale_factor]
     if frames is not None:
@@ -1637,6 +1644,10 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
         command.append('--hide-tail')
     state = {'status': 'starting', 'geometry': canvas, 'seed': seed, 'installation': str(root),
              'command': command, 'output': str(output), 'source': str(source), 'resources': resources}
+    if fast_package is not None:
+        state['fast_tier'] = {key: fast_package[key] for key in
+                              ('package_id', 'bindings', 'adapter_sha256', 'constants_sha256')}
+        state['fast_tier']['mode'] = fast_mode
     # ComfyUI's id of the request that made this work, so deleting the work also removes ComfyUI's record of it.
     try:
         from server import PromptServer
@@ -1825,13 +1836,11 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
         if step_cache is not None:
             # A cache changes the arithmetic; without one the identity stays that of earlier versions.
             keyed = dict(keyed, step_cache=step_cache)
-        if fast_mode is not None:
+        if fast_package is not None:
             # The same step count without the adapter is another video.
-            adapter, constants = fast_tier.component_hashes(
-                environment.get('FREEVIDEO_MODEL_ROOT') or machine['model_root'], fast_mode, engine_root=root)
-            keyed = dict(keyed, fast_mode=fast_mode, fast_adapter=adapter)
-            if constants != fast_tier.CONSTANTS_FILE[1]:
-                keyed['fast_constants'] = constants
+            keyed = dict(keyed, fast_mode=fast_mode, fast_adapter=fast_package['adapter_sha256'])
+            if fast_package['constants_sha256'] != fast_tier.CONSTANTS_FILE[1]:
+                keyed['fast_constants'] = fast_package['constants_sha256']
         if hide_tail_frames:
             keyed = dict(keyed, hide_tail_frames=hide_tail_frames)
         identify = lambda check: request_key(prompt, seed, canvas, keyed, extra, machine,
@@ -1852,6 +1861,9 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
         if interrupted:
             interrupted()
         if reused is not None:
+            if fast_package is not None:
+                checked = require_fast_model(machine, fast_mode, environ=environment, package_id=fast_package['package_id'])
+                fast_tier.check_snapshot(checked, environment[fast_tier.SNAPSHOT_ENV])
             state.update(status='reused', reused_output=str(reused))
             state['result_cache']['hit'] = True
             send_progress({'label': 'Reused previous result', 'phase': 'complete',

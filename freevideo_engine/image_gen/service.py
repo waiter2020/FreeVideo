@@ -37,6 +37,16 @@ def messages(code):
     return dict(zip(('message_en', 'message_zh'), MESSAGES[code])) if code in MESSAGES else {}
 
 
+def request_package(value):
+    from ..model_packages import valid_package_id
+    package = value.get('package')
+    if package in (None, ''):
+        return None
+    if not valid_package_id(package):
+        raise ValueError('invalid_request')
+    return package
+
+
 def write_refused(error):
     """Whether an OSError says a folder or file cannot be written (no permission, read-only volume, in use)."""
     import errno
@@ -454,6 +464,7 @@ class Service:
         self.warm_placement = None
         # The model the image worker holds or is loading (a picture or a full warm-up), for a conservative warm-up.
         self.loaded_model = None
+        self.loaded_identity = None
         # Server mode: the worker's last report of a full warm-up, and why the last session ended.
         self.warm_facts = None
         self.warm_full = threading.Event()
@@ -543,7 +554,18 @@ class Service:
                              bool(self.pack_checked(image_pack.ready, root, group='segment')[0]))
         except (OSError, ValueError):
             segment_ready = False
-        return dict(ready=ready, model=spec['repo'], models=self.model_rows(machine, ready, downloading, problem),
+        from ..model_packages import image_catalog, load as load_packages
+        document = None
+        if machine.get('root'):
+            try:
+                document = load_packages(engine_root)
+            except (OSError, ValueError):
+                pass
+        models = self.model_rows(machine, ready, downloading, problem, package_document=document)
+        family_readiness = {row['id']: row['available'] and row['ready'] for row in models}
+        packages = image_catalog(machine, family_readiness=family_readiness, document=document) if document is not None else []
+        return dict(ready=ready, model=spec['repo'], models=models,
+                    image_packages=packages,
                     checking=not ready and image_pack.checking(root),
                     downloading=downloading,
                     bytes=sum(row['bytes'] for row in spec['groups']['image']), busy=self.busy(),
@@ -584,7 +606,7 @@ class Service:
             if self.h3_installer is installer:
                 self.h3_installer = None
 
-    def model_rows(self, machine, qwen_ready, qwen_downloading, qwen_problem=None):
+    def model_rows(self, machine, qwen_ready, qwen_downloading, qwen_problem=None, *, package_document=None):
         """Both picture models for the page: installed, or being fetched with the bytes still to download."""
         root = machine['model_root']
         mac = sys.platform == 'darwin'
@@ -641,13 +663,17 @@ class Service:
         if mac:
             rows[-1]['unavailable_reason'] = 'platform'
         if machine.get('root'):
-            from ..image_components import ComponentError, resolve
+            from ..image_components import ComponentError
+            from ..model_packages import PackageError, resolve_image
             for row in rows:
                 if not row['ready']:
                     continue
+                if package_document is None:
+                    row['component_error'] = None
+                    continue
                 try:
-                    components = resolve(machine, row['id'])['components']
-                except ComponentError as error:
+                    components = resolve_image(machine, model=row['id'], document=package_document)['components']
+                except (ComponentError, PackageError) as error:
                     row['component_error'] = getattr(error, 'role', None)
                     continue
                 row['components'] = component_facts(components)
@@ -1581,6 +1607,7 @@ class Service:
         model = value.get('model')
         if model is not None and model not in image_model.MODELS:
             raise ValueError('invalid_request')
+        package = request_package(value)
         dimensions = [value.get(name) for name in ('width', 'height')]
         if model == image_model.H3:
             # 4 MP up to 16 MP; a smaller shape is asked for again at 4 MP in the same proportion.
@@ -1649,7 +1676,8 @@ class Service:
                       steps=8, seed=seed, images=paths, **(dict(mask=mask_path) if mask_path else {}),
                       **(dict(cast_view='back') if cast_view == 'back' else {}),
                       path=self.output_path(named=True),
-                      **(dict(loras=loras) if loras else {}), **(dict(model=model) if model else {}))
+                      **(dict(loras=loras) if loras else {}), **(dict(model=model) if model else {}),
+                      **(dict(package=package) if package else {}))
         # Leave room for action, kind and the small size-fit record added at dispatch.
         if loras and len(json.dumps(result, ensure_ascii=True).encode('utf-8')) > BODY_LIMIT - 1024:
             raise ValueError('invalid_loras')
@@ -1707,6 +1735,8 @@ class Service:
                 self.remove_uploads(names)
             if waiting:
                 self.pending.append(dict(key=key, action=action, value=raw, context=context,
+                                         package_snapshot=(prepared['package'], prepared['package_identity'])
+                                         if 'package_identity' in prepared else None,
                                          state=dict(phase='queued', queued_behind='video' if video else 'image',
                                                     queue_position=len(self.pending) + 1),
                                          video_since=time.monotonic() if video else None))
@@ -1718,7 +1748,7 @@ class Service:
                 self.begin(key, root, machine, prepared, context)
             return dict(job=key)
 
-    def prepare(self, action, value, context, *, waiting=False):
+    def prepare(self, action, value, context, *, waiting=False, package_snapshot=None):
         """Validate at admission and again at dispatch, against the original request."""
         try:
             root, machine = self.installation()
@@ -1727,13 +1757,28 @@ class Service:
         context.set_machine(machine)
         self.last_machine = machine
         try:
-            model = value.get('model') if isinstance(value, dict) else None
+            if not isinstance(value, dict):
+                raise ValueError('invalid_request')
+            model = value.get('model')
+            if model is not None and model not in image_model.MODELS:
+                raise ValueError('invalid_request')
+            package = request_package(value)
+            expected = None
+            if package_snapshot:
+                package, expected = package_snapshot
+            resolved = None
+            if package and not machine.get('root'):
+                raise ValueError('invalid_request')
+            if machine.get('root') and package:
+                resolved, identity = image_model.open_package(machine, model, package, expected)
+                model = resolved['model']
             h3 = model == image_model.H3
-            # A model this computer does not run (H3 Image on a Mac) is said so; its files are not looked for.
-            if h3 and sys.platform == 'darwin':
-                raise ValueError('model_unavailable')
             moss = model == image_model.MOSS
-            if not image_pack.ready(machine['model_root'], group=self.model_group(model) or 'image'):
+            # A model this computer does not run (H3 Image on a Mac) is said so; its files are not looked for.
+            if (h3 or moss) and sys.platform == 'darwin':
+                raise ValueError('model_unavailable')
+            from ..model_packages import image_ready
+            if not image_ready(machine, model or image_model.QWEN):
                 raise ValueError('pack_missing')
             if (h3 or moss) and action != 'generate':
                 raise ValueError('invalid_request')
@@ -1741,14 +1786,22 @@ class Service:
             unified = self.unified_total(machine)
             if unified is not None and unified < UNIFIED_MIN_TOTAL:
                 raise ValueError('small_memory')
-            requested = {name: value.get(name) for name in ('width', 'height')} if isinstance(value, dict) else {}
+            requested = {name: value.get(name) for name in ('width', 'height')}
             if action == 'compose':
                 from . import compose
                 value = compose.build(value, self.input_directory())
+            else:
+                value = dict(value)
+            if model:
+                value['model'] = model
+            if package:
+                value['package'] = package
             value = self.request(value)
             if machine.get('root'):
-                from ..image_components import resolve
-                resolve(machine, model or image_model.QWEN)
+                if resolved is None:
+                    resolved, identity = image_model.open_package(machine, model or image_model.QWEN)
+                value['package'] = resolved['package_id']
+                value['package_identity'] = identity
             value['kind'] = context.kind
             if h3:
                 # What the worker needs to run the video text encoder for this prompt and to plan against the card.
@@ -1775,10 +1828,10 @@ class Service:
             raise FailureError(self.failed(classify_exception(error), context, error=error)) from None
 
     def warm(self, value):
-        """Get ready for the picture the page is setting up ({model, level, mode}); no prompt or picture is sent.
+        """Get ready for the picture the page is setting up ({model, package, level, mode}).
 
         ``level`` 'light' (the default: the page was opened or touched) reads the model files ahead and, for H3
-        Image, puts the shared text encoder on the card. 'full' (a picture is likely next) also loads the model as a
+        Image, puts its text encoder on the card. 'full' (a picture is likely next) also loads the model as a
         picture leaves it. ``mode`` 'eager' (the default) may start a model that is not loaded; 'conservative' only
         keeps ready a model this worker already holds. Never a job and never in the way of one: skipped while video
         or a picture is running or queued, while the card is being given to video, or when the plan says the model
@@ -1791,7 +1844,9 @@ class Service:
                 or not isinstance(value.get('beside', False), bool)):
             raise ValueError('invalid_request')
         model, level = value['model'], value.get('level', 'light')
+        package = request_package(value)
         h3 = model == image_model.H3
+        conservative = value.get('mode') == 'conservative'
         if level == 'full' and value.get('beside'):
             # Read before the mutex: it may ask the resident worker what it holds.
             try:
@@ -1817,24 +1872,35 @@ class Service:
             if video:
                 return skipped('video_busy')
             alive = self.thread is not None and self.thread.is_alive()
-            if value.get('mode') == 'conservative' and not (alive and self.loaded_model == model):
+            if conservative and not (alive and self.loaded_model == model):
                 return skipped('not_loaded')
             try:
                 root, machine = self.installation()
             except (OSError, ValueError):
                 return skipped('pack_missing')
-            if not image_pack.ready(machine['model_root'], group=self.model_group(model) or 'image'):
+            from ..model_packages import image_ready
+            if not image_ready(machine, model):
                 return skipped('pack_missing')
+            try:
+                resolved, identity = image_model.open_package(machine, model, package)
+            except (OSError, ValueError):
+                return skipped('model_component_unavailable')
+            same_model = alive and self.loaded_model == model and self.loaded_identity == identity
+            if conservative and not same_model:
+                return skipped('not_loaded')
             from .image_policy import UNIFIED_MIN_TOTAL
             unified = self.unified_total(machine)
             if unified is not None and unified < UNIFIED_MIN_TOTAL:
                 return skipped('memory')
             row = dict(action='warm', model=model, level=level, keep_seconds=keep.keep_seconds(keep.path(root)))
+            if resolved.get('package_id'):
+                row.update(package=resolved['package_id'], package_identity=identity)
+            components = resolved['components']
             if h3:
-                row['files'] = self.warm_files(machine)
+                row['files'] = self.model_files(machine, model, components=components)
                 row['place_encoder'] = self.h3_resident(machine)
             elif level == 'light':
-                row['files'] = self.model_files(machine, model)
+                row['files'] = self.model_files(machine, model, components=components)
             elif model == image_model.MOSS:
                 pass    # a MOSS picture is not planned like Qwen's (no preflight): its warm-up is not either
             else:
@@ -1845,9 +1911,10 @@ class Service:
                 if plan is not None and not plan['feasible']:
                     return skipped('memory')
             # The same model already held: the row still goes, to keep it and the encoder ready for longer.
-            ready = alive and self.loaded_model == model
+            ready = same_model and not self.loading_full
             if level == 'full':
                 self.loaded_model = model
+                self.loaded_identity = identity
                 self.warm_full.clear()
                 self.loading_full = True
             if not alive:
@@ -1882,9 +1949,13 @@ class Service:
             if isinstance(row, dict) and row.get('phase') == 'warmed':
                 self.warm_facts = row
                 if row.get('level') == 'full':
-                    self.warm_full.set()
                     with self.mutex:
-                        self.loading_full = False
+                        if (row.get('model'), row.get('package_identity')) == (self.loaded_model, self.loaded_identity):
+                            self.loading_full = False
+                            if row.get('failed'):
+                                self.loaded_model = self.loaded_identity = None
+                            else:
+                                self.warm_full.set()
 
     def wait_warm(self, timeout):
         """Wait until the worker reports a full warm-up done, the session ends, or ``timeout`` seconds pass; True
@@ -1910,7 +1981,7 @@ class Service:
         return [model for model, group in ((image_model.H3, H3_GROUP), (image_model.QWEN, 'image'))
                 if image_pack.ready(machine['model_root'], group=group)]
 
-    def place_encoder(self, root, machine, env, descriptor, stop=None):
+    def place_encoder(self, machine, env, descriptor, package=None, expected=None, stop=None):
         """Put H3 Image's text encoder on the card in the resident worker, as it idles after a video, and wait for it.
         ``stop`` (default: the session's) ends it: the warm-up passes one that is also set by a picture asked for
         meanwhile, which loads the encoder itself (a speculative placement can be slower than that load). A video
@@ -1918,14 +1989,20 @@ class Service:
         to yield. Returns the worker's report."""
         from .. import resident_process
         from ..comfy_bridge import source_root
-        from ..encoder_checkpoint import encoder_options
+        from ..encoder_checkpoint import encoder_options, encoder_resident_key
         from ..hardware import detect
         from ..idle_encoder import place_now
         from ..kernel_capabilities import available_backends
         from ..policy import choose
+        from .h3_pipeline import placed_encoder_bytes
         endpoint = self.resident_endpoint()
         if endpoint is None:
             return dict(state='skipped', reason='no resident worker')
+        resolved, _ = image_model.open_package(machine, image_model.H3, package, expected)
+        encoder = resolved['components']['text_encoder']
+        key = encoder_resident_key(encoder['path'], machine['comfy_root'])
+        if placed_encoder_bytes(endpoint, key) > 0:
+            return dict(state='kept', reason='The encoder is already on the card')
         hardware = detect()
         # From the saved kernel checks, never running them here: a check cannot be stopped for a video or a picture.
         policy = choose(hardware, available_backends=available_backends(hardware, probe_missing=False),
@@ -1933,20 +2010,22 @@ class Service:
         directory = Path(endpoint).parent
         environment = dict(env, PYTHONPATH=str(source_root()))
         environment.pop(resident_process.ENV, None)
-        return place_now(endpoint, encoder_options(machine),
+        binding = 'builtin' if encoder.get('builtin') else encoder['id']
+        return place_now(endpoint, encoder_options(machine, binding),
                          descriptor=descriptor, environment=environment, directory=directory,
                          gpu_budget_bytes=policy.gpu_budget_bytes, ram_budget_bytes=policy.ram_budget_bytes,
                          allocator=policy.allocator_config, limits=dict(system=hardware.system),
                          stop=stop or self.session_stop)
 
     @staticmethod
-    def model_files(machine, model):
+    def model_files(machine, model, *, components=None):
         """The files to read ahead for a picture model: each model's own, from one table."""
-        from ..image_components import ComponentError, resolve
-        try:
-            components = resolve(machine, model)['components']
-        except ComponentError:
-            return []
+        if components is None:
+            from ..image_components import resolve
+            try:
+                components = resolve(machine, model)['components']
+            except (OSError, ValueError):
+                return []
         files = []
         for role in ('dit', 'text_encoder', 'vae'):
             if model == image_model.H3 and role == 'text_encoder':
@@ -2038,8 +2117,8 @@ class Service:
                                 and self.session_stop.is_set())
                     if not self.busy() and not stopping:
                         try:
-                            root, machine, value = self.prepare(pending['action'], pending['value'],
-                                                                pending['context'])
+                            root, machine, value = self.prepare(pending['action'], pending['value'], pending['context'],
+                                                                package_snapshot=pending['package_snapshot'])
                         except FailureError as error:
                             self.discard_queued(error.status)
                         except Exception as error:
@@ -2673,28 +2752,21 @@ class Service:
                             except OSError:
                                 pass
                             if place and not self.session_stop.is_set() and not self._busy:
-                                from .h3_pipeline import placed_encoder_bytes
                                 # The placement is speculative: whatever goes wrong in it, the session and a picture
                                 # that arrived meanwhile carry on (the picture places the encoder itself).
                                 try:
-                                    from ..encoder_checkpoint import configured_encoder_file, encoder_resident_key
-                                    endpoint = self.resident_endpoint()
-                                    identity = (encoder_resident_key(configured_encoder_file(machine), machine['comfy_root'])
-                                                if endpoint is not None else None)
-                                    if endpoint is not None and placed_encoder_bytes(endpoint, identity) > 0:
-                                        placed = dict(state='kept', reason='The encoder is already on the card')
-                                    else:
+                                    with self.mutex:
+                                        self.placing = True
+                                    try:
+                                        with self.lease(lock_path, descriptor) as held:
+                                            placed = self.place_encoder(machine, env, held,
+                                                                        value.get('package'), value.get('package_identity'),
+                                                                        stop=AnyOf(self.session_stop.is_set, lambda: self._busy))
+                                    finally:
                                         with self.mutex:
-                                            self.placing = True
-                                        try:
-                                            with self.lease(lock_path, descriptor) as held:
-                                                placed = self.place_encoder(root, machine, env, held, stop=AnyOf(
-                                                    self.session_stop.is_set, lambda: self._busy))
-                                        finally:
-                                            with self.mutex:
-                                                self.placing = False
-                                        if self._busy and placed.get('state') != 'ready':
-                                            placed = dict(placed, state='stopped', reason='A picture was asked for')
+                                            self.placing = False
+                                    if self._busy and placed.get('state') not in ('ready', 'kept'):
+                                        placed = dict(placed, state='stopped', reason='A picture was asked for')
                                 except Exception as error:  # noqa: BLE001
                                     from ..failure_details import raised_at
                                     logging.warning('[FreeVideo] Encoder placement for the warm-up failed: %s at %s',
@@ -2714,6 +2786,7 @@ class Service:
                                     pass
                             continue
                         self.loaded_model = value.get('model') or image_model.QWEN
+                        self.loaded_identity = value.get('package_identity')
                         with self.mutex:
                             # A picture loads the model itself; a warm-up it overtook is not reported.
                             self.loading_full = False
@@ -2779,7 +2852,7 @@ class Service:
         finally:
             with self.mutex:
                 self.process = self.worker = None
-                self.loaded_model = None
+                self.loaded_model = self.loaded_identity = None
                 self.per_request = False
                 self.loading_full = False
                 self.session_stop.set()
@@ -2984,7 +3057,7 @@ class Service:
             elif phase == 'plan':
                 context.note_plan(row.get('plan'))
             elif phase == 'model':
-                context.components = component_facts(row.get('components'))
+                context.note_model(row)
             elif phase in ('result', 'error'):
                 if self.stop.is_set() or row.get('code') == 'cancelled':
                     result = dict(phase='cancelled')
@@ -3032,6 +3105,8 @@ class Service:
                                   seconds=seconds, plan=row.get('plan'), report_id=report_id)
                     if context.components:
                         result['components'] = context.components
+                    if context.package_id:
+                        result['package_id'] = context.package_id
                     if isinstance(row.get('attention'), dict):
                         result['attention'] = row['attention']
                 with self.mutex:

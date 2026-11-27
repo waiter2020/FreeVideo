@@ -2,7 +2,9 @@
 // shape. A workflow restored from an older version, or a widget list that moved,
 // can leave an empty or missing value in them, and Comfy then rejects the whole
 // request. Keep each of them to a value the server accepts.
-const DEFAULTS = {refine_from: '', continue_from: '', frames: 0, first_frame_reference: false, force_regenerate: false, preview: false, voice_reference: false, hide_tail: false, step_cache: 'none', fast_mode: 'none', upscale_factor: '2'};
+const DEFAULTS = {refine_from: '', continue_from: '', frames: 0, first_frame_reference: false, force_regenerate: false, preview: false, voice_reference: false, hide_tail: false, step_cache: 'none', fast_mode: 'none', upscale_factor: '2', video_package: ''};
+const PACKAGE_ID = /^(?:builtin:[a-z0-9]+(?:-[a-z0-9]+)*|pkg_[0-9a-f]{32})$/;
+export const videoPackageId = value => typeof value === 'string' && PACKAGE_ID.test(value) ? value : '';
 // A workflow saved before Step cache existed holds '' where it now sits.
 const STEP_CACHE_OPTIONS = ['none', 'easycache-av', 'fbcache'];
 // Likewise for Upscale factor, appended after Step cache.
@@ -33,7 +35,13 @@ export function optionalInputValue(name, value) {
     if (name === 'step_cache') return STEP_CACHE_OPTIONS.includes(value) ? value : 'none';
     if (name === 'fast_mode') return ['fast2', 'fast4'].includes(value) ? value : 'none';
     if (name === 'upscale_factor') return UPSCALE_OPTIONS.includes(value) ? value : '2';
+    if (name === 'video_package') return typeof value === 'string' ? value : '';
     return value;
+}
+
+export function clearFastMode(inputs) {
+    if ('fast_mode' in inputs) inputs.fast_mode = 'none';
+    if ('video_package' in inputs) inputs.video_package = '';
 }
 
 // A saved workflow is read back by position, so a control can hold another type's value, a choice the

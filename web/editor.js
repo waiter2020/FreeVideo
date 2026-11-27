@@ -47,7 +47,7 @@ import {createFirstRunGuide} from './first_run_guide.js';
 import {SHOWCASE_SCENE} from './entry_showcase.js';
 import {createEditorFailures} from './editor_failure.js';
 import {fitEditorHeader} from './editor_header_fit.js';
-import {optionalText, clonePrompt, allowEmptyPrompt} from './optional_inputs.js';
+import {optionalText, clonePrompt, allowEmptyPrompt, clearFastMode, videoPackageId} from './optional_inputs.js';
 import {outputNotWritable, modelTableDamaged} from './error_panel.js';
 import {repairAction} from './repair_hint.js';
 import {expandCast} from './cast_mention.js';
@@ -60,7 +60,7 @@ import {setDisabled} from './dom_quiet.js';
 import {randomUUID} from './random_id.js';
 import {translator, translatorFor} from './i18n.js';
 import {applyVideoModelSnapshot, createVideoModelPicker, isPiVideoModel, piVideoModeInfo, piVideoProblem,
-    piVideoDownloadText} from './video_model.js';
+    piVideoDownloadText, sameVideoChoice, videoChoiceProblem} from './video_model.js';
 import {fileFailureText} from './file_failure.js';
 const editorStyles = Promise.all(['result_actions.css', 'editor.css', 'editor_expand.css', 'editor_tracks.css', 'editor_frame.css', 'editor_adjust.css', 'editor_adjust_picture.css', 'editor_preview_picture.css', 'editor_select.css', 'editor_menu.css', 'editor_text.css', 'editor_notes.css', 'editor_transport.css', 'glass/editor.css', 'editor_touch.css'].map(name => {
     const style = document.createElement('link'); style.rel = 'stylesheet'; style.href = new URL(name, import.meta.url).href;
@@ -839,11 +839,13 @@ export function openEditor({api, app, from = null, panel = {}, components: given
             && clip.pending && !generating(clip)).map(clip => clip.id);
         return {record: next, ids};
     }
-    function checkPiGeneration(mode, prepared, ids, range, size, grid = capability.grid) {
+    function checkPiGeneration(mode, prepared, ids, range, size, grid = capability.grid, packageId = '') {
         const continuation = model.generationBefore(prepared, ids).some(Boolean);
         const multipart = ids.length !== 1;
         const frames = continuation || multipart ? null : model.generationRequest(prepared, ids).blocks[0].frames;
-        const info = piVideoModeInfo(grid, mode, size.width, size.height, frames);
+        const status = videoModel.status(mode, packageId);
+        const info = status?.compatible === false ? {known: true, listed: false, reason: status.compatibility_reason}
+            : piVideoModeInfo(grid, mode, size.width, size.height, frames);
         const originalAudio = model.soundRange(state.record, range.start, range.frames)
             || importedSound(prepared, ids) || activeOriginal(panel.references?.rows?.() || []);
         const say = piVideoProblem(t, mode, {continuation, multipart, originalAudio, info, frames});
@@ -852,35 +854,37 @@ export function openEditor({api, app, from = null, panel = {}, components: given
     }
     const videoDraft = () => JSON.stringify([state.step, state.selection, state.rangeText, bar?.prompt.value ?? genbar?.shown(),
         bar?.values?.(), bar?.overrides?.()?.seed, panel.references?.rows?.()]);
-    const piDownload = mode => ({ready: videoModel.status(mode)?.present === true, draft: videoDraft()});
-    async function ensurePiForDraft(mode, epoch, {ready: originallyReady, draft} = piDownload(mode)) {
+    const piDownload = ({mode, packageId}) => ({ready: videoModel.status(mode, packageId)?.present === true, draft: videoDraft()});
+    async function ensurePiForDraft(choice, epoch, {ready: originallyReady, draft} = piDownload(choice)) {
         if (originallyReady) return true;
+        const {mode, packageId} = choice;
         const isCurrent = () => !disposed && !closing && element.open && projectEpoch === epoch
-            && videoModel.selection() === mode && videoDraft() === draft;
+            && sameVideoChoice(videoModel.choice(), choice) && videoDraft() === draft;
         if (!isCurrent()) return false;
-        if (videoModel.status(mode)?.present) return true;
+        if (videoModel.status(mode, packageId)?.present) return true;
         let abandon;
         const left = new Promise(resolve => { abandon = () => resolve(false); piDraftWaits.add(abandon); });
         try {
-            const ready = await Promise.race([videoModel.ensure(mode, isCurrent), left]);
+            const ready = await Promise.race([videoModel.ensure(mode, packageId, isCurrent), left]);
             if (!isCurrent()) return false;
-            if (!ready) genbar?.say(piVideoDownloadText(t, videoModel.status(mode)));
+            if (!ready) genbar?.say(piVideoDownloadText(t, videoModel.status(mode, packageId)));
             return ready;
         } finally { piDraftWaits.delete(abandon); }
     }
     function hold(selection, text, job = null, {texts = null, shown = selection === state.selection, allowEmpty = false,
-        selectedModel = videoModel.selection()} = {}) {
+        videoChoice = videoModel.choice()} = {}) {
+        const {mode: selectedModel, packageId: videoPackage} = videoChoice;
         const range = selectionRange(selection), selectedIds = selectionClips(selection).map(clip => clip.id);
         let ids = [];
         if (job) ids = selectedIds;
         if (!job) state.apply(t('Generate', '生成'), record => {
             const attempt = planGeneration(record, range, selectedIds, {text, texts, selectedModel});
             if (isPiVideoModel(selectedModel)) checkPiGeneration(selectedModel, model.prepare(attempt.record, attempt.ids),
-                attempt.ids, range, capability.generationSize || generationSize(record));
+                attempt.ids, range, capability.generationSize || generationSize(record), capability.grid, videoPackage);
             ids = attempt.ids;
             return attempt.record;
         }, {checkpoint: true});
-        if (!ids.every(isHeld)) held.push({ids, text, job, allowEmpty, selectedModel});
+        if (!ids.every(isHeld)) held.push({ids, text, job, allowEmpty, selectedModel, videoPackage});
         markHeld(ids, true);
         if (shown) state.select({kind: 'clip', ids});
         rememberView();
@@ -906,7 +910,8 @@ export function openEditor({api, app, from = null, panel = {}, components: given
                 // Each part goes with its own description, as written while it waited.
                 const texts = Object.fromEntries(clips.map(clip => [clip.id, clip.text.trim() || entry.text]));
                 try { await actions.generate({text: texts[clips[0].id], texts, selection, allowEmpty: entry.allowEmpty === true,
-                    selectedModel: entry.selectedModel ?? null, verifiedModel: isPiVideoModel(entry.selectedModel)}); }
+                    videoChoice: {mode: entry.selectedModel ?? null, packageId: entry.videoPackage || ''},
+                    verifiedModel: isPiVideoModel(entry.selectedModel)}); }
                 catch (value) { const reason = error(value, 'generate'); if (reason && !correctableGeneration(reason.reason)) genbar?.say(reason.say); }
             }
         } finally { startingHeld = false; }
@@ -1062,7 +1067,7 @@ export function openEditor({api, app, from = null, panel = {}, components: given
             }
             Object.assign(inputs, capability.generationSize || generationSize(state.record));
             // Its own level is the edit's (its project cannot hold the Fast level): the node's Fast setting does not come with it.
-            if (!preserveSamplingLinks && 'fast_mode' in inputs && EDIT_SAMPLING.some(key => key in settings)) inputs.fast_mode = 'none';
+            if (!preserveSamplingLinks && 'fast_mode' in inputs && EDIT_SAMPLING.some(key => key in settings)) clearFastMode(inputs);
         } else if (bar?.overrides) for (const [name, setting] of Object.entries(bar.overrides())) if (name in inputs && !Array.isArray(inputs[name])) inputs[name] = setting;
         // The first-frame reference is the work's own setting, the one the length limit is worked out from.
         if (panel.barActive && 'first_frame_reference' in inputs && !Array.isArray(inputs.first_frame_reference)) inputs.first_frame_reference = state.record.settings?.first_frame_reference === true;
@@ -1230,7 +1235,8 @@ export function openEditor({api, app, from = null, panel = {}, components: given
         try {
             // Queued parts stay queued across a reload; they are only planned drafts until sent.
             const waiting = held.map(entry => ({ids: entry.ids, text: entry.text, ...(entry.allowEmpty === true ? {allowEmpty: true} : {}),
-                ...(entry.selectedModel ? {selectedModel: entry.selectedModel} : {})}));
+                ...(entry.selectedModel ? {selectedModel: entry.selectedModel} : {}),
+                ...(entry.videoPackage ? {videoPackage: entry.videoPackage} : {})}));
             value.held = waiting;
             localStorage.setItem(viewPrefix + key, JSON.stringify({selection: value.selection, text: value.text, ...(waiting.length ? {held: waiting} : {})}));
             if (state.record.id) localStorage.setItem('fv-editor-last', key);
@@ -1311,7 +1317,8 @@ export function openEditor({api, app, from = null, panel = {}, components: given
             const clips = entry.ids.map(id => model.find(state.record, id));
             if (!clips.length || clips.some(clip => !clip || clip.source || clip.pending !== 'draft' || clip.job) || entry.ids.some(isHeld)) continue;
             const selectedModel = isPiVideoModel(entry.selectedModel) || entry.selectedModel === 'current' ? entry.selectedModel : null;
-            held.push({ids: [...entry.ids], text: entry.text, allowEmpty: entry.allowEmpty === true, selectedModel}); markHeld(entry.ids, true);
+            const videoPackage = isPiVideoModel(selectedModel) ? videoPackageId(entry.videoPackage) : '';
+            held.push({ids: [...entry.ids], text: entry.text, allowEmpty: entry.allowEmpty === true, selectedModel, videoPackage}); markHeld(entry.ids, true);
         }
         viewReady = true;
         if (record.id) try { localStorage.setItem('fv-editor-last', record.id); localStorage.setItem(usedPrefix + record.id, String(Date.now())); } catch {}
@@ -1647,7 +1654,7 @@ export function openEditor({api, app, from = null, panel = {}, components: given
         references: panel.references ? {source: panel.references, notify, seconds: () => { const range = selectionRange(); return range ? range.frames / model.FPS : null; }, size: () => capability.generationSize || generationSize(state.record),
             visible: () => store.generationAvailable && actions.supportedSelection() ? partStart() : null} : null,
         setFirstFrame: value => { state.apply(t('First-frame reference', '首帧参考'), record => model.setFlag(record, 'first_frame_reference', value)); },
-        videoModel: () => videoModel.selection(),
+        videoModel: () => videoModel.choice(),
         piModel: () => isPiVideoModel(videoModel.selection()),
         // The sampling data and models the next generated part would still download first.
         assets: {api, query: () => {
@@ -1675,17 +1682,20 @@ export function openEditor({api, app, from = null, panel = {}, components: given
         // texts: a description for each planned part, by the part's picture; otherwise text is every part's.
         // secondPass: the preview video whose second pass replaces it; the engine continues that preview's own request.
         async generate({target = 'both', text = '', texts = null, label = t('Generate', '生成'), selection = state.selection,
-            shown = selection === state.selection, allowEmpty = false, secondPass = null, selectedModel = videoModel.selection(), verifiedModel = false} = {}) {
+            shown = selection === state.selection, allowEmpty = false, secondPass = null, videoChoice = videoModel.choice(), verifiedModel = false} = {}) {
             if (target !== 'both' || !actions.supportedSelection(selection)) throw new model.EditError('unsupported');
             // A half of a pair left by a cut or a paste is dropped; a description over the limit is said before anything is sent.
             text = wellFormed(text);
             // Only the user's own choice to go on without a description lets an empty one through.
             if (!(allowEmpty === true && !text.trim() && store.generationAvailable && actions.needsText(selection)) && !actions.canGenerate(text, selection)) throw new model.EditError('text');
             if (characters(text) > model.RULES.maxText) throw Object.assign(new model.EditError('text_long'), {limit: model.RULES.maxText});
+            const {mode: selectedModel, packageId} = videoChoice;
+            const unavailable = !secondPass && videoChoiceProblem(t, videoChoice);
+            if (unavailable) throw Object.assign(new model.EditError('pi_video'), {say: unavailable});
             const pi = !secondPass && isPiVideoModel(selectedModel);
             const previewing = !secondPass && actions.previewFirst(selection, selectedModel);
             const activeModel = videoModel.active();
-            const installation = pi && !verifiedModel ? piDownload(selectedModel) : null;
+            const installation = pi && !verifiedModel ? piDownload(videoChoice) : null;
             submissionFailure = null; genbar?.update(null);
             const chosen = state.selection;
             generationBusy = true; updateTop(); updateTransport();
@@ -1698,10 +1708,15 @@ export function openEditor({api, app, from = null, panel = {}, components: given
             };
             sendingRanges.add(range);
             try {
+                if (pi && packageId && verifiedModel) {
+                    await videoModel.ready();
+                    const state = videoModel.status(selectedModel, packageId);
+                    if (!state?.present) throw Object.assign(new model.EditError('pi_video'), {say: piVideoDownloadText(t, state)});
+                }
                 frozen = await snapshot({preserveSamplingLinks: pi}); if (epoch !== projectEpoch || closing || disposed || !store.generationAvailable) return;
                 const inputs = frozen.prompt[frozen.node].inputs;
                 if (!secondPass && selectedModel !== null) {
-                    try { applyVideoModelSnapshot({output: frozen.prompt}, frozen.node, activeModel, selectedModel); }
+                    try { applyVideoModelSnapshot({output: frozen.prompt}, frozen.node, activeModel, selectedModel, packageId); }
                     catch (error) {
                         if (!pi) throw error;
                         throw Object.assign(new model.EditError('pi_video'), {say: piVideoProblem(t, selectedModel, {settingsLinked: true}) || error.message});
@@ -1711,19 +1726,19 @@ export function openEditor({api, app, from = null, panel = {}, components: given
                 const piSize = {width: inputs.width, height: inputs.height};
                 if (pi) {
                     const attempt = prepare(state.record);
-                    const {info} = checkPiGeneration(selectedModel, attempt.record, attempt.ids, range, piSize, piGrid);
+                    const {info} = checkPiGeneration(selectedModel, attempt.record, attempt.ids, range, piSize, piGrid, packageId);
                     if (info.maxFrames === undefined && Object.values(piSize).every(Number.isInteger)) {
                         piGrid = await store.capabilityGrid(piSize) || piGrid;
                         if (epoch !== projectEpoch || closing || disposed || !store.generationAvailable) return false;
-                        checkPiGeneration(selectedModel, attempt.record, attempt.ids, range, piSize, piGrid);
+                        checkPiGeneration(selectedModel, attempt.record, attempt.ids, range, piSize, piGrid, packageId);
                     }
-                    if (installation && !(await ensurePiForDraft(selectedModel, epoch, installation))) return false;
+                    if (installation && !(await ensurePiForDraft(videoChoice, epoch, installation))) return false;
                     if (epoch !== projectEpoch || closing || disposed || !store.generationAvailable) return false;
                 }
                 beforeAttempt = state.record; priorSelection = state.selection; priorText = state.rangeText;
                 state.apply(label, record => {
                     const attempt = prepare(record);
-                    if (pi) checkPiGeneration(selectedModel, attempt.record, attempt.ids, range, piSize, piGrid);
+                    if (pi) checkPiGeneration(selectedModel, attempt.record, attempt.ids, range, piSize, piGrid, packageId);
                     ids = attempt.ids;
                     return !record.tracks[0].clips.length && text.trim()
                         ? model.rename(attempt.record, model.truncateText(text.trim(), 40)) : attempt.record;
@@ -1764,10 +1779,13 @@ export function openEditor({api, app, from = null, panel = {}, components: given
                 // A preview is one part; any other part samples both passes, whatever the panel shows.
                 const alone = request.blocks.length === 1 && (store.continuationPreview || !beforeKeys.some(Boolean));
                 // The Fast level makes one part that continues nothing; any other part samples as the control then says.
-                if (!pi && 'fast_mode' in inputs && inputs.fast_mode !== 'none' && (!panel.fastOffered || secondPass || request.blocks.length !== 1 || beforeKeys.some(Boolean)))
-                    Object.assign(inputs, {fast_mode: 'none', two_pass: true, base_steps: 8, refine_steps: 3, step_cache: 'none', upscale_factor: '2'});
+                if (!pi && 'fast_mode' in inputs && inputs.fast_mode !== 'none' && (!panel.fastOffered || secondPass || request.blocks.length !== 1 || beforeKeys.some(Boolean))) {
+                    clearFastMode(inputs);
+                    Object.assign(inputs, {two_pass: true, base_steps: 8, refine_steps: 3, step_cache: 'none', upscale_factor: '2'});
+                }
                 if (secondPass) {
                     if (!alone) throw new model.EditError('unsupported');
+                    clearFastMode(inputs);
                     Object.assign(inputs, {two_pass: true, preview: false, refine_from: secondPass, native_h3_preset: ''});
                 } else {
                     // By the steps in this very request: they may have changed on the node since the key was drawn.
@@ -1825,7 +1843,7 @@ export function openEditor({api, app, from = null, panel = {}, components: given
             } finally { sendingRanges.delete(range); for (const id of ids) sending.delete(id); if (disposed && ids.length) queue.enqueue(state.record); generationBusy = false; finishGeneration?.(); generationDone = null; finishGeneration = null; updateTop(); updateTransport(); startHeld(); }
         },
         // A press on Generate always answers: what can be done for the user is done, then said in one line.
-        async press(text, {allowEmpty = false, allowDownload = false, selectedModel = videoModel.selection()} = {}) {
+        async press(text, {allowEmpty = false, allowDownload = false, videoChoice = videoModel.choice()} = {}) {
             if (disposed || closing || initializing) return {say: t('Opening the edit…', '正在打开…')};
             text = wellFormed(text);
             if (voice.session() && ['ready', 'done'].includes(voice.session().phase)) { await voice.redub(); return {}; }
@@ -1842,6 +1860,9 @@ export function openEditor({api, app, from = null, panel = {}, components: given
                 if (bytes > 0 && !allowDownload) return {confirmDownload: bytes};
                 return narration.press(text);
             }
+            const {mode: selectedModel, packageId} = videoChoice;
+            const unavailable = videoChoiceProblem(t, videoChoice);
+            if (unavailable) return {say: unavailable};
             let selection = state.selection, said = null;
             if (actions.selectionHeld()) return {say: t('Queued', '排队中')};
             if (busySelection(selection)) return {say: t('This part is generating.', '这一段正在生成。')};
@@ -1899,20 +1920,20 @@ export function openEditor({api, app, from = null, panel = {}, components: given
             const waiting = waitingFor(selection);
             const described = texts ? texts[run[0].id] : text;
             if (waiting) {
-                if (isPiVideoModel(selectedModel) && !videoModel.status(selectedModel)?.present) {
+                if (isPiVideoModel(selectedModel) && !videoModel.status(selectedModel, packageId)?.present) {
                     const range = selectionRange(selection), selectedIds = selectionClips(selection).map(clip => clip.id);
                     const planned = planGeneration(state.record, range, selectedIds, {text: described, texts, selectedModel});
                     checkPiGeneration(selectedModel, model.prepare(planned.record, planned.ids), planned.ids, range,
-                        capability.generationSize || generationSize(state.record));
-                    if (!(await ensurePiForDraft(selectedModel, epoch))) return {};
+                        capability.generationSize || generationSize(state.record), capability.grid, packageId);
+                    if (!(await ensurePiForDraft(videoChoice, epoch))) return {};
                 }
-                hold(selection, described, null, {texts, shown, allowEmpty, selectedModel});
+                hold(selection, described, null, {texts, shown, allowEmpty, videoChoice});
                 if (store.generationAvailable) void startHeld();
                 return {text, say: [said, used, waiting === 'ready' ? queuedReady()
                     : t('Queued. It starts after the previous part finishes.', '已排队，上一段完成后自动开始。')].filter(Boolean).join(' '), queued: true};
             }
             const busyBefore = jobActive();
-            if (await actions.generate({text: described, texts, selection, shown, allowEmpty, selectedModel}) === false) return {};
+            if (await actions.generate({text: described, texts, selection, shown, allowEmpty, videoChoice}) === false) return {};
             return {text, say: [said, used, busyBefore ? t('Queued. It starts after the part now generating.', '已排队，正在生成的那段完成后自动开始。') : null].filter(Boolean).join(' ') || null, queued: busyBefore};
         },
         selectionRunning: () => music.target() ? music.running() : narration.target() ? narration.running() : busySelection(state.selection),
@@ -1958,10 +1979,12 @@ export function openEditor({api, app, from = null, panel = {}, components: given
             else if (!store.generationAvailable) {
                 const text = wellFormed(clip.text || panel.text || '');
                 if (characters(text) > model.RULES.maxText) { error(Object.assign(new model.EditError('text_long'), {limit: model.RULES.maxText}), 'generate'); return; }
-                const selectedModel = videoModel.selection(), epoch = projectEpoch;
-                if (isPiVideoModel(selectedModel) && !(await ensurePiForDraft(selectedModel, epoch))) return;
+                const videoChoice = videoModel.choice(), epoch = projectEpoch;
+                const unavailable = videoChoiceProblem(t, videoChoice);
+                if (unavailable) { genbar?.say(unavailable); return; }
+                if (isPiVideoModel(videoChoice.mode) && !(await ensurePiForDraft(videoChoice, epoch))) return;
                 if (disposed || closing || epoch !== projectEpoch) return;
-                if (!isHeld(id)) hold(selection, text, null, {selectedModel});
+                if (!isHeld(id)) hold(selection, text, null, {videoChoice});
                 genbar?.say(queuedReady()); if (genHost.hidden) notify(queuedReady()); void startHeld();
             } else await actions.generate({text: clip.text || panel.text || ''});
         },
@@ -2114,9 +2137,9 @@ export function openEditor({api, app, from = null, panel = {}, components: given
         attachBar = () => {
         if (bar) return;
         bar = panel.borrowBar({mount: genHost, onSeconds: value => { const field = genbar.duration; if (!field || field.element.hidden || field.input.disabled || !(value > 0)) return; field.input.value = String(Math.round(value)); field.commit(); }, label: () => barLabel || null, previews: () => [t('Generate preview', '生成预览'), t('Regenerate preview', '重新生成预览')].includes(barLabel), disabled: () => !genbar.canGenerate(),
-            submit: async options => { genbar.setText(bar.prompt.value); await genbar.press(options?.allowEmpty === true); },
+            submit: async options => { genbar.setText(bar.prompt.value); await genbar.press(options?.allowEmpty === true, options?.videoChoice); },
             onFirstFrame: value => genbar.firstFrame?.set(value), modelPicker: videoModel.element,
-            videoModelSelection: () => videoModel.selection()});
+            videoModelChoice: () => videoModel.choice()});
         if (bar) {
             genHost.classList.add('fv-ed-genbar-borrowed');
             genHost.addEventListener('focusout', fromStart);

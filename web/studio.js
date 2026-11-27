@@ -3,7 +3,7 @@ import './has_mirror.js';
 import {createLanAccess} from './lan_access.js';
 import { createErrorPanel, errorText, createErrorReport } from './error_panel.js';
 import {createExpandButton} from './editor_expand.js';
-import {allowEmptyPrompt, cleanOptionalPrompt, clonePrompt} from './optional_inputs.js';
+import {allowEmptyPrompt, cleanOptionalPrompt, clearFastMode, clonePrompt, videoPackageId} from './optional_inputs.js';
 import {showEmptyPrompt, dismissEmptyPrompt} from './empty_prompt_notice.js';
 import { app } from '../../scripts/app.js';
 import { api } from '../../scripts/api.js';
@@ -51,7 +51,7 @@ import { enlarged, toggleEnlarge } from './video_enlarge.js';
 import { framesOf, savedPrompt, savedSettings } from './result_reuse.js';
 import { addVideoLabel, addVideoModel, applyVideoModelSnapshot, COMFY_H3_SAMPLING,
     createVideoModelPicker, isPiVideoModel, missingVideoText, piVideoDownloadText, piVideoModeInfo, piVideoProblem,
-    piVideoSteps, videoModelState } from './video_model.js';
+    piVideoSteps, sameVideoChoice, videoChoiceProblem, videoModelState } from './video_model.js';
 import { createPromptEnhancer } from './prompt_enhance.js';
 import { requestText, shownRewrite } from './prompt_sections.js';
 import { createRequestAssets, enabledLoras, referenceFiles } from './request_assets.js';
@@ -770,7 +770,8 @@ export function openStudio(node, {extendFrom = null} = {}) {
     let consoleUI = null, promptLibrary = null, reverseKey = null, reversePick = null;
     // Set while the editor borrows this panel's bar (current.borrow below).
     let borrowed = null, columns = null, placeReverse = () => {};   // (placeReverse: where the reverse-prompt key stands; set below, run again when the editor lends or takes back the bar)
-    const selectedVideoMode = () => borrowed ? borrowed.videoModelSelection?.() : videoPicker?.selection();
+    const selectedVideoChoice = () => borrowed ? borrowed.videoModelChoice?.() : videoPicker?.choice();
+    const selectedVideoMode = () => selectedVideoChoice()?.mode;
     const piMode = () => isPiVideoModel(selectedVideoMode()) ? selectedVideoMode() : null;
     const fixedVideoSampling = () => Boolean(comfyH3Model || piMode());
     const piSamplingInputs = [...Object.keys(COMFY_H3_SAMPLING), 'refine_steps'];
@@ -1173,7 +1174,11 @@ export function openStudio(node, {extendFrom = null} = {}) {
     // it accepts beside it (8 + 3, one pass, no cache, factor 2). The two-pass choice made before it comes back when it is left.
     let fastOffer = null, fastBack = null;
     const fastOn = () => !comfyH3Model && !selectedVideoMode() && Boolean(widget(node, 'fast_mode')) && value(node, 'fast_mode') === 'fast2';
-    const fastLeft = () => { if (fastOn()) set(node, 'fast_mode', 'none'); };
+    const fastLeft = () => {
+        if (!fastOn()) return;
+        set(node, 'fast_mode', 'none');
+        if (widget(node, 'video_package')) set(node, 'video_package', '');
+    };
     // A video made in parts is sampled at Light in two passes, whatever is chosen (the request says so at submission).
     const fastParts = () => fastOn() && lengthControl?.plan?.count > 1;
     const fastPartsWords = () => t('Each part of a video made in parts uses the Light level.', '分段生成时，每段使用轻量档。');
@@ -2729,7 +2734,8 @@ export function openStudio(node, {extendFrom = null} = {}) {
             : t('Generating part {part}…', '正在生成第 {part} 段…', { part: position.index + 1 });
         const fastShort = fastShortfall(), fastWait = fastUnknown();
         const lengthBlocked = !fixedVideoSampling() && lengthControl.blocked;
-        generate.disabled = submitting || chainWait || (lengthBlocked && !lengthControl.retryable) || Boolean(fastShort)
+        const choiceProblem = !borrowed && videoChoiceProblem(t, selectedVideoChoice());
+        generate.disabled = submitting || chainWait || (lengthBlocked && !lengthControl.retryable) || Boolean(fastShort || choiceProblem)
             || fastWait === 'checking' || (runMode === 'loop' && queueState?.looping) || enhancer.reversing;
         paintReverse?.();
         // Planning the parts and adding a batch are different waits; a count is only shown when the queue really has one.
@@ -2763,11 +2769,12 @@ export function openStudio(node, {extendFrom = null} = {}) {
             : submitting ? t('Adding to the queue. One moment.', '正在加入队列，请稍候')
             : chainWait ? t('Parts are generating. Wait, or cancel them in the queue.', '分段视频生成中，完成或在队列里取消后可再生成')
             : enhancer.reversing ? t('Writing the prompt. One moment.', '正在生成提示词，请稍候')
+            : choiceProblem ? choiceProblem
             : lengthBlocked ? lengthControl.message || ''
             : fastShort ? fastShortfallWords(fastShort)
             : fastWait === 'checking' ? fastUnknownWords(fastWait)
             : t('A loop is running. Stop it to start again.', '正在循环生成，停止后可重新开始');
-        const lengthSaid = videoMissing ? '' : pi && !borrowed ? piProblem(pi) : lengthBlocked ? lengthControl.visibleMessage : fastShort ? fastShortfallWords(fastShort)
+        const lengthSaid = videoMissing ? '' : choiceProblem ? choiceProblem : pi && !borrowed ? piProblem(pi) : lengthBlocked ? lengthControl.visibleMessage : fastShort ? fastShortfallWords(fastShort)
             : fastWait ? fastUnknownWords(fastWait) : '';
         if (lengthWhy.textContent !== lengthSaid) lengthWhy.textContent = lengthSaid;
         if (lengthWhy.hidden !== !lengthSaid) lengthWhy.hidden = !lengthSaid;
@@ -2930,13 +2937,13 @@ export function openStudio(node, {extendFrom = null} = {}) {
             status.textContent = reply.status === 'cancelling' ? t('Stopping generation…', '正在停止生成…') : '';
         } catch (error) { cancelling = false; updateRunButton(); showQueueError(error); }
     }
-    function piInfo(model) {
-        const status = videoPicker.status(model);
+    function piInfo(model, packageId = selectedVideoChoice()?.packageId) {
+        const status = videoPicker.status(model, packageId);
         if (status?.compatible === false) return {known: true, listed: false, reason: status.compatibility_reason};
         return piVideoModeInfo(fastGrid, model, value(node, 'width'), value(node, 'height'), piFrames());
     }
-    async function exactPiInfo(model) {
-        const current = piInfo(model), context = capabilityContext(node, {custom: true});
+    async function exactPiInfo(model, packageId) {
+        const current = piInfo(model, packageId), context = capabilityContext(node, {custom: true});
         if (!context || current.maxFrames !== undefined || current.known && !current.listed) return current;
         for (let attempt = 0; attempt < 4 && !disposed; attempt++) {
             try {
@@ -2967,15 +2974,15 @@ export function openStudio(node, {extendFrom = null} = {}) {
     async function submitDraft(options) {
         // Borrowed by the editor: its Generate runs the editor's own submission (editor_bar.js), with this bar's values.
         if (borrowed) {
-            const lending = borrowed, selectedModel = lending.videoModelSelection?.();
+            const lending = borrowed, videoChoice = lending.videoModelChoice?.();
             // The enhancement and the replace-person check are this bar's; what is then made is the editor's.
             if (swapState(mediaNode)) {
                 const missing = swapMissing(swapState(mediaNode));
                 if (missing) { status.dataset.error = 'true'; status.textContent = swapMissingText(missing, t); return; }
             }
             if (prompt.value.trim() && !swapState(mediaNode) && await enhancer.beforeGenerate() === false) return;
-            if (borrowed !== lending || lending.videoModelSelection?.() !== selectedModel) return;
-            return lending.submit(options);
+            if (borrowed !== lending || !sameVideoChoice(lending.videoModelChoice?.(), videoChoice)) return;
+            return lending.submit({...options, videoChoice});
         }
         if (videoMissing) {
             // The answer comes from this computer at once; the button waits for it so a click is never silent.
@@ -2989,9 +2996,10 @@ export function openStudio(node, {extendFrom = null} = {}) {
         if (capturing || queueState?.submitting || waitingForPi) return;
         const selectedModel = videoModel;
         const nativeModel = comfyH3Model;
-        const selection = selectedVideoMode(), explicitPi = isPiVideoModel(selection);
+        const choice = selectedVideoChoice(), {mode: selection, packageId} = choice;
+        const explicitPi = isPiVideoModel(selection);
         const fixedSampling = nativeModel || explicitPi;
-        const problem = piProblem(selection);
+        const problem = videoChoiceProblem(t, choice) || piProblem(selection);
         if (problem) { status.dataset.error = 'true'; status.textContent = problem; return; }
         if (nativeModel && (extension.source || Object.keys(COMFY_H3_SAMPLING).some(name => linked(node, name)))) {
             status.dataset.error = 'true';
@@ -3066,18 +3074,18 @@ export function openStudio(node, {extendFrom = null} = {}) {
         if (texts && !texts.length) { status.dataset.error = 'true'; status.textContent = t('Write one prompt per line, then add them.', '每行写一条提示词后再添加。'); prompt.focus(); return; }
         if (texts && texts.length > 100) { status.dataset.error = 'true'; status.textContent = t('At most 100 lines at a time; there are {count}.', '一次最多 100 行，现在有 {count} 行。', { count: texts.length }); prompt.focus(); return; }
         if (texts && timedParse(texts.join('\n'))[1].length) { status.dataset.error = 'true'; status.textContent = t('Timed lines cannot be split into separate videos. Turn off One prompt per line.', '带时间的台词不能拆成多个视频，请关闭“每行一条提示词”。'); return; }
-        if (explicitPi && !videoPicker.status(selection)?.present) {
+        if (explicitPi && !videoPicker.status(selection, packageId)?.present) {
             const pending = waitingForPi = {model: selection, draft: piDraft()};
             updateRunButton();
             const currentDraft = () => !disposed && dialog.open && !borrowed && waitingForPi === pending
-                && selectedVideoMode() === selection && piDraft() === pending.draft;
-            const ready = await videoPicker.ensure(selection, currentDraft);
+                && sameVideoChoice(selectedVideoChoice(), choice) && piDraft() === pending.draft;
+            const ready = await videoPicker.ensure(selection, packageId, currentDraft);
             const same = currentDraft();
             if (waitingForPi === pending) waitingForPi = null;
             if (disposed || borrowed) return;
             updateRunButton();
             if (!ready) {
-                if (same) { status.dataset.error = 'true'; status.textContent = piVideoDownloadText(t, videoPicker.status(selection)); }
+                if (same) { status.dataset.error = 'true'; status.textContent = piVideoDownloadText(t, videoPicker.status(selection, packageId)); }
                 return;
             }
         }
@@ -3097,7 +3105,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
             const lengthPlan = fixedSampling ? null : await lengthControl.ready();
             if (disposed || (!fixedSampling && lengthControl.blocked)) return;
             if (explicitPi) {
-                const info = await exactPiInfo(selection);
+                const info = await exactPiInfo(selection, packageId);
                 if (disposed) return;
                 const problem = piProblem(selection, info);
                 if (problem) { status.dataset.error = 'true'; status.textContent = problem; return; }
@@ -3137,13 +3145,17 @@ export function openStudio(node, {extendFrom = null} = {}) {
             for (const section of controls.querySelectorAll('.fv-section')) section.inert = true;
             held = turnNodeOn(node);
             const graph = cleanOptionalPrompt(clonePrompt(await app.graphToPrompt()));
-            applyVideoModelSnapshot(graph, node.id, selectedModel, selection);
+            applyVideoModelSnapshot(graph, node.id, selectedModel, selection, packageId);
             if (emptyAllowed && !prompt.value.trim() && !extension.source) allowEmptyPrompt(graph, node.id);
             snapshot = singleRunSnapshot(extendSnapshot(graph, node.id, source,
                 {multiple: lengthPlan?.count > 1}), node.id, lengthPlan);
             if (!snapshot) { fault(t('Could not prepare this run. Try again.', '没能准备这次生成，请重试。')); return; }
             // The Fast level makes one whole video: the parts of a longer one are sampled at Light.
-            if (fastOn() && lengthPlan?.count > 1) Object.assign(snapshot.output[node.id].inputs, {fast_mode: 'none', two_pass: true, preview: false});
+            if (fastOn() && lengthPlan?.count > 1) {
+                const inputs = snapshot.output[node.id].inputs;
+                clearFastMode(inputs);
+                Object.assign(inputs, {two_pass: true, preview: false});
+            }
             const seedIndex = node.widgets.findIndex(w => w.name === 'seed');
             capturing = false;
             for (const section of controls.querySelectorAll('.fv-section')) section.inert = false;
@@ -3446,7 +3458,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     // come from the same node the bar edits. Release puts everything back as it was.
     let popHolder = null;
     current.borrow = ({mount, submit, label = null, previews = null, disabled = null, onSeconds = null, onFirstFrame = null,
-        modelPicker = null, videoModelSelection = null, initial = {}, locked = []}) => {
+        modelPicker = null, videoModelChoice = null, initial = {}, locked = []}) => {
         if (borrowed || disposed) return null;
         columns?.restore(); // the editor shows the console bar, not the column
         videoPicker.close(); waitingForPi = null;
@@ -3492,7 +3504,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
                 updateRunButton();
             }};
         shadow = new Map();
-        borrowed = {submit, label: () => (state.labelFn ?? label)?.(), previews, disabled, onSeconds, onFirstFrame, videoModelSelection,
+        borrowed = {submit, label: () => (state.labelFn ?? label)?.(), previews, disabled, onSeconds, onFirstFrame, videoModelChoice,
             firstFrame: null, applying: false, release: state.release};
         placeReverse();
         const unlock = () => {
@@ -3696,8 +3708,8 @@ export function openStudio(node, {extendFrom = null} = {}) {
     const loraCount = () => { try { return enabledCount(JSON.parse(value(loraNode, 'adapters') || '[]')); } catch { return 0; } };
     const shapeName = () => selected === 'input' ? t('Match image', '跟随图片') : studioShapes(t).find(([id]) => id === selected)?.[1] || t('Custom size', '自定义');
     videoPicker = createVideoModelPicker({fetchApi: api.fetchApi.bind(api), t, scope: 'studio',
-        initial: value(node, 'fast_mode') === 'fast4' ? 'fast4' : null,
-        onChange: () => { waitingForPi = null; syncVideoSampling(); },
+        initial: videoPackageId(value(node, 'video_package')) || (value(node, 'fast_mode') === 'fast4' ? 'fast4' : null),
+        onChange: () => { waitingForPi = null; syncVideoSampling(); updateRunButton(); },
         onActive: model => { videoModel = model; syncVideoSampling(); }});
     if (fastGrid) videoPicker.setCapabilities(fastGrid);
     cleanup.push(videoPicker.dispose);
@@ -3754,7 +3766,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
         if (disposed) return;
         const pi = piMode(), selection = selectedVideoMode();
         const native = !pi && videoModel?.kind === 'comfy_h3' ? videoModel : null;
-        const profile = `${selection ?? ''}:${native?.id ?? ''}`;
+        const profile = `${selection ?? ''}:${native?.id ?? ''}:${selectedVideoChoice()?.packageId || ''}`;
         if (samplingProfile === profile) return;
         samplingProfile = profile;
         comfyH3Model = native;

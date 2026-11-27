@@ -220,13 +220,33 @@ class ComponentJobs(HubModelJobs):
         return _public(candidate)
 
     def status(self, *, local=False, native_picker=False, managers=None):
+        from .model_components_generation import PI_SLOTS
+        from .model_packages import binding_references, fast_default_bindings, load as load_packages
+
         active = models.selections(self.root)
         rows = []
+        modes = {slot: mode for mode, slot in PI_SLOTS.items()}
+        packages, protected, package_error = None, set(), None
         for slot in self._catalog().values():
             default = _known_default(slot)
             versions = list(default.pop('versions', []))
             active_id = active.get(slot.id, default.pop('active_id', models.BUILTIN))
             supported = slot.supported
+            if slot.id in modes:
+                try:
+                    if packages is None and package_error is None:
+                        packages = load_packages(self.root)
+                        protected = binding_references(self.root, 'video', document=packages)
+                    if packages is not None:
+                        bindings = set(fast_default_bindings(self.root, modes[slot.id], document=packages).values())
+                        if len(bindings) == 1:
+                            active_id, = bindings
+                        else:
+                            active_id = models.BUILTIN
+                except (OSError, ValueError) as error:
+                    package_error = str(error)
+                if package_error:
+                    supported = False
             if slot.manager and managers is not None:
                 active_id, versions, supported = manager_versions(slot, default, managers)
                 actions = ['reset'] if supported else []
@@ -235,20 +255,22 @@ class ComponentJobs(HubModelJobs):
                 if io_path(folder).is_dir():
                     for directory in sorted(io_path(folder).iterdir()):
                         if models.ID.fullmatch(directory.name):
-                            versions.append(self._version_status(slot, directory.name, active_id))
+                            versions.append(self._version_status(slot, directory.name, active_id,
+                                                                 protected if slot.id in modes else ()))
                 if active_id != models.BUILTIN and not any(row['id'] == active_id for row in versions):
                     versions.append(self._version_status(slot, active_id, active_id))
                 actions = ['inspect', 'install', 'verify', 'activate', 'reset', 'repair', 'remove'] if supported and slot.validate else []
             rows.append(dict(id=slot.id, group=slot.group, label=slot.label, label_zh=slot.label_zh,
                              consumers=slot.consumers, format=slot.format, supported=supported,
-                             reason=slot.reason, default=default, active_id=active_id, versions=versions,
+                             reason=(package_error or slot.reason) if slot.id in modes else slot.reason,
+                             default=default, active_id=active_id, versions=versions,
                              actions=actions, manager=slot.manager, manager_model=slot.model,
                              manager_component=slot.component))
         with self.mutex:
             job = dict(self.task)
         return dict(slots=rows, job=job, local_available=local, native_picker=native_picker)
 
-    def _version_status(self, slot, identity, active):
+    def _version_status(self, slot, identity, active, protected=()):
         try:
             folder, value = models.receipt(self.root, slot.id, identity)
             valid = models.intact(folder, value)
@@ -256,7 +278,9 @@ class ComponentJobs(HubModelJobs):
             return dict(id=identity, label=identity, installed=False, damaged=True, actions=[])
         actions = ['verify'] if valid else ['repair']
         if identity != active and valid:
-            actions.extend(('activate', 'remove'))
+            actions.append('activate')
+            if identity not in protected:
+                actions.append('remove')
         return (dict(id=identity, installed=valid, damaged=not valid, actions=actions)
                 | {key: value[key] for key in ('label', 'source', 'repo', 'revision', 'license', 'bytes') if key in value})
 
@@ -420,7 +444,7 @@ class ComponentJobs(HubModelJobs):
     def _change(self, slot, action, identity, token):
         if action == 'reset':
             with self._idle():
-                models.choose(self.root, slot.id, None)
+                self._select(slot, None)
             return
         folder, value = models.receipt(self.root, slot.id, identity)
         if action == 'repair':
@@ -447,12 +471,28 @@ class ComponentJobs(HubModelJobs):
                 if not models.intact(folder, value):
                     raise ValueError('Model files changed on disk. Repair the installed version.')
                 if action == 'activate':
-                    models.choose(self.root, slot.id, identity)
+                    self._select(slot, identity)
                 else:
                     self._remove(slot, folder, value)
 
+    def _select(self, slot, identity):
+        from .model_components_generation import PI_SLOTS
+        from .model_packages import note_fast_selection
+
+        for mode, name in PI_SLOTS.items():
+            if slot.id == name:
+                note_fast_selection(self.root, mode, identity)
+                return
+        models.choose(self.root, slot.id, identity)
+
     def _remove(self, slot, folder, value):
-        if models.selected_identity(self.root, slot.id) == value['id']:
+        from .model_components_generation import PI_SLOTS
+        from .model_packages import binding_references
+
+        if slot.id in PI_SLOTS.values():
+            if value['id'] in binding_references(self.root, 'video'):
+                raise ValueError('Remove this version from every pi-H3 package before deleting it.')
+        elif models.selected_identity(self.root, slot.id) == value['id']:
             raise ValueError('Switch to another version before removing the active model.')
         if self.retained(value['id']):
             raise ValueError('This model is still needed by a saved working checkpoint.')

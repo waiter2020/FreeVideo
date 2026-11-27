@@ -66,6 +66,23 @@ test('a poll started before a command cannot overwrite the visible job', async (
     assert.equal(packs.status('fast4').install.job_id, 'new');
 });
 
+test('the built-in install checks and cancels the official files regardless of the legacy default', async () => {
+    const commands = [];
+    const packs = createPiVideoPacks((path, options) => {
+        if (!options.method) {
+            assert.equal(path, '/freevideo/fast-pack?mode=fast2&target=builtin');
+            return response(missing);
+        }
+        commands.push(JSON.parse(options.body));
+        return response({...missing, install: {state: 'running', job_id: 'official-job'}});
+    }, {target: 'builtin'});
+    await packs.read('fast2');
+    await packs.action('fast2', 'install');
+    await packs.action('fast2', 'cancel');
+    assert.deepEqual(commands, [{action: 'install', mode: 'fast2', target: 'builtin'},
+        {action: 'cancel', mode: 'fast2', target: 'builtin', job_id: 'official-job'}]);
+});
+
 test('missing, interrupted, failed, and incompatible packs keep distinct management states', () => {
     assert.deepEqual(piVideoPackState(en, undefined), {state: 'checking'});
     const interrupted = piVideoPackState(en, {...missing, resume_bytes: 40, install: {state: 'failed', reason: 'interrupted'}});

@@ -29,13 +29,15 @@ export function createWarmer({getToken, fetchImpl = (...args) => globalThis.fetc
         // At most once per model and level every two seconds; a full warm also stands for a light one.
         // beside: the view was only opened, so the engine loads the model only into free room (never in place of
         // the video models it keeps) and otherwise reads the files ahead.
-        warm(model, level = 'light', {beside = false} = {}) {
+        warm(model, level = 'light', {beside = false, packageId = ''} = {}) {
             if (absent || !model) return false;
             const at = now(), seen = key => at - (last.get(key) ?? -Infinity) < WARM_GAP_MS;
+            const pkg = typeof packageId === 'string' ? packageId : '';
             const key = beside && level === 'full' ? 'beside' : level;
-            if (seen(`${model}|${key}`) || (level === 'light' && seen(`${model}|full`))) return false;
-            last.set(`${model}|${key}`, at);
-            void send('warm', {model, level, mode: preloadMode(), ...(key === 'beside' ? {beside: true} : {})});
+            const stamp = name => `${model}|${name}|${pkg}`;
+            if (seen(stamp(key)) || (level === 'light' && seen(stamp('full')))) return false;
+            last.set(stamp(key), at);
+            void send('warm', {model, level, mode: preloadMode(), ...(key === 'beside' ? {beside: true} : {}), ...(pkg ? {package: pkg} : {})});
             return true;
         },
         // Leaving the view: what was being made ready can stop (sent even as the page goes away).

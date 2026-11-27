@@ -53,12 +53,13 @@ jobs:
       - name: Check every ComfyUI browser module
         run: |
           for file in web/*.js; do node --input-type=module --check < "$file"; done
-          node scripts/test_freevideo_entry.mjs
+          node --test scripts/test_freevideo_entry.mjs scripts/test_image_view_drafts.mjs scripts/test_pi_video_packs.mjs
       - name: Check CLI, ComfyUI entry and packaged resources
         run: |
           python scripts/check_installation.py
           python -m unittest discover -s scripts -p 'test_hf_*.py'
-            python -m unittest discover -s scripts -p 'test_local_*.py'
+          python -m unittest discover -s scripts -p 'test_local_*.py'
+          python -m unittest scripts.test_model_packages scripts.test_image_package_requests scripts.test_video_package_requests
           bash -n setup.sh test.sh freevideo scripts/bootstrap_linux.sh
           ./setup.sh --help
           ./test.sh --help

@@ -6,6 +6,7 @@ resource locks and readiness; this module does not run pip in ComfyUI.
 """
 import asyncio
 from collections import deque
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -398,6 +399,46 @@ class Setup:
         jobs.perform(slot, action, value, token)
         return dict(model_components=self.component_status(queue_busy, release_idle, True))
 
+    @staticmethod
+    def _package_status_access(value, local, image_status=None):
+        if value is not None:
+            value.update(local_available=local, native_picker=local and os.name == 'nt')
+            task = (image_status or {}).get('task') or {}
+            if task.get('operation') == 'set-shared-encoder':
+                value['job'] = task
+        return value
+
+    def package_status(self, *, local, video_only=False, image_status=None):
+        from .model_packages import status
+
+        try:
+            root, machine = installation(self.source)
+            value = status(root, machine, video_only=video_only)
+        except (OSError, ValueError):
+            return None
+        return self._package_status_access(value, local, image_status)
+
+    def package_action(self, value, queue_busy, release_idle):
+        from .model_packages import perform
+
+        if self.runner.busy:
+            raise ValueError('Wait for setup to finish before changing another model.')
+        action = value.get('action')
+        root, machine = installation(self.source)
+        manager = None
+        if action == 'set-shared-encoder':
+            manager = self.hub_models('image', queue_busy, release_idle)
+            if manager is None:
+                raise ValueError('Install the FreeVideo image runtime before changing the shared encoder.')
+        elif (action in ('activate', 'remove') or action == 'update' and value.get('bindings') is not None):
+            if queue_busy():
+                raise ValueError('Wait for the generation queue to finish.')
+            release_idle()
+        result = perform(root, value, machine, change_shared_encoder=manager.switch_shared_encoder if manager else None)
+        with manager.mutex if manager else nullcontext():
+            image_status = {'task': dict(manager.task)} if manager else None
+        return dict(model_packages=self._package_status_access(result, True, image_status))
+
     def _release_idle_video_workers(self):
         from . import video_warm
         from .resident_process import OWNER
@@ -775,13 +816,24 @@ def register():
     @server.routes.get('/freevideo/setup')
     async def info(request):
         try:
-            root=setup.validate_root(request.query['root']) if request.query.get('root') else None
             local = local_model_access(request)
-            managers = {kind: setup.hub_model_status(kind, queue_busy, release_idle, local_available=local)
-                        for kind in ('video', 'image')}
-            return web.json_response(dict(discovery=setup.discovery(root), task=setup.status(),
-                                          video_models=managers['video'], image_models=managers['image'],
-                                          model_components=setup.component_status(component_busy, release_components, local, managers)))
+            view, root_query = request.query.get('view'), request.query.get('root')
+
+            def snapshot():
+                if view == 'video-packages':
+                    manager = setup.hub_models('video', queue_busy, release_idle)
+                    video = manager.status(active_only=True)['active'] if manager is not None else None
+                    return dict(video_models=dict(active=video),
+                                model_packages=setup.package_status(local=local, video_only=True))
+                root = setup.validate_root(root_query) if root_query else None
+                video = setup.hub_model_status('video', queue_busy, release_idle, local_available=local)
+                image = setup.hub_model_status('image', queue_busy, release_idle, local_available=local)
+                managers = dict(video=video, image=image)
+                return dict(discovery=setup.discovery(root), task=setup.status(), video_models=video, image_models=image,
+                            model_components=setup.component_status(component_busy, release_components, local, managers),
+                            model_packages=setup.package_status(local=local, image_status=image))
+
+            return web.json_response(await asyncio.to_thread(snapshot))
         except (OSError, ValueError) as error:
             return web.json_response({'error': str(error)}, status=400)
 
@@ -800,6 +852,10 @@ def register():
                 if not local_model_access(request):
                     return web.json_response({'error': 'Open FreeVideo directly on this computer to manage models.'}, status=403)
                 result = await asyncio.to_thread(setup.component_action, value, component_busy, release_components)
+            elif name == 'model-package':
+                if not local_model_access(request):
+                    return web.json_response({'error': 'Open FreeVideo directly on this computer to manage models.'}, status=403)
+                result = await asyncio.to_thread(setup.package_action, value, component_busy, release_components)
             elif name.startswith(('video-model-', 'image-model-')):
                 kind, _, action = name.partition('-model-')
                 local = local_model_access(request)

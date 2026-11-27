@@ -27,7 +27,8 @@ import { createPreviewScene } from './preview_scene.js?v=20261115-still';
 import { jobs, ACTIVE, IMAGE_BUSY } from './task_store.js';
 import { confirmStop, startJobSources } from './task_float.js';
 import { el, icon, t, cn, tip, button, section, readStore, writeStore, mod } from './image_view_ui.js';
-import { IMAGE_MODELS, modelPicker, modelState, verifyText, pausedText } from './image_view_models.js';
+import { IMAGE_MODELS, IMAGE_MODEL_CHANGED, imagePackageRows, imagePackageState, modelPicker, modelState,
+    preferredImagePackage, verifyText, pausedText } from './image_view_models.js';
 import { RANGES, RATIOS, areaRange, estimateSeconds, machineLimit, presetAt, ratioValue, sizePicker, sizeFor, sizeText, megapixels } from './image_view_size.js';
 import { createMetaStore, createTrash, filterCounts, filterRows, groupRows, historyPanel, sessionPrompts } from './image_view_history.js';
 import { SUBJECT_WORDS, brokenMentions, mentionText, mentionsToEngine, posePrompt, promptMentions, renumberMentions, sketchPrompt } from './image_view_mentions.js';
@@ -51,9 +52,11 @@ export { IMAGE_MODELS, RATIOS };
 for (const name of ['./image_view.css']) {
     const css = document.createElement('link'); css.rel = 'stylesheet'; css.href = new URL(name, import.meta.url).href; document.head.append(css);
 }
-const MODEL_KEY = 'freevideo.imageModel', SIZE_KEY = 'freevideo.imageView.size', FIT_KEY = 'freevideo.imageView.fitted', PANEL_KEY = 'freevideo.imageView.panels';
+const MODEL_KEY = 'freevideo.imageModel', PACKAGE_KEY = 'freevideo.imagePackage', SIZE_KEY = 'freevideo.imageView.size', FIT_KEY = 'freevideo.imageView.fitted', PANEL_KEY = 'freevideo.imageView.panels';
 const remembered = () => { try { return localStorage.getItem(MODEL_KEY); } catch { return null; } };
 const remember = id => { try { localStorage.setItem(MODEL_KEY, id); } catch { /* the choice is only not kept */ } };
+const rememberedPackage = () => { try { return localStorage.getItem(PACKAGE_KEY); } catch { return null; } };
+const rememberPackage = id => { try { if (id) localStorage.setItem(PACKAGE_KEY, id); else localStorage.removeItem(PACKAGE_KEY); } catch { /* the choice is only not kept */ } };
 
 // H3 Image is made for 4 to 16 MP; a smaller picture would still cost a 4 MP canvas, so its tiers start there.
 const H3_AREAS = Object.freeze({standard: 2048, high: 4096});
@@ -208,9 +211,13 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     const sizes = readStore(SIZE_KEY, {}), fittedAreas = readStore(FIT_KEY, {}), panels = readStore(PANEL_KEY, {});
     // The engine's last answer stands in until the new one arrives, so the model row never changes its words on the way in.
     let info = viewCache?.info || null, model = IMAGE_MODELS.find(m => m.id === remembered()) || IMAGE_MODELS[0];
+    let localPackage = rememberedPackage(), pickerModels = imagePackageRows(info);
     // A model the engine's list (even the cached one) does not offer is never the starting point: H3 Image on a Mac.
     const offers = m => !!info?.models?.some(r => r.id === m.id && r.available !== false);
     if (info?.models && !offers(model)) model = IMAGE_MODELS.find(offers) || model;
+    model = preferredImagePackage(info, pickerModels, localPackage, model) || model;
+    if (model.packageId && !pickerModels.some(item => item.packageId === model.packageId)) pickerModels.push(model);
+    if (!pickerModels.length) pickerModels = IMAGE_MODELS;
     let ratio = sizes.ratio || '1:1', area = sizes[model.id] || RANGES[model.id].presets.standard, locked = sizes.locked !== false, tier = 'standard';
     const promptOf = {};
     // The boxes a MOSS picture was made with, while this page is open (as its prompt is).
@@ -238,12 +245,9 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     meta.reload();
     if (viewCache?.shownFile && rows.some(r => r.file === viewCache.shownFile)) shownFile = viewCache.shownFile;
     else shownFile = rows[0]?.file || '';
-    // The model made ready ahead (image_view_warm.js); only the model and the level go to the engine.
     const warmer = createWarmer({getToken: async () => info?.token || ''});
-    function warmUp(level, beside = false) { if (alive && !running && modelState(info, model.id).state === 'ready') warmer.warm(model.id, level, {beside}); }
-    const entry = () => info?.models?.find(m => m.id === model.id) || null;
-    const missing = () => entry() ? entry().ready === false : false;
-    const loading = () => modelState(info, model.id).state === 'downloading';
+    const stateOf = (item = model) => imagePackageState(info, item.id, item);
+    function warmUp(level, beside = false) { if (alive && !running && stateOf().state === 'ready') warmer.warm(model.id, level, {beside, packageId: model.packageId || ''}); }
 
     // ───── Layout ─────
     const body = el('div', 'fv-image-body fv-iv');
@@ -262,7 +266,8 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     // Model: one dropdown row; the list holds every model (both today, more later).
     const modelBox = el('section', 'fv-iv-sec fv-iv-sec-model'); modelBox.dataset.section = 'model'; modelBox.dataset.open = 'true';
     const modelGroup = {element: modelBox, body: modelBox, meta: el('span'), open() {}, isOpen: () => true};
-    const cards = modelPicker({host: dialog, onPick: m => { chooseModel(m); }, onInstall: m => { chooseModel(m); void install(); }, onPause: m => { void pauseInstall(m.id); }});
+    const cards = modelPicker({host: dialog, models: pickerModels, readState: imagePackageState,
+        onPick: m => { chooseModel(m); }, onInstall: m => { chooseModel(m); void install(); }, onPause: m => { void pauseInstall(m.id); }});
     modelBox.append(cards.element);
 
     // Prompt: the enhancer wraps the box, as on the video page.
@@ -310,7 +315,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     enhancer.element.classList.add('fv-image-enhance');
     // Expand: the same quiet reading and editing panel as the studio and the editing view; it writes back live.
     const expand = createExpandButton({t, textarea: prompt, onGenerate: () => go.click(),
-        canGenerate: () => !running && modelState(info, model.id).state === 'ready' && hasWords(), onDraft: () => render()});
+        canGenerate: () => !running && stateOf().state === 'ready' && hasWords(), onDraft: () => render()});
     enhancer.model.read().then(value => { enhancerReady = value?.ready === true; render(); fitSoon(); }).catch(() => {});
     const promptBar = el('div', 'fv-iv-prompt-bar');
     const promptCount = el('span', 'fv-iv-prompt-count');
@@ -1007,15 +1012,31 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         startDraft(); keepSize(); render(); warmUp('full');
     }
     // Another model keeps the shape; a quick point stays the same quick point, any other size is kept inside the new range.
+    function resolvePackage(item) {
+        if (item.packageId) return pickerModels.find(row => row.packageId === item.packageId) || item;
+        if (item.id === model.id && stateOf().state !== 'unavailable') return model;
+        const offered = pickerModels.filter(row => row.id === item.id && stateOf(row).state !== 'unavailable');
+        return offered.find(row => row.active) || offered[0] || item;
+    }
     function chooseModel(m) {
-        if (m.id === model.id) return;
-        const at = presetAt(model.id, area);
-        model = m; remember(m.id);
-        const limits = areaRange(model.id, ratioValue(shapeOf()));
-        area = at ? RANGES[model.id].presets[at] : sizes[model.id] || RANGES[model.id].presets.standard;
-        area = Math.min(limits.max, Math.max(limits.min, area));
-        if (!missing() && !loading()) pendingGenerate = false;
-        enhancer.invalidateDraft({showOriginal: true});
+        const next = resolvePackage(m);
+        const unchanged = next.id === model.id && next.packageId === model.packageId;
+        if (m.packageId || !unchanged) {
+            localPackage = next.packageId || null;
+            remember(next.id);
+            rememberPackage(localPackage);
+        }
+        if (unchanged) return;
+        const beforeId = model.id, at = presetAt(beforeId, area);
+        const familyChanged = next.id !== beforeId;
+        model = next;
+        if (familyChanged) {
+            const limits = areaRange(model.id, ratioValue(shapeOf()));
+            area = at ? RANGES[model.id].presets[at] : sizes[model.id] || RANGES[model.id].presets.standard;
+            area = Math.min(limits.max, Math.max(limits.min, area));
+            enhancer.invalidateDraft({showOriginal: true});
+        }
+        pendingGenerate = false;
         keepSize(); render(); warmUp('full');
     }
     function applyPreset(preset) {
@@ -1035,7 +1056,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
 
     function paintSlot() {
         // One fixed-height line above Generate: the most pressing thing there is to say.
-        const s = modelState(info, model.id), tooMany = over() > 0;
+        const s = stateOf(), tooMany = over() > 0;
         let kind = '', parts = [];
         if (note.textContent && folderNote && note.textContent === folderNote.text) { kind = 'note'; parts = folderParts(); }
         else if (note.textContent) { kind = note.dataset.kind === 'busy' ? 'info' : 'warn'; parts = [icon(kind === 'info' ? 'clock' : 'warn'), el('span', 'fv-iv-slot-tx', note.textContent)]; }
@@ -1046,7 +1067,9 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         else if (brokenMentions(prompt.value, references.length)) {
             kind = 'warn'; parts = [icon('warn'), el('span', 'fv-iv-slot-tx', t('An image named in the prompt was removed; choose it again with @', '提示词里引用的参考图已移除，请用 @ 重新选择'))];
         }
-        else if (s.state === 'failed') {
+        else if (s.state === 'unavailable' && s.reason) {
+            kind = 'warn'; parts = [icon('warn'), el('span', 'fv-iv-slot-tx', s.reason)];
+        } else if (s.state === 'failed') {
             kind = 'warn'; parts = [icon('warn'), el('span', 'fv-iv-slot-tx', s.reason
                 ? t('{model} download failed: {reason}. Retry to continue; if it keeps failing, report the problem.', '{model} 下载失败：{reason}。请重试以继续下载；仍然失败时，请提交问题。',
                     { model: model.short, reason: s.reason.replace(/[.。]$/, '') })
@@ -1113,9 +1136,10 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     fitWatch?.observe(scroll); fitWatch?.observe(inputs);
 
     function paintGo() {
-        const s = modelState(info, model.id), busy = !!running, now = size(), est = estimateSeconds(meta.samples(), model.id, now.width * now.height);
+        const s = stateOf(), busy = !!running, now = size(), est = estimateSeconds(meta.samples(), model.id, now.width * now.height);
         go.className = 'fv-image-go fv-iv-go ' + (failure ? 'fv-image-go-quiet' : 'fv-primary');
-        go.disabled = !!enhancer.reversing; if (go.disabled) tip(go, t('Writing the prompt', '正在生成提示词'), ''); go.dataset.state = busy ? 'running' : s.state === 'downloading' ? 'downloading' : (s.state === 'missing' || s.state === 'failed') ? 'install' : 'ready';
+        go.disabled = !!enhancer.reversing || (!busy && s.state === 'unavailable' && Boolean(s.reason));
+        go.dataset.state = busy ? 'running' : s.state === 'downloading' ? 'downloading' : (s.state === 'missing' || s.state === 'failed') ? 'install' : s.state;
         goFill.style.setProperty('--p', String(s.state === 'downloading' ? s.fraction : 0));
         delete go.dataset.fvTipWhy;
         if (busy) {
@@ -1134,6 +1158,8 @@ export function openImageView(node, {studio = null, client: given = null, poll =
             goLabel.textContent = t('Generate', '生成'); goSub.textContent = est ? t('about {est} s', '约 {est} 秒', { est }) : '';
             tip(go, t('Generate', '生成'), t('Makes a {size} image', '生成一张 {size} 的图片', { size: sizeText(now) }), `${mod}+Enter`);
             if (!hasWords()) go.dataset.fvTipWhy = t('Describe the image first', '先写一句描述');
+            if (s.state === 'unavailable' && s.reason) go.dataset.fvTipWhy = s.reason;
+            if (enhancer.reversing) go.dataset.fvTipWhy = t('Writing the prompt', '正在生成提示词');
         }
         // With no time (or size) to say beside it, the word sits alone in the middle of the key.
         go.dataset.eta = String(!!goSub.textContent);
@@ -1163,7 +1189,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         if (running && !browsing) { draft = false; draftPreview = null; }
         enhancer.element.dataset.off = String(enhancerOff());
         paintReverse();
-        cards.paint(info, model.id, pendingGenerate);
+        cards.paint(info, model.packageId || model.id, pendingGenerate);
         loraRow.paint(model.id);
         drawReferences();
         // MOSS takes neither references nor a sketch: Layout takes their place in the row.
@@ -1358,7 +1384,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     // Installing from the page: the engine fetches the model; the page watches until it is ready, then generates if asked to.
     async function install() {
         const mine = model.id;
-        try { info = await client.packInstall(mine); } catch (error) {
+        try { const value = await client.packInstall(mine); if (alive) settleModel(value, true); } catch (error) {
             // A failed download says so in its own words; the generation sentences do not describe it.
             say(error?.code === 'connection_lost'
                 ? t('The download did not start: FreeVideo could not be reached. Start FreeVideo again, then try again.', '下载未能开始：连不上 FreeVideo。请重新启动 FreeVideo 后再试。')
@@ -1370,14 +1396,20 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         }
         render();
         while (alive && modelState(info, mine).state === 'downloading') {
-            await new Promise(r => setTimeout(r, 1500)); try { info = await client.info(); } catch { /* asked again */ } render();
+            await new Promise(r => setTimeout(r, 1500));
+            await refreshModelProfiles();
         }
-        if (alive && pendingGenerate && model.id === mine && modelState(info, mine).state === 'ready') { pendingGenerate = false; render(); if (!running) void generate(); }
+        resumePending();
     }
     async function pauseInstall(id) {
-        try { info = await client.packCancel?.(id); info = await client.info(); } catch { /* the next look shows it */ }
         if (id === model.id) pendingGenerate = false;
+        try { await client.packCancel?.(id); await refreshModelProfiles(); } catch { /* the next look shows it */ }
         render();
+    }
+    function resumePending() {
+        if (!alive || !pendingGenerate || running || stateOf().state !== 'ready') return;
+        pendingGenerate = false;
+        render(); void generate();
     }
     // Over the model's limit, Generate stays solid: a click flashes the note and moves to the first greyed picture's remove.
     function blockOver() {
@@ -1393,10 +1425,10 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         const seed = seedInput.value === '' ? undefined : Number(seedInput.value);
         const boxes = layoutActive() ? layout.request() : [], drawn = boxes.length ? layout.snapshot().filter(item => item.line.trim()) : null;
         const caption = boxes.length ? layout.caption() : '';
-        const modelId = model.id, sent = size(), tierNow = tier, loras = loraRow.value(modelId);
+        const modelId = model.id, packageId = model.packageId, sent = size(), tierNow = tier, loras = loraRow.value(modelId);
         const images = references.slice(0, cap_(model)).map(({file, sketch, pose}) => ({file, sketch, pose: pose ? structuredClone(pose) : null}));
         const context = {seed: seed ?? Math.floor(Math.random() * 1e9), images, modelId};
-        const inputsKey = () => JSON.stringify([enhanceScene(), size(), tier, seedInput.value, loraRow.value(model.id), layoutActive() ? layout.request() : []]);
+        const inputsKey = () => JSON.stringify([enhanceScene(), size(), tier, seedInput.value, loraRow.value(model.id), layoutActive() ? layout.request() : [], model.packageId || '']);
         const revision = enhancer.draftRevision, scene = inputsKey();
         const sentWords = text => boxes.length && !text.trim() ? caption : engineText(text, context);
         const lengthOf = words => words.trim() ? [...words].length : 0;
@@ -1443,6 +1475,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
             startJobSources();
             const display = text.trim(), historyPrompt = display && display !== words.trim() && [...display].length <= 2000 ? display : '';
             const request = {prompt: words, ...sent, model: modelId, remember: true, images: names, retry_busy: true,
+                ...(packageId ? {package: packageId} : {}),
                 ...(historyPrompt ? {history_prompt: historyPrompt} : {}),
                 ...(seed === undefined ? {} : {seed}), ...(loras.length ? {loras} : {}), ...(boxes.length ? {layout: boxes} : {})};
             const meta = {text, withImages: images.length > 0, tier: tierNow, width: sent.width, height: sent.height, ...(drawn ? {layout: drawn} : {})};
@@ -1576,11 +1609,12 @@ export function openImageView(node, {studio = null, client: given = null, poll =
             else { failure = {error: 'connection_lost', stage: 'start', noList: true}; renderFailure(); render(); drawWorks(); }
         }
         // The model on show is not one this computer offers (a remembered H3 Image on a Mac): the press moves to the one it offers.
-        else if (!offers(model) && IMAGE_MODELS.some(offers)) { chooseModel(IMAGE_MODELS.find(offers)); go.onclick(); }
+        else if (!model.packageId && !offers(model) && IMAGE_MODELS.some(offers)) { chooseModel(IMAGE_MODELS.find(offers)); go.onclick(); }
+        else if (stateOf().state === 'unavailable') { say(stateOf().reason || t('Choose another image model.', '请选择其他图像模型。')); }
         // A model being installed: Generate says whether the picture follows the install.
-        else if (loading()) { pendingGenerate = !pendingGenerate && hasWords(); if (!hasWords()) { promptGroup.open(true); prompt.focus(); } render(); }
+        else if (stateOf().state === 'downloading') { pendingGenerate = !pendingGenerate && hasWords(); if (!hasWords()) { promptGroup.open(true); prompt.focus(); } render(); }
         // A model not installed: installs it, then generates.
-        else if (missing() || modelState(info, model.id).state === 'failed') { pendingGenerate = hasWords(); void install(); }
+        else if (['missing', 'failed'].includes(stateOf().state)) { pendingGenerate = hasWords(); void install(); }
         else if (!hasWords()) { promptGroup.open(true); prompt.focus(); }
         else void generate();
     };
@@ -1747,7 +1781,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         // Leaving only stops watching: the job runs on, the floating window carries it, and its picture reaches the works.
         rememberView(); document.removeEventListener('keydown', strayKeys); expand.dispose?.();
         alive = false; place.dispose(); stopScene(); enhancer.dispose(); promptBarWatch?.disconnect(); document.removeEventListener('click', closeMore, true);
-        window.removeEventListener('freevideo-image-model-changed', refreshModelProfiles);
+        window.removeEventListener(IMAGE_MODEL_CHANGED, refreshModelProfiles);
         unwatch?.(); unwatch = null; references.forEach(r => URL.revokeObjectURL(r.url)); clearStep(); dialog.remove();
         // ── end run ──
         if (kept?.dialog === dialog) kept = null;
@@ -1807,31 +1841,47 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     // A model the engine lists no row for is not offered on this computer (H3 Image on a Mac) and is never kept.
     function settleModel(value, keepChosen = false) {
         info = value; const before = model;
-        const ready = IMAGE_MODELS.filter(m => value.models?.find(r => r.id === m.id)?.ready);
-        const offered = IMAGE_MODELS.filter(m => value.models?.some(r => r.id === m.id && r.available !== false));
-        if (value.models && !remembered() && ready.length) model = ready[0];
-        if (value.models && offered.length && !offered.includes(model)) model = offered[0];
-        // A press that waited for this list keeps the size the user already chose, unless the model changed.
-        if (keepChosen && model === before) return;
+        const packages = imagePackageRows(value);
+        const preferred = preferredImagePackage(value, packages, localPackage, before);
+        if (preferred) {
+            model = preferred;
+            if (!packages.some(item => item.packageId === model.packageId)) packages.push(model);
+            pickerModels = packages;
+        } else {
+            pickerModels = IMAGE_MODELS;
+            const offered = value.models ? IMAGE_MODELS.filter(offers) : IMAGE_MODELS;
+            model = offered.find(item => item.id === before.id) || offered[0] || IMAGE_MODELS[0];
+            if (!keepChosen && !remembered() && value.models) model = offered.find(item => modelState(value, item.id).state === 'ready') || model;
+        }
+        cards.setModels(pickerModels);
+        if (model.id !== before.id || model.packageId !== before.packageId) pendingGenerate = false;
+        // A press that waited for this list keeps the size the user already chose, unless the family changed.
+        if (keepChosen && model.id === before.id) return;
         const limits = areaRange(model.id, ratioValue(shapeOf()));
         area = Math.min(limits.max, Math.max(limits.min, sizes[model.id] || RANGES[model.id].presets.standard));
-        if (model !== before) enhancer.invalidateDraft({showOriginal: true});
+        if (model.id !== before.id) enhancer.invalidateDraft({showOriginal: true});
         keepSize();
     }
+    let infoRevision = 0;
     async function refreshModelProfiles() {
+        if (!alive) return;
+        const revision = ++infoRevision;
         try {
             const value = await client.info();
-            if (!alive) return;
-            info = value;
+            if (!alive || revision !== infoRevision) return;
+            settleModel(value, true);
             render();
             if (historyLoaded) rememberView();
+            resumePending();
         } catch { /* The next info request can pick up the profile. */ }
     }
-    window.addEventListener('freevideo-image-model-changed', refreshModelProfiles);
+    window.addEventListener(IMAGE_MODEL_CHANGED, refreshModelProfiles);
+    const firstRead = ++infoRevision;
     client.info().then(value => {
-        settleModel(value);
-        const poller = setInterval(() => { if (!alive) return clearInterval(poller); if (IMAGE_MODELS.some(m => modelState(info, m.id).state === 'downloading')) client.info().then(v => { info = v; render(); }).catch(() => {}); }, 2000);
-        if (alive) { render(); fitLeft(); if (historyLoaded) rememberView(); }
+        if (!alive) return;
+        if (firstRead === infoRevision) settleModel(value);
+        const poller = setInterval(() => { if (!alive) return clearInterval(poller); if (IMAGE_MODELS.some(m => modelState(info, m.id).state === 'downloading')) void refreshModelProfiles(); }, 2000);
+        render(); fitLeft(); if (historyLoaded) rememberView();
         markReady('info');
     }).catch(() => markReady('info'));
     // No focus on open: the box stays neutral until the user goes to it.

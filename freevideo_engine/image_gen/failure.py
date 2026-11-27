@@ -232,7 +232,7 @@ def component_facts(value):
         if not isinstance(row, dict):
             continue
         identity, label, digest = (row.get(key) for key in ('id', 'label', 'sha256'))
-        if not isinstance(identity, str) or not re.fullmatch(r'[a-z0-9_:-]{1,96}', identity):
+        if not isinstance(identity, str) or not re.fullmatch(r'[a-z0-9_.:-]{1,96}', identity):
             continue
         facts[role] = {'id': identity}
         if isinstance(label, str):
@@ -300,6 +300,7 @@ class Context:
         self.plan = None
         self.pack = None
         self.components = {}
+        self.package_id = None
         self.start_memory = None
         # The card as the admission check read it (memory_budget): numbers only.
         self.gpu_reading = {}
@@ -358,6 +359,13 @@ class Context:
         if isinstance(machine, dict):
             seed_redactor(self.redactor, machine, names=False)
             self.machine = machine
+
+    def note_model(self, row):
+        from ..model_packages import valid_package_id
+
+        self.components = component_facts(row.get('components'))
+        package_id = row.get('package_id')
+        self.package_id = package_id if valid_package_id(package_id) else None
 
     def report(self, code, *, row=None, error=None, video_busy=False, worker_restarts=0, outcome='failed', forecast=None):
         row = row if isinstance(row, dict) else {}
@@ -424,6 +432,8 @@ class Context:
         extra = dict(attention=clean(attention, self.redactor)) if isinstance(attention, dict) else {}
         if self.components:
             extra['components'] = self.components
+        if self.package_id:
+            extra['package_id'] = self.package_id
         if isinstance(forecast, dict):
             extra['forecast'] = {key: value for key, value in forecast.items() if key in ('basis', 'typical_seconds', 'predicted') and clean(value, self.redactor) is not None}
         return dict(schema='freevideo.image-report', schema_version=1, **extra,

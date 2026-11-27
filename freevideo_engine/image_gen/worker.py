@@ -11,7 +11,7 @@ import threading
 import time
 
 from ..input_cache import capture_used
-from . import keep
+from . import image_model, keep
 from .failure import Context, classify_exception, component_facts, exception_details, host_memory_shortage, safe_plan
 from .step_preview import LIMIT as PREVIEW_LIMIT
 
@@ -144,7 +144,8 @@ def latest(inbox, value):
         for row in reversed(rows):
             if row.get('action') == 'unwarm':
                 break
-            if row.get('action') == 'warm' and row.get('level') == 'full' and row.get('model') == picked.get('model'):
+            if (row.get('action') == 'warm' and row.get('level') == 'full'
+                    and all(row.get(key) == picked.get(key) for key in ('model', 'package_identity'))):
                 return row
     return picked
 
@@ -153,7 +154,8 @@ def warm_up(runner, value, should_stop, send):
     """Prepare for the picture the page is setting up: read the model files ahead into the OS file cache and, for a
     full warm-up of a runner that can (H3 Image), load the model as a picture leaves it. Stops once
     ``should_stop()`` is true. No prompt is part of a warm-up."""
-    facts = dict(phase='warmed', model=value.get('model'), level=value.get('level'))
+    facts = dict(phase='warmed', model=value.get('model'), level=value.get('level'),
+                 package_identity=value.get('package_identity'))
     files = value.get('files') or []
     if files and not should_stop():
         from ..encoder_prewarm import available_memory, plan, prefetch
@@ -298,15 +300,20 @@ def load_moss_runner(pack_dir, device, *, progress=None, components=None):
     return MossRunner(pack_dir, device=device, progress=progress, components=components)
 
 
-def runner_source(pack_dir, model, engine_root):
+def runner_source(pack_dir, model, engine_root, package=None, expected=None):
     if engine_root is None:
-        return pack_dir, (model, pack_dir), None
-    from ..image_components import resolve
+        return pack_dir, (model, pack_dir), None, None
     from ..long_paths import io_path
 
     machine = json.loads(io_path(Path(engine_root) / 'machine.json').read_text(encoding='utf-8'))
-    resolved = resolve(dict(machine, root=str(engine_root)), model)
-    return Path(resolved['pack']), (model, resolved['identity']), resolved['components']
+    opened = dict(machine, root=str(engine_root))
+    resolved, _ = image_model.open_package(opened, model, package, expected)
+    if expected is not None:
+        from ..image_components import ComponentError
+        from ..model_packages import image_ready
+        if not image_ready(opened, model):
+            raise ComponentError('The required image model files are no longer installed.')
+    return Path(resolved['pack']), (model, resolved['identity']), resolved['components'], resolved.get('package_id')
 
 
 def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None, factory=None, h3_factory=None,
@@ -357,7 +364,8 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
                     try:
                         if load:
                             held.enter_context(lease())
-                            model_pack, model_identity, components = runner_source(pack_dir, model, engine_root)
+                            model_pack, model_identity, components, _ = runner_source(
+                                pack_dir, model, engine_root, value.get('package'), value.get('package_identity'))
                         # A light warm-up only reads files ahead: it neither loads nor drops a model.
                         if load and runner is not None and runner_model != model_identity:
                             runner = drop(runner)
@@ -370,6 +378,9 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
                         warm_up(runner, value, should_stop, send)
                     except Exception as error:
                         print('image worker warm-up failed: %s' % type(error).__name__, file=sys.stderr, flush=True)
+                        if load:
+                            send(phase='warmed', model=model, level='full', failed=True,
+                                 package_identity=value.get('package_identity'))
                         if runner is not None and not getattr(runner, 'at_boundary', lambda: True)():
                             runner = drop(runner)
                             release_memory()
@@ -392,9 +403,11 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
 
                     model = value.get('model') or 'qwen-image-2.1-turbo'
                     context.timing.enter('load')
-                    model_pack, model_identity, components = runner_source(pack_dir, model, engine_root)
+                    model_pack, model_identity, components, package_id = runner_source(
+                        pack_dir, model, engine_root, value.get('package'), value.get('package_identity'))
                     if components is not None:
-                        send(phase='model', components=component_facts(components))
+                        send(phase='model', components=component_facts(components),
+                             **(dict(package_id=package_id) if package_id else {}))
                     if runner is not None and runner_model != model_identity:
                         # One model's weights at a time on the card.
                         runner = drop(runner)

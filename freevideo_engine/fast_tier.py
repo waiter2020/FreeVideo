@@ -10,13 +10,16 @@ VDN-derived base.
 This module imports no Torch unless it runs as the adapter-preparation child.
 """
 import argparse
+from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import sys
 
 FOLDER = 'pi-h3'
 CONSTANTS = 'pi_h3_adaln_constants.safetensors'
 CONSTANTS_FILE = (19435680, '7949a370323b2a15e13f2e9160cfb1325207cde21b2629643f390be3e32f690b')
+SNAPSHOT_ENV = 'FREEVIDEO_FAST_PACKAGE_SNAPSHOT'
 
 
 def _grid(steps, maximum):
@@ -77,29 +80,63 @@ def validate_setup(reason):
         raise ValueError('The fastest mode needs the int8 model')
 
 
-def files(model_root, mode='fast2', *, engine_root=None):
+def files(model_root, mode='fast2', *, engine_root=None, package_id=None):
     """Return the selected, verified runtime files by their basenames."""
-    from .fast_pack import files as verified_files
-    spec = mode_spec(mode)
-    found = verified_files(model_root, mode=mode, engine_root=engine_root)
-    return {name: found[f'{FOLDER}/{name}'] for name in (spec['adapter'], CONSTANTS)}
+    from .model_packages import fast_files
+    return fast_files(model_root, mode, engine_root=engine_root, package_id=package_id)
 
 
-def component_hashes(model_root, mode, *, engine_root=None):
-    from .model_components import root_for_model_dir, selected_hash
-    from .model_components_generation import PI_SLOTS
-    spec = mode_spec(mode)
-    root = engine_root or root_for_model_dir(model_root)
-    slot = PI_SLOTS[mode]
-    return (selected_hash(root, slot, spec['adapter']) or spec['adapter_sha256'],
-            selected_hash(root, slot, CONSTANTS) or CONSTANTS_FILE[1])
+def component_hashes(model_root, mode, *, engine_root=None, package_id=None):
+    from .model_packages import fast_hashes
+    return fast_hashes(model_root, mode, engine_root=engine_root, package_id=package_id)
+
+
+def checked_package_id(value):
+    if value is None or value == '':
+        return None
+    from .model_packages import valid_package_id
+    if not valid_package_id(value):
+        raise ValueError('Choose a valid pi-H3 model package.')
+    return value
+
+
+def resolve(model_root, mode, *, engine_root=None, package_id=None):
+    from .model_packages import resolve_fast
+    return resolve_fast(model_root, mode, engine_root=engine_root, package_id=checked_package_id(package_id))
+
+
+def snapshot(opened):
+    """Identity passed from the cache lookup to the executor that reads the weights."""
+    identity = {name: opened[name] for name in ('package_id', 'bindings', 'adapter_sha256', 'constants_sha256')}
+    return sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def check_snapshot(opened, expected):
+    if expected is not None and snapshot(opened) != expected:
+        raise ValueError('The pi-H3 package changed while this video was starting. Submit it again.')
+
+
+def installed_package(mode, package_id=None):
+    from .long_paths import io_path
+    from .paths import data_root, installed_model_root
+    engine_root = data_root()
+    if not io_path(engine_root / 'machine.json').is_file():
+        engine_root = None
+    return resolve(installed_model_root(), mode, engine_root=engine_root, package_id=package_id)
+
+
+def recheck(spec):
+    check_snapshot(installed_package(spec['mode'], spec['package_id']), spec['snapshot'])
 
 
 def request(args, *, original_audio=False):
     """Check a generate command at its entry and set its steps; None without --fast-mode."""
     mode = getattr(args, 'fast_mode', None)
-    if mode is None:
+    package = checked_package_id(getattr(args, 'video_package', None))
+    if mode is None and not package:
         return None
+    if package and not mode:
+        raise ValueError('A video package needs --fast-mode.')
     validate_setup(unsupported(mac=sys.platform == 'darwin'))
     spec = mode_spec(mode)
     upscale_factor = getattr(args, 'upscale_factor', None)
@@ -109,14 +146,14 @@ def request(args, *, original_audio=False):
         upscale_from=getattr(args, 'upscale_from', None), original_audio=original_audio,
         redo_sound=getattr(args, 'redo_sound', None), step_cache=getattr(args, 'step_cache', None),
         upscale_factor=2 if upscale_factor is None else upscale_factor)
-    from .paths import installed_model_root
-    model_root = installed_model_root()
-    paths = files(model_root, mode)
-    adapter_hash, constants_hash = component_hashes(model_root, mode)
+    selected = installed_package(mode, package)
+    check_snapshot(selected, os.environ.get(SNAPSHOT_ENV))
+    paths = selected['paths']
     args.two_pass, args.base_steps, args.refine_steps = sampling
     return dict(spec, mode=mode, adapter=str(paths[spec['adapter']]), constants=str(paths[CONSTANTS]),
-                adapter_sha256=adapter_hash, adapter_bytes=paths[spec['adapter']].stat().st_size,
-                constants_sha256=constants_hash)
+                adapter_sha256=selected['adapter_sha256'], adapter_bytes=paths[spec['adapter']].stat().st_size,
+                constants_sha256=selected['constants_sha256'], package_id=selected['package_id'],
+                bindings=selected['bindings'], snapshot=snapshot(selected))
 
 
 def bridge_steps(mode, *, preview=False, refine_from=None, continue_from=None, upscale_from=None, step_cache=None,

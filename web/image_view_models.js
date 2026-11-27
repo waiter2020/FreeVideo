@@ -11,6 +11,36 @@ export const IMAGE_MODELS = Object.freeze([
     {id: 'qwen-image-2.1-turbo', name: 'Qwen-Image 2.1', short: 'Qwen-Image 2.1'},
     {id: 'moss-image-sft', name: 'MOSS-Image', short: 'MOSS-Image'},
 ]);
+export const IMAGE_MODEL_CHANGED = 'freevideo-image-model-changed';
+
+export function imagePackageRows(info) {
+    const entries = Array.isArray(info?.image_packages) ? info.image_packages : [];
+    return IMAGE_MODELS.flatMap(base => {
+        if (info?.models && !info.models.some(row => row.id === base.id && row.available !== false)) return [];
+        return entries.filter(row => row?.family === base.id && typeof row.id === 'string').map(row => ({
+            ...base, packageId: row.id, name: row.builtin ? base.name : (row.name || base.name), active: row.active === true,
+            group: t(row.type_label || base.name, row.type_label_zh || base.name),
+        }));
+    });
+}
+
+export function imagePackageState(info, id, entry) {
+    const family = modelState(info, id);
+    if (!entry?.packageId || family.state === 'checking' || family.state === 'unavailable') return family;
+    const row = info.image_packages?.find(item => item.id === entry.packageId && item.family === id);
+    if (!row || row.components_ready === false || (row.ready === false && family.state === 'ready')) return {
+        ...family, state: 'unavailable', reason: t('Model package unavailable. Choose another package or repair its weights in Settings.', '模型包不可用。请选择其他模型包，或在设置中修复它的权重。'),
+    };
+    return family;
+}
+
+export function preferredImagePackage(info, rows, localPackage, previous) {
+    if (!Array.isArray(info?.image_packages)) return null;
+    if (localPackage) return rows.find(row => row.packageId === localPackage) || {...previous, packageId: localPackage};
+    const offered = rows.filter(row => imagePackageState(info, row.id, row).state !== 'unavailable');
+    return offered.find(row => row.active) || offered.find(row => imagePackageState(info, row.id, row).state === 'ready')
+        || offered[0] || rows.find(row => row.active) || rows[0] || null;
+}
 
 // One model row from the engine's info as a state the page can draw. `info` absent: still asking.
 export function modelState(info, id) {
@@ -60,14 +90,14 @@ export function statusLine(state) {
     case 'downloading': return state.paused ? t('Paused', '已暂停') : state.verifying ? verifyText(state) : `${Math.floor(state.fraction * 100)}%`;
     case 'failed': return t('Download failed. Retry to continue.', '下载失败，请重试以继续。');
     case 'missing': return downloadText(state);
-    case 'unavailable': return t('Not on this computer', '这台电脑不支持');
+    case 'unavailable': return state.reason ? t('Package unavailable', '模型包不可用') : t('Not on this computer', '这台电脑不支持');
     default: return t('Checking…', '正在检查…');
     }
 }
 
 const ICON_OF = {ready: 'check', failed: 'warn', downloading: 'down', unavailable: 'info', missing: 'cloud', checking: 'clock'};
 const gbOf = state => state.total ? (state.total / 1e9).toFixed(1) : '';
-const displayName = (model, state) => state.row?.profile?.label || model.name;
+const displayName = (model, state) => model?.packageId ? model.name : (state.row?.profile?.label || model.name);
 function useOf(model, state) {
     const shared = model.id !== 'moss-image-sft';
     const size = state.total ? shared ? t('about {size} GB, files shared with video are not downloaded again', '约 {size} GB，和视频共用的文件不重复下载', { size: gbOf(state) })
@@ -80,8 +110,8 @@ function useOf(model, state) {
         downloading: state.paused ? pausedText(state) : state.verifying ? (state.unknown ? t('Verifying the files; usable when done', '正在校验文件，完成后可以使用') : t('Verifying the files {percent}%; usable when done', '正在校验文件 {percent}%，完成后即可使用', { percent: Math.floor(state.fraction * 100) })) : t('Downloading {percent}%; usable when done', '正在下载 {percent}%，完成后即可使用', { percent: Math.floor((state.fraction || 0) * 100) }),
         // The engine's sentence ends with its own full stop; the other states have none, and the tips add one after it.
         failed: state.reason ? String(state.reason).replace(/[.。]\s*$/, '') : t('The download stopped; press Retry', '下载已中断，请点击“重试”'),
-        unavailable: model.id === 'moss-image-sft' ? t('MOSS-Image needs an NVIDIA graphics card, which this computer does not have. Choose another model', 'MOSS-Image 需要 NVIDIA 显卡，这台电脑没有。请选别的模型')
-            : t('This model needs an NVIDIA graphics card, which this computer does not have. Choose another model', '这个模型需要 NVIDIA 显卡，这台电脑没有。请选别的模型'),
+        unavailable: state.reason || (model.id === 'moss-image-sft' ? t('MOSS-Image needs an NVIDIA graphics card, which this computer does not have. Choose another model', 'MOSS-Image 需要 NVIDIA 显卡，这台电脑没有。请选别的模型')
+            : t('This model needs an NVIDIA graphics card, which this computer does not have. Choose another model', '这个模型需要 NVIDIA 显卡，这台电脑没有。请选别的模型')),
         checking: t('Asking the engine', '正在询问引擎'),
     }[state.state];
 }
@@ -99,8 +129,9 @@ export function modelPicker({host, onPick, onInstall, onPause, models = IMAGE_MO
     root.append(trigger, action, bar);
     const list = el('div', 'fv-iv-mlist fv-glass fv-g3'); list.hidden = true; list.setAttribute('role', 'listbox'); list.setAttribute('aria-label', t('Model', '模型'));
     if (menuClass) list.classList.add(menuClass);
-    let last = {info: null, chosen: '', pending: false};
-    const states = () => models.map(model => ({model, state: readState(last.info, model.id)}));
+    let catalog = models, last = {info: null, chosen: '', pending: false};
+    const keyOf = model => model?.packageId || model?.id || '';
+    const states = () => catalog.map(model => ({model, state: readState(last.info, model.id, model)}));
     function open() {
         paintList(); list.hidden = false; trigger.setAttribute('aria-expanded', 'true');
         ((typeof host === 'function' ? host() : host) || document.body).append(list); place();
@@ -116,9 +147,13 @@ export function modelPicker({host, onPick, onInstall, onPause, models = IMAGE_MO
         else { list.style.top = ''; list.style.bottom = `${Math.round(innerHeight - r.top + 4)}px`; }
     }
     function paintList() {
-        list.replaceChildren(...states().map(({model, state}) => {
-            const row = el('div', 'fv-iv-mopt'); row.setAttribute('role', 'option'); row.tabIndex = -1; row.dataset.model = model.id; row.dataset.state = state.state;
-            row.setAttribute('aria-selected', String(model.id === last.chosen)); row.setAttribute('aria-disabled', String(state.state === 'unavailable'));
+        let previous = '';
+        const nodes = [];
+        for (const {model, state} of states()) {
+            if (model.group && model.group !== previous) { nodes.push(el('div', 'fv-iv-mgroup', model.group)); previous = model.group; }
+            const key = keyOf(model);
+            const row = el('div', 'fv-iv-mopt'); row.setAttribute('role', 'option'); row.tabIndex = -1; row.dataset.model = key; row.dataset.state = state.state;
+            row.setAttribute('aria-selected', String(key === last.chosen)); row.setAttribute('aria-disabled', String(state.state === 'unavailable'));
             const label = displayName(model, state);
             const text = el('span', 'fv-iv-mopt-tx'); text.append(el('b', '', label), el('small', '', labelStatus(state)));
             row.append(icon('check', 'fv-iv-mopt-mark'), text);
@@ -131,8 +166,9 @@ export function modelPicker({host, onPick, onInstall, onPause, models = IMAGE_MO
             if (state.state === 'downloading') { const p = el('i', 'fv-iv-mpick-bar'); p.style.setProperty('--p', String(state.fraction || 0)); row.append(p); }
             tip(row, label, describe(model, state));
             row.addEventListener('click', () => { if (state.state === 'unavailable') return; onPick(model); close(); });
-            return row;
-        }));
+            nodes.push(row);
+        }
+        list.replaceChildren(...nodes);
     }
     trigger.addEventListener('click', () => list.hidden ? open() : close());
     listenDialogKey(trigger, 'keydown', event => { if (['ArrowDown', 'ArrowUp'].includes(event.key) && list.hidden) { event.preventDefault(); open(); } });
@@ -147,11 +183,11 @@ export function modelPicker({host, onPick, onInstall, onPause, models = IMAGE_MO
     const resize = () => { if (!list.hidden) place(); };
     document.addEventListener('pointerdown', outside, true);
     addEventListener('resize', resize);
-    action.addEventListener('click', () => { const model = models.find(m => m.id === last.chosen); const state = readState(last.info, last.chosen); if (!model) return; if (state.state === 'downloading' && !state.paused) onPause(model); else onInstall(model); });
+    action.addEventListener('click', () => { const model = catalog.find(m => keyOf(m) === last.chosen); if (!model) return; const state = readState(last.info, model.id, model); if (state.state === 'downloading' && !state.paused) onPause(model); else onInstall(model); });
 
     function paint(info, chosen, pending) {
         last = {info, chosen, pending};
-        const model = models.find(m => m.id === chosen) || models[0], state = readState(info, model.id);
+        const model = catalog.find(m => keyOf(m) === chosen) || catalog[0], state = readState(info, model.id, model);
         root.dataset.state = state.state;
         const label = displayName(model, state);
         name.textContent = label;
@@ -169,7 +205,7 @@ export function modelPicker({host, onPick, onInstall, onPause, models = IMAGE_MO
             if (focused) [...list.querySelectorAll('[role=option]')].find(row => row.dataset.model === focused)?.focus({preventScroll: true});
         }
     }
-    return {element: root, paint, close, dispose() {
+    return {element: root, paint, close, setModels(next) { if (Array.isArray(next) && next.length) catalog = next; }, dispose() {
         document.removeEventListener('pointerdown', outside, true);
         removeEventListener('resize', resize);
         list.remove();

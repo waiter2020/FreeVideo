@@ -48,7 +48,7 @@ const IMAGE = {
     switching: ['Switching picture model…', '正在切换图像模型…'],
     incompatible: ['This model is incompatible with the selected picture model family.', '此模型与所选图像模型系列不兼容。'],
 };
-const IMAGE_COMPONENTS = {
+export const IMAGE_COMPONENTS = {
     dit: ['Denoiser', '去噪器'],
     text_encoder: ['Text encoder', '文本编码器'],
     vae: ['VAE', 'VAE'],
@@ -64,7 +64,7 @@ const QWEN_ENCODER = {
     ],
 };
 const isQwenEncoder = (model, component) => model === QWEN_ENCODER.model && component === 'text_encoder';
-const IMAGE_FORMATS = {
+export const IMAGE_FORMATS = {
     'qwen-image-2.1-turbo': {
         dit: ['Qwen-Image 2.1 Turbo INT8 ConvRot, one .safetensors file.', 'Qwen-Image 2.1 Turbo INT8 ConvRot，单个 .safetensors 文件。'],
         text_encoder: ['Qwen3-VL 8B, INT8 ConvRot text weights (group size 256) and a complete BF16 vision tower in one .safetensors file.',
@@ -407,14 +407,15 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
     }
 
     function focusComponent(model, role) {
-        if (!family || !families().some(item => item.id === model && roles(item)[role]?.ready)) return;
+        if (!family || !families().some(item => item.id === model && roles(item)[role]?.ready)) return false;
         heading.scrollIntoView?.({block: 'start'});
-        if (requesting) return;
+        if (requesting) return true;
         family.value = model;
         paintComponents();
         component.value = role;
         resetSearch();
         component.focus();
+        return true;
     }
 
     function focusVideo() {

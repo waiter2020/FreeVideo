@@ -849,8 +849,8 @@ def _run(args):
               'encoder_mode': 'native H3 encoder library child' if args.prompt_file else 'preencoded shared conditioning'}
     if fast_spec is not None:
         # From here on, so that a failure while preparing the adapter is reported as this mode's.
-        report['fast_tier'] = dict(mode=fast_spec['mode'], steps=fast_spec['steps'],
-                                   adapter_sha256=fast_spec['adapter_sha256'])
+        report['fast_tier'] = {key: fast_spec[key] for key in
+                               ('mode', 'steps', 'package_id', 'bindings', 'adapter_sha256', 'constants_sha256')}
     if continuation is not None:
         report['continuation'] = continuation_summary(continuation, hide_tail_frames=hide_tail_frames)
         if 'tail' in continuation:
@@ -883,8 +883,9 @@ def _run(args):
         from .sleep_guard import awake
         with runtime_lock() as descriptor, awake():
             from .model_components import video_snapshot
-            report['model_components'] = video_snapshot(fast=fast_spec['mode'] if fast_spec is not None else None,
-                                                        two_pass=two_pass, preview=preview)
+            if fast_spec is not None:
+                fast_tier.recheck(fast_spec)
+            report['model_components'] = video_snapshot(fast=fast_spec, two_pass=two_pass, preview=preview)
             if active_loras:
                 lora_request = artifacts / 'lora-request.json'
                 lora_result = artifacts / 'lora-result.json'

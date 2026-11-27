@@ -161,10 +161,14 @@ def _selected(machine, model, role, identity):
 
 
 def shared_encoder(machine, *, identity=ACTIVE):
-    """Return the selected H3 encoder, or None for the installation's built-in one."""
+    """Return the encoder video reads, or None for the installation's built-in one."""
     if identity is ACTIVE:
         root = machine.get('root')
-        identity = read_selections(root).get(image_model.H3, {}).get('text_encoder') if root else None
+        if not root:
+            identity = None
+        else:
+            from .model_packages import shared_encoder_binding
+            identity = shared_encoder_binding(root)
     if identity in (None, '', 'builtin', builtin_id(image_model.H3, 'text_encoder')):
         return None
     return _selected(machine, image_model.H3, 'text_encoder', identity)
@@ -177,10 +181,14 @@ def shared_ready(machine):
     return path.is_file()
 
 
-def resolve(machine, model, *, selections=None):
+def resolve(machine, model, *, selections=None, package=None):
+    """Open one image package. An explicit selection map stays on that map and ignores ``package``."""
     if selections is None:
         root = machine.get('root')
-        selections = read_selections(root).get(model, {}) if root else {}
+        if root:
+            from .model_packages import resolve_image
+            return resolve_image(machine, package_id=package, model=model)
+        selections = {}
     components = {}
     for role in ROLES:
         identity = selections.get(role)

@@ -141,6 +141,12 @@ def fast_mode_option(value):
     return {'fast_mode': value} if value in FAST_MODE_OPTIONS and value != 'none' else {}
 
 
+def video_package_option(value):
+    from .fast_tier import checked_package_id
+    package_id = checked_package_id(value)
+    return {'video_package': package_id} if package_id else {}
+
+
 UPSCALE_OPTIONS = ('2', '1.5', '1.2')  # two_pass.SCALES as the widget shows them
 
 
@@ -234,6 +240,8 @@ class FreeVideoGenerate(io.ComfyNode):
                 io.Combo.Input('fast_mode', display_name='Fastest mode', options=list(FAST_MODE_OPTIONS), default='none',
                     optional=True, advanced=True,
                     tooltip='Uses the selected pi-H3 DWD adapter for two or four steps.'),
+                io.String.Input('video_package', default='', optional=True, advanced=True, socketless=True,
+                    tooltip='pi-H3 model package. Empty uses the package saved for this fastest mode.'),
             ],
             outputs=[io.Video.Output('video'), io.String.Output('report', display_name='Report JSON')],
             hidden=[io.Hidden.unique_id, io.Hidden.prompt, io.Hidden.extra_pnginfo],
@@ -244,13 +252,19 @@ class FreeVideoGenerate(io.ComfyNode):
     def validate_inputs(cls, text, width, height, seconds, seed, continue_from='', frames=0, two_pass=True,
                         preview=False, refine_from='', base_steps=8, refine_steps=3, step_cache='none',
                         upscale_factor='2', allow_empty_prompt=False, upscale_from='', upscale_to='',
-                        native_h3_error='', fast_mode='none'):
+                        native_h3_error='', fast_mode='none', video_package=''):
         # ComfyUI marks every input named here when a check fails, so only the checked widgets are
         # listed. Linked pictures, media and conditioning have no value before the run anyway.
         # step_cache and upscale_factor are named so ComfyUI skips their option lists: an older saved
         # workflow puts '' there, and execute uses no cache and the 2x upscale for a value that is not an option.
         if native_h3_error:
             return native_h3_error
+        try:
+            package = video_package_option(video_package).get('video_package')
+        except ValueError as error:
+            return str(error)
+        if package and not fast_mode_option(fast_mode):
+            return 'A video package needs the fastest mode.'
         refine_from = optional_text(refine_from)
         upscale_from = optional_text(upscale_from)
         if upscale_from and not fast_mode_option(fast_mode):
@@ -281,7 +295,7 @@ class FreeVideoGenerate(io.ComfyNode):
                     return 'Preview first needs the faster second pass.'
             _, machine = comfy_bridge.installation()
             if fast_mode_option(fast_mode):
-                comfy_bridge.require_fast_model(machine, fast_mode)
+                comfy_bridge.require_fast_model(machine, fast_mode, package_id=package)
         except (OSError, ValueError, KeyError) as error:
             from .continuation import UNSUPPORTED
             if str(error).startswith(UNSUPPORTED):
@@ -304,13 +318,16 @@ class FreeVideoGenerate(io.ComfyNode):
                 force_regenerate=False, base_steps=8, refine_steps=3, preview=False, refine_from='',
                 continue_from='', frames=0, first_frame_reference=False, voice_reference=False, hide_tail=False,
                 step_cache='none', upscale_factor='2', allow_empty_prompt=False, upscale_from='', upscale_to='',
-                native_h3_preset='', native_h3_error='', native_h3_video=None, fast_mode='none'):
+                native_h3_preset='', native_h3_error='', native_h3_video=None, fast_mode='none', video_package=''):
         from .comfy_environment import control_process
         from .gpu_pool import pool_enabled
         if control_process() and pool_enabled():
             raise RuntimeError('Generation requires a dispatched executor')
         if native_h3_error:
             raise ValueError(native_h3_error)
+        package = video_package_option(video_package)
+        if package and not fast_mode_option(fast_mode):
+            raise ValueError('A video package needs the fastest mode.')
         if native_h3_preset or native_h3_video is not None:
             if not native_h3_preset or native_h3_video is None:
                 raise ValueError('The ComfyUI H3 workflow is incomplete. Submit it again from FreeVideo.')
@@ -518,6 +535,8 @@ class FreeVideoGenerate(io.ComfyNode):
                 **step_cache_option(step_cache),
                 **upscale_option(upscale_factor),
                 **fast_mode_option(fast_mode),
+                **package,
+                fast_package_snapshot=chain.get('fast_package_snapshot') if chain is not None else None,
                 **({'report_extra': {'chain': report_fields(chain)}} if chain is not None else {}))
             relative = output.relative_to(output_root)
             report = output.with_suffix('.request.json').read_text(encoding='utf-8')

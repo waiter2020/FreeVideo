@@ -288,8 +288,7 @@ def image(*, local=False):
         prompt=dict(type='string', minLength=1, maxLength=2000),
         width=number(256, 4096, integer=True), height=number(256, 4096, integer=True),
         aspect=enum(IMAGE_ASPECTS, description='Instead of width and height; 1:1 when all three are omitted.'),
-        model=enum(('minimax-h3-image', 'qwen-image-2.1-turbo'), description='The picture model; leave it out to use the installed one, '
-            'or the one chosen on the picture page when both are installed.'),
+        model=enum(('minimax-h3-image', 'qwen-image-2.1-turbo'), description='The picture model family. Omit it to use the active image package in Settings when available.'),
         tier=enum(('standard', 'high'), description='With aspect on H3 Image: standard is about 4 MP, high about 16 MP. Not used by Qwen.'),
         seed=nullable(number(-(2**53 - 1), 2**53 - 1, integer=True)),
         loras=image_loras(),

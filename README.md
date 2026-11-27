@@ -88,7 +88,7 @@ After setting up the video engine on a CUDA GPU, open **Settings → Models → 
 
 Supported repositories provide either the H3 Transformer and VDN-H3 8-step checkpoint (`h3-base/transformer` and `stage-dmd-step-250`), or a compatible FreeVideo FP8 or ConvRot INT8 prepared cache. Third-party prepared caches include the full AdaLN projections. Both routes use the text encoder and video/audio decoders from the current installation.
 
-The same settings page has a **Picture model switching** section. Install a built-in family first, then choose MiniMax H3 Image, Qwen-Image 2.1 Turbo, or MOSS-Image-SFT and check a Hugging Face repository link. FreeVideo imports compatible denoiser weights and uses the installed family's encoder and decoder. The Image workspace shows the active version beside that family. Each family can switch back to its built-in weights independently.
+Under **Settings → Models → Image packages**, create a named package for an installed image model family and select its denoiser, text encoder, and VAE. Import compatible weights from Hugging Face or from a local model folder. **Use for pictures** sets the default package. The Image workspace remembers its own selection for previewing and generating pictures.
 
 To import a compatible model already on this computer, open FreeVideo directly on the Windows computer with the CUDA installation. Under **Settings → Models**, choose **Import from this computer** in the relevant section. For pictures, select the denoiser `.safetensors` or the MOSS shard index. For videos, select the prepared cache's `manifest.json` or the source folder containing `h3-base` and `stage-dmd-step-250`.
 
