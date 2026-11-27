@@ -28,14 +28,35 @@ PLAN_NAMES = {'-1': 'refused', '0': 'normal', '1': 'slower_streaming',
               '2': 'admitted_tight_memory'}
 
 
+# A Mac is offered the fastest mode from this much unified memory: on 8 GB its admission left 0.12 GiB, so a request
+# would run out of memory first and then start over with the slowest partitions.
+MAC_FAST_RAM_FLOOR = 16 * GiB
+
+
 def _fast_mode_listing(machine):
-    """Whether the installed model and GPU can run either pi-H3 adapter."""
+    """Whether the installed model and GPU can run either pi-H3 adapter.
+
+    An FP8 installation that the launcher can switch to int8 is shown as unavailable, with that download, instead of
+    being left off the list.
+    """
     reason = fast_tier.unsupported(mac=machine['mac'], gpu_name=machine['name'], vendor=machine.get('vendor'),
                                   cuda_missing=machine['cap'] is None or machine.get('cuda_missing'),
                                   precision=machine['precision'])
-    return dict(listed=reason is None, unlisted_reason=reason)
+    listing = dict(listed=reason is None, unlisted_reason=reason)
+    switch = machine.get('model_switch')
+    if reason == 'engine' and switch:
+        listing.update(needs='int8_model', download_bytes=switch['download_bytes'],
+                       int8_slower=switch['purpose'] == 'fast-level')
+    return listing
 
 
+def _model_switch(value):
+    """The launcher's offer of the int8 model as the page's server read it, or None when nothing is offered."""
+    if (not isinstance(value, dict) or value.get('status') not in ('available', 'low-disk')
+            or value.get('purpose') not in ('faster', 'fast-level') or type(value.get('download_bytes')) is not int
+            or value['download_bytes'] < 0):
+        return None
+    return dict(status=value['status'], purpose=value['purpose'], download_bytes=value['download_bytes'])
 # WholeVideoProgress.for_request starts an ordinary new-prompt request with
 # these flags. Unobserved encoder/model residency stays cold; compilation is
 # unknown (the prior's half-cold default), even later in the same session.
@@ -274,7 +295,8 @@ def _machine(machine, in_use=None):
                 # Setup's vendor, and whether the saved torch build is a CUDA one: a ROCm build saves no CUDA version.
                 # A record from before either was saved has neither, and is judged by the card's name as before.
                 vendor=str(machine['gpu_vendor']).casefold() if machine.get('gpu_vendor') else None,
-                cuda_missing='cuda_version' in observed and observed['cuda_version'] in (None, '', 'None'))
+                cuda_missing='cuda_version' in observed and observed['cuda_version'] in (None, '', 'None'),
+                model_switch=None if mac or precision == 'int8' else _model_switch(machine.get('model_switch')))
 
 
 def _request(width, height, frames, steps, two_pass, task='t2va', refine=3,
@@ -320,10 +342,11 @@ def _admit(machine, width, height, frames, steps, two_pass, task='t2va', refine=
             from .macos_compute import request_admission, plan as mac_plan
             resource = mac_policy(SimpleNamespace(), dict(total_bytes=machine['ram'],
                                                          available_bytes=machine['ram']))
-            admission = request_admission(resource, sampling, working_set_bytes=machine['metal'])
+            admission = request_admission(resource, sampling, working_set_bytes=machine['metal'], fast_mode=fast_mode)
             if admission['state'] == 'refuse':
                 return None, -1, 'memory'
-            plans = [mac_plan(min(resource['allocator_bytes'], machine['metal'] or resource['allocator_bytes']),
+            from .macos_compute import fast_budget
+            plans = [mac_plan(fast_budget(min(resource['allocator_bytes'], machine['metal'] or resource['allocator_bytes']), fast_mode),
                               geometry(**g)['video_tokens'] + 1024 + rows['video'] + rows['audio'],
                               frames=geometry(**g)['latent_frames'], allow_bounded=True)
                      for g in (sampling['first'], sampling['second'] or sampling['first'])]
