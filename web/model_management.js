@@ -128,7 +128,10 @@ export function createModelManagement({request, refresh, t, onManage, piWeights 
             if (action === 'cancel') stopping = true;
             if (selected === id) {
                 if (action === 'inspect') showReview({action: 'install', candidate: result.candidate});
-                else if (action === 'pick' && result.path) { location = result.path; listKey = ''; }
+                else if (action === 'pick' && result.path && result.path !== location) {
+                    location = result.path;
+                    showReview(null);
+                }
                 else if (['install', 'remove', 'repair'].includes(action)) showReview(null);
             }
             if (action !== 'inspect' && action !== 'pick') void refresh?.();
@@ -214,12 +217,31 @@ export function createModelManagement({request, refresh, t, onManage, piWeights 
         const actions = el('div', 'st-actions');
         form.append(labelled(t('Model source', '模型来源'), controlled(sources)),
             labelled(source === 'hf' ? t('Repository ID', '仓库 ID') : t('Local model file or folder', '本地模型文件或文件夹'), controlled(path)));
+        if (source === 'local' && model.id === 'prompt-vlm' && model.local_selection?.includes('file')) {
+            const hint = model.local_uses_builtin_files === true
+                ? t('Compatible Qwen3-VL Safetensors weights can reuse the installed built-in model’s configuration and tokenizer. You can also select a complete model folder.',
+                    '兼容的 Qwen3-VL Safetensors 权重可复用已安装内置模型的配置和分词器。也可以选择完整的模型文件夹。')
+                : t('Keep the configuration and tokenizer beside model.safetensors or model.safetensors.index.json.',
+                    '请将配置文件和分词器文件与 model.safetensors 或 model.safetensors.index.json 放在同一文件夹。');
+            form.append(el('p', 'st-p', hint));
+        }
         if (source === 'hf') form.append(labelled(t('Revision (optional)', '版本（可选）'), controlled(rev)),
             labelled(t('Repository path (optional)', '仓库内路径（可选）'), controlled(subdirectory)));
-        if (source === 'local' && (view.native_picker === true || enabled(model, 'pick'))) {
-            const pick = controlled(button(t('Browse', '浏览'), {iconName: 'folder'}));
-            pick.onclick = () => run('pick', model.id);
-            actions.append(pick);
+        if (source === 'local' && (view.native_picker ?? enabled(model, 'pick'))) {
+            if (Array.isArray(model.local_selection)) {
+                for (const kind of ['file', 'directory']) {
+                    if (!model.local_selection.includes(kind)) continue;
+                    const file = kind === 'file';
+                    const pick = controlled(button(file ? t('Choose a file', '选择文件') : t('Choose a folder', '选择文件夹'),
+                        {iconName: file ? 'doc' : 'folder'}));
+                    pick.onclick = () => run('pick', model.id, {kind});
+                    actions.append(pick);
+                }
+            } else {
+                const pick = controlled(button(t('Browse', '浏览'), {iconName: 'folder'}));
+                pick.onclick = () => run('pick', model.id);
+                actions.append(pick);
+            }
         }
         const inspect = controlled(button(t('Inspect model', '检查模型'), {kind: 'fill'}), () => !location.trim());
         inspect.type = 'submit';
@@ -251,6 +273,10 @@ export function createModelManagement({request, refresh, t, onManage, piWeights 
         const meta = [item.repo, item.revision, bytes > 0 && bytesText(bytes),
             files > 0 && t('{count} files', '{count} 个文件', {count: files}), item.license];
         if (meta.some(Boolean)) panel.append(el('p', 'st-p', meta.filter(Boolean).join(' · ')));
+        if (Array.isArray(candidate?.builtin_files) && candidate.builtin_files.length) {
+            panel.append(el('p', 'st-p', t('This import reuses files from the installed built-in model.', '本次导入会复用已安装内置模型的文件。')),
+                el('p', 'st-p', candidate.builtin_files.join(' · ')));
+        }
         if (item.download_scope) panel.append(el('p', 'st-p', t('Includes the {name} pack.', '包含 {name} 模型包。', {name: item.download_scope})));
         const repository = item.repo || item.source || '';
         if (/^[\w.-]+\/[\w.-]+$/.test(repository)) {

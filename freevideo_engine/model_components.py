@@ -46,6 +46,15 @@ class Slot:
     verify_default: object = None
     default_bytes: int = 0
     license: str = ''
+    local_file_records: object = None
+    file_picker: str = 'model-file'
+
+    @property
+    def local_selection(self):
+        """Native picker modes for this component's local import."""
+        if self.local_file_records is not None:
+            return ('file', 'directory')
+        return ('file',) if self.layout is None and len(self.files) == 1 else ('directory',)
 
 
 def catalog(root, machine):

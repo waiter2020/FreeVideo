@@ -378,18 +378,21 @@ class Setup:
             from .local_model_picker import select
             if os.name != 'nt' or not slot.supported or slot.manager or slot.validate is None:
                 raise ValueError('Enter the path of a file or folder in a configured model library.')
+            modes = slot.local_selection
+            kind = value.get('kind', 'file' if modes == ('file',) else 'directory')
+            if kind not in modes:
+                raise ValueError('Choose a selection type supported by this model.')
             if not self._local_picker.acquire(blocking=False):
                 raise ValueError('Close the other local model picker first.')
             try:
-                path = select(jobs.machine['python'], self.source,
-                              'model-directory' if slot.layout or len(slot.files) != 1 else 'model-file')
+                path = select(jobs.machine['python'], self.source, slot.file_picker if kind == 'file' else 'model-directory')
             finally:
                 self._local_picker.release()
             if path:
                 with jobs.mutex:
                     if len(jobs.picked) >= 24:
                         jobs.picked.clear()
-                    jobs.picked.add(path)
+                    jobs.picked.add((slot.id, path))
             return dict(path=path)
         if action in ('install', 'remove') and value.get('accepted') is not True:
             raise ValueError('Confirm the model action first.')

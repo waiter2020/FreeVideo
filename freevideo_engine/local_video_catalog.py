@@ -37,15 +37,21 @@ def _metadata(path, label):
         raise ValueError('Invalid video model metadata: ' + label) from error
 
 
-def _tensor_header(row, *, dtypes=TENSOR_BYTES):
+def read_tensor_layout(path, size, *, dtypes=TENSOR_BYTES):
     """Validate bounded header and payload extent without reading tensor data."""
+    with io_path(path).open('rb') as stream:
+        length = int.from_bytes(stream.read(8), 'little')
+        if not 2 <= length <= min(MAX_HEADER, size - 8):
+            raise ValueError('Invalid safetensors header length')
+        header = stream.read(length)
+        if len(header) != length:
+            raise ValueError('Truncated safetensors header')
+    return tensor_layout(header, size, dtypes=dtypes)
+
+
+def _tensor_header(row, *, dtypes=TENSOR_BYTES):
     try:
-        with io_path(row['source']).open('rb') as stream:
-            length = int.from_bytes(stream.read(8), 'little')
-            if not 2 <= length <= min(MAX_HEADER, row['bytes'] - 8):
-                raise ValueError('Invalid header length')
-            header = stream.read(length)
-        return tensor_layout(header, row['bytes'], dtypes=dtypes)
+        return read_tensor_layout(row['source'], row['bytes'], dtypes=dtypes)
     except (AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError) as error:
         raise ValueError('Invalid video safetensors: ' + row['target']) from error
 

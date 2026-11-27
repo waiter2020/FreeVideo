@@ -860,6 +860,104 @@ test('model library reviews, installs and switches a replacement without removin
     } finally { globalThis.document = original; }
 });
 
+test('model library opens the native picker for each supported local selection', async () => {
+    const original = globalThis.document;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    try {
+        const model = {id: 'prompt-vlm', group: 'prompt', label: 'Prompt and vision model', supported: true, actions: ['inspect', 'install', 'pick']};
+        const files = {file: 'D:/models/custom.safetensors', directory: 'D:/models/custom'};
+        const calls = [];
+        const panel = createModelManagement({t: settingsText, request: async (route, payload) => {
+            assert.equal(route, 'model-component');
+            calls.push(payload);
+            if (payload.action === 'inspect') return {candidate: {id: 'reviewed', label: 'Reviewed model', files: [payload.path]}};
+            return {path: files[payload.kind]};
+        }});
+        const all = () => descendants(panel.element);
+        const button = (en, zh) => all().find(node => node.className === 'st-btn-t' && node.textContent === settingsText(en, zh))?.parentNode;
+        const file = () => button('Choose a file', '选择文件'), folder = () => button('Choose a folder', '选择文件夹');
+        const browse = () => button('Browse', '浏览'), path = () => all().find(node => node.type === 'text');
+        const inspect = () => all().find(node => node.tag === 'form').onsubmit({preventDefault() {}});
+        const update = (local_selection, native_picker) => panel.update({slots: [{...model, local_selection}], local_available: true, native_picker});
+
+        update(['file', 'directory'], true);
+        button('Manage', '管理').onclick();
+        assert.equal(browse(), undefined);
+        assert.ok(all().some(node => node.textContent?.includes('model.safetensors.index.json')));
+        await file().onclick();
+        assert.deepEqual(calls.at(-1), {action: 'pick', slot: model.id, kind: 'file'});
+        assert.equal(path().value, files.file);
+        await inspect();
+        assert.ok(button('Install version', '安装版本'));
+        await folder().onclick();
+        assert.deepEqual(calls.at(-1), {action: 'pick', slot: model.id, kind: 'directory'});
+        assert.equal(path().value, files.directory);
+        assert.equal(button('Install version', '安装版本'), undefined);
+
+        update(['file'], true);
+        assert.ok(file());
+        assert.equal(folder(), undefined);
+        update(['directory'], true);
+        assert.equal(file(), undefined);
+        assert.ok(folder());
+
+        update(['file', 'directory'], false);
+        assert.ok(!file() && !folder() && !browse());
+        path().value = files.file; path().oninput();
+        await inspect();
+        assert.deepEqual(calls.at(-1), {action: 'inspect', slot: model.id, source: 'local', path: files.file});
+
+        update(undefined, undefined);
+        assert.ok(!file() && !folder());
+        await browse().onclick();
+        assert.deepEqual(calls.at(-1), {action: 'pick', slot: model.id});
+    } finally { globalThis.document = original; }
+});
+
+test('prompt model review identifies built-in files reused by a standalone checkpoint', async () => {
+    const original = globalThis.document;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    try {
+        const model = {id: 'prompt-vlm', group: 'prompt', label: 'Prompt and vision model', supported: true,
+            actions: ['inspect', 'install'], local_selection: ['file', 'directory']};
+        const weights = 'D:/models/custom.safetensors';
+        const builtin_files = ['config.json', 'tokenizer.json', 'tokenizer_config.json'];
+        const calls = [];
+        const panel = createModelManagement({t: settingsText, request: async (route, payload) => {
+            calls.push([route, payload]);
+            if (payload.action === 'inspect') return {candidate: {id: 'standalone', label: 'Custom weights', bytes: 2 ** 31,
+                files: ['model.safetensors', ...builtin_files], builtin_files}};
+            return {};
+        }});
+        const all = () => descendants(panel.element);
+        const button = (en, zh) => all().find(node => node.className === 'st-btn-t' && node.textContent === settingsText(en, zh))?.parentNode;
+        const update = ready => panel.update({slots: [{...model, local_uses_builtin_files: ready}], local_available: true, native_picker: true});
+        update(false);
+        button('Manage', '管理').onclick();
+        assert.ok(all().some(node => node.textContent?.includes('model.safetensors.index.json')));
+        update(true);
+        assert.ok(all().some(node => node.textContent?.includes('Qwen3-VL Safetensors')));
+        const path = all().find(node => node.type === 'text');
+        path.value = weights; path.oninput();
+        await all().find(node => node.tag === 'form').onsubmit({preventDefault() {}});
+        assert.deepEqual(calls.at(-1), ['model-component', {action: 'inspect', slot: model.id, source: 'local', path: weights}]);
+        const review = all().find(node => node.className === 'st-model-review');
+        assert.ok(review.children.some(node => node.textContent === settingsText('This import reuses files from the installed built-in model.',
+            '本次导入会复用已安装内置模型的文件。')));
+        assert.ok(review.children.some(node => node.textContent === builtin_files.join(' · ')));
+        assert.ok(review.children.some(node => node.textContent === `2.0 GiB · ${settingsText('{count} files', '{count} 个文件', {count: 4})}`));
+        const agreements = all().filter(node => node.type === 'checkbox');
+        assert.equal(agreements.length, 1);
+        const [accept] = agreements;
+        const install = button('Install version', '安装版本');
+        assert.equal(install.disabled, true);
+        accept.checked = true; accept.onchange();
+        assert.equal(install.disabled, false);
+        await install.onclick();
+        assert.deepEqual(calls.at(-1), ['model-component', {action: 'install', slot: model.id, candidate_id: 'standalone', accepted: true}]);
+    } finally { globalThis.document = original; }
+});
+
 test('system models and pi-H3 pair imports have separate controls', async () => {
     const original = globalThis.document;
     globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};

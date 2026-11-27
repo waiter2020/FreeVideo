@@ -78,7 +78,7 @@ def _layout(slot, names, single=None):
 
 
 def _public(candidate):
-    return {key: candidate[key] for key in ('id', 'label', 'source', 'repo', 'revision', 'license', 'bytes')
+    return {key: candidate[key] for key in ('id', 'label', 'source', 'repo', 'revision', 'license', 'bytes', 'builtin_files')
             if key in candidate} | {'files': [row['target'] for row in candidate['files']]}
 
 
@@ -180,7 +180,7 @@ class ComponentJobs(HubModelJobs):
     def _catalog(self):
         return models.catalog(self.root, self.machine)
 
-    def inspect(self, slot, value, libraries, token):
+    def inspect(self, slot, value, libraries, token, *, use_builtin_files=False):
         if not slot.supported or slot.manager or slot.validate is None:
             raise ValueError(slot.reason or 'This model uses its existing management controls.')
         token = hf_auth.validate(token or '')
@@ -188,16 +188,27 @@ class ComponentJobs(HubModelJobs):
         if source == 'local':
             value_path = value.get('path')
             with self.mutex:
-                picked = isinstance(value_path, str) and value_path in self.picked
+                key = (slot.id, value_path) if isinstance(value_path, str) else None
+                picked = key in self.picked
                 if picked:
-                    self.picked.discard(value_path)
+                    self.picked.discard(key)
             path = Path(value_path) if picked else approved_path(value_path, libraries)
             is_file = io_path(path).is_file()
             folder = path.parent if is_file else path
-            layout = _layout(slot, set() if is_file else _names(folder), path.name if is_file else None)
-            files = [local_model_copy.source_record(folder / name, target, root=folder)
-                     for target, name in layout.items()]
+            builtin_files = []
+            if is_file and slot.local_file_records is not None:
+                if Path(plain(resolved(path))) != path:
+                    raise ValueError('Choose the resolved path to the model file or directory.')
+                with os.scandir(io_path(folder)) as entries:
+                    names = {entry.name for entry in entries if entry.is_file(follow_symlinks=False)}
+                files, builtin_files = slot.local_file_records(path, names, use_builtin_files=use_builtin_files)
+            else:
+                layout = _layout(slot, set() if is_file else _names(folder), path.name if is_file else None)
+                files = [local_model_copy.source_record(folder / name, target, root=folder)
+                         for target, name in layout.items()]
             candidate = dict(label=path.name, source='Local', files=files, license='', local_path=str(path))
+            if builtin_files:
+                candidate['builtin_files'] = builtin_files
         elif source == 'hf':
             repo, requested, path = _hub_selection(value)
             info, entries = hub._info(repo, requested, token)
@@ -264,7 +275,9 @@ class ComponentJobs(HubModelJobs):
                              consumers=slot.consumers, format=slot.format, supported=supported,
                              reason=(package_error or slot.reason) if slot.id in modes else slot.reason,
                              default=default, active_id=active_id, versions=versions,
-                             actions=actions, manager=slot.manager, manager_model=slot.model,
+                             actions=actions, local_selection=slot.local_selection if 'inspect' in actions else (),
+                             local_uses_builtin_files=bool(slot.local_file_records and default['installed']),
+                             manager=slot.manager, manager_model=slot.model,
                              manager_component=slot.component))
         with self.mutex:
             job = dict(self.task)
@@ -374,7 +387,7 @@ class ComponentJobs(HubModelJobs):
                 return
             self._test(slot, staging, workspace)
             record = {key: candidate[key] for key in ('source', 'source_kind', 'label', 'license', 'bytes', 'repo', 'revision',
-                                                      'path', 'local_path') if key in candidate}
+                                                      'path', 'local_path', 'builtin_files') if key in candidate}
             save(staging / models.RECEIPT, record | dict(schema_version=1, id=identity, slot=slot.id, files=files), durable=True)
             self._check()
             io_path(destination.parent).mkdir(parents=True, exist_ok=True)
@@ -453,8 +466,8 @@ class ComponentJobs(HubModelJobs):
                            repo=value.get('repo'), revision=value.get('revision'))
             if local:
                 with self.mutex:
-                    self.picked.add(request['path'])
-            inspected = self.inspect(slot, request, (), token)
+                    self.picked.add((slot.id, request['path']))
+            inspected = self.inspect(slot, request, (), token, use_builtin_files=bool(value.get('builtin_files')))
             with self.mutex:
                 candidate = self.pending.pop(inspected['id'])
             self._install(slot, candidate, token, repair=identity)

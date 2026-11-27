@@ -5,10 +5,13 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Lock
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from freevideo_engine import model_component_jobs as jobs, model_components as models
+from freevideo_engine import comfy_setup, model_component_jobs as jobs, model_components as models
+from freevideo_engine import model_components_visual as visual
 from freevideo_engine.locking import runtime_lock
 
 
@@ -16,11 +19,17 @@ class ModelComponentCatalogTest(unittest.TestCase):
     def test_catalog_and_status_load_without_inference_dependencies(self):
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
-            machine = {'root': str(root), 'model_root': str(root / 'models'), 'device_backend': 'cuda'}
+            machine = {'root': str(root), 'model_root': str(root / 'models'), 'device_backend': 'cuda',
+                       'base': str(root / 'models' / 'h3-base')}
             rows = {row['id']: row for row in jobs.ComponentJobs(root, machine).status()['slots']}
             self.assertGreaterEqual(len(rows), 47)
             self.assertEqual(rows['qwen-image-2.1-turbo-text-encoder']['manager_component'], 'text_encoder')
             self.assertEqual(rows['prompt-vlm']['group'], 'prompt')
+            self.assertEqual(rows['prompt-vlm']['local_selection'], ('file', 'directory'))
+            self.assertFalse(rows['prompt-vlm']['local_uses_builtin_files'])
+            self.assertEqual(rows['depth-reference']['local_selection'], ('file',))
+            fast = rows['pi-h3-2-step']
+            self.assertEqual(fast['local_selection'], ('directory',) if fast['supported'] else ())
             self.assertIn('Speaker identification', rows['campplus']['consumers'])
             self.assertTrue(rows['editor-silero-vad']['default']['bytes'] > 0)
 
@@ -158,6 +167,120 @@ class ModelComponentJobsTest(unittest.TestCase):
         self.assertIn('changed', self.finish('failed')['error'])
         self.assertEqual(self.status()['slots'][0]['versions'], [])
         self.smoke.assert_not_called()
+
+    def test_prompt_file_picker_authorizes_its_complete_bundle_for_one_slot(self):
+        prompt = next(slot for slot in visual.slots(self.engine, {}) if slot.id == 'prompt-vlm')
+        self.catalog[prompt.id] = prompt
+        self.machine['python'] = 'fixture-python'
+        setup = SimpleNamespace(source=self.root, runner=None, _local_picker=Lock(),
+                                component_jobs=lambda *_: self.manager,
+                                component_libraries=lambda _: (self.library,))
+        folder = self.root / 'prompt 模型'
+        folder.mkdir()
+        metadata = visual.PROMPT_REQUIRED | {'tokenizer.json'}
+        source = folder / 'Qwen3-VL.safetensors'
+        for name in metadata | {source.name}:
+            (folder / name).write_bytes(b'fixture')
+        def action(slot, **payload):
+            return comfy_setup.Setup.component_action(setup, dict(slot=slot.id, **payload), None, None)
+        with (patch.object(comfy_setup, 'os', SimpleNamespace(name='nt')),
+              patch('freevideo_engine.local_model_picker.select', return_value=str(source)) as pick):
+            self.assertEqual(action(prompt, action='pick', kind='file')['path'], str(source))
+            pick.assert_called_once_with(self.machine['python'], self.root, 'prompt-model')
+        with self.assertRaisesRegex(ValueError, 'configured model library'):
+            action(self.slot, action='inspect', source='local', path=str(source))
+        candidate = action(prompt, action='inspect', source='local', path=str(source))['candidate']
+        self.assertEqual(set(candidate['files']), metadata | {visual.PROMPT_SINGLE})
+        with self.assertRaisesRegex(ValueError, 'configured model library'):
+            action(prompt, action='inspect', source='local', path=str(source))
+
+    def test_prompt_shard_index_and_file_require_the_whole_bundle(self):
+        prompt = next(slot for slot in visual.slots(self.engine, {}) if slot.id == 'prompt-vlm')
+        index = self.library / visual.PROMPT_INDEX
+        first, second = 'model-00001-of-00002.safetensors', 'model-00002-of-00002.safetensors'
+        def inspect(path):
+            return self.manager.inspect(prompt, {'source': 'local', 'path': str(path)}, (self.library,), '')
+        for name in visual.PROMPT_REQUIRED | {'tokenizer.json', visual.PROMPT_INDEX, first}:
+            (self.library / name).write_bytes(b'fixture')
+        with self.assertRaisesRegex(ValueError, 'complete set'):
+            inspect(index)
+        (self.library / second).write_bytes(b'fixture')
+        self.assertEqual(inspect(index)['files'], inspect(self.library)['files'])
+        self.assertEqual(inspect(self.library / first)['files'], inspect(self.library)['files'])
+        single = self.source('alternative.safetensors')
+        self.assertEqual(set(inspect(single)['files']), visual.PROMPT_REQUIRED | {'tokenizer.json', visual.PROMPT_SINGLE})
+        (self.library / 'config.json').unlink()
+        with self.assertRaisesRegex(ValueError, 'Missing prompt model files: config.json'):
+            inspect(index)
+
+    def standalone_prompt(self):
+        from freevideo_engine.prompt_vlm import assets
+
+        self.slot = next(slot for slot in visual.slots(self.engine, {}) if slot.id == 'prompt-vlm')
+        self.catalog.clear()
+        self.catalog[self.slot.id] = self.slot
+        folder = self.engine / 'stock'
+        folder.mkdir()
+        metadata = sorted(visual.PROMPT_REQUIRED | {'tokenizer.json'})
+        contents = {name: b'{}' for name in metadata}
+        contents[visual.PROMPT_SINGLE] = self.prompt_weights('expected')
+        pins = []
+        for name, data in contents.items():
+            (folder / name).write_bytes(data)
+            pins.append(dict(file=name, bytes=len(data), sha256=hashlib.sha256(data).hexdigest()))
+        for mock in (patch.object(assets, 'directory', return_value=folder),
+                     patch.object(assets, 'catalog', return_value={'files': pins}),
+                     patch.object(assets, 'default_ready', return_value=True)):
+            mock.start()
+            self.addCleanup(mock.stop)
+        return folder, metadata
+
+    @staticmethod
+    def prompt_weights(name, value=b'\0\0'):
+        header = json.dumps({name: dict(dtype='BF16', shape=[len(value) // 2], data_offsets=[0, len(value)])}).encode()
+        return len(header).to_bytes(8, 'little') + header + value
+
+    def test_prompt_standalone_copies_selected_weights_with_pinned_builtin_metadata(self):
+        stock, metadata = self.standalone_prompt()
+        data = self.prompt_weights('expected', b'\0\1')
+        self.slot = replace(self.slot, validate=lambda folder: self.assertEqual(
+            (folder / visual.PROMPT_SINGLE).read_bytes(), data))
+        self.catalog[self.slot.id] = self.slot
+        source = self.source('custom.safetensors', data)
+        candidate = self.inspect_local(source)
+        self.assertTrue(self.status()['slots'][0]['local_uses_builtin_files'])
+        self.assertEqual(candidate['builtin_files'], metadata)
+        self.assertEqual(set(candidate['files']), set(metadata) | {visual.PROMPT_SINGLE})
+        self.assertNotIn('local_path', candidate)
+        self.manager.perform(self.slot, 'install', {'candidate_id': candidate['id']}, '')
+        identity = self.finish()['id']
+        folder, receipt = models.receipt(self.engine, self.slot.id, identity)
+        self.assertEqual(self.status()['slots'][0]['active_id'], models.BUILTIN)
+        self.assertEqual((folder / visual.PROMPT_SINGLE).read_bytes(), data)
+        self.assertEqual(receipt['files']['config.json']['sha256'], hashlib.sha256(b'{}').hexdigest())
+        self.assertEqual(receipt['builtin_files'], metadata)
+        (source.parent / 'config.json').write_bytes(b'also present now')
+        (folder / 'config.json').unlink()
+        self.action('repair', identity)
+        self.assertEqual((folder / 'config.json').read_bytes(), (stock / 'config.json').read_bytes())
+
+    def test_prompt_standalone_rejects_invalid_weights_and_damaged_or_partial_metadata(self):
+        stock, _ = self.standalone_prompt()
+        with self.assertRaisesRegex(ValueError, 'valid BF16'):
+            self.inspect_local(self.source())
+        for data in (self.prompt_weights('different'), self.prompt_weights('expected', b'\0' * 4)):
+            with self.assertRaisesRegex(ValueError, 'do not match'):
+                self.inspect_local(self.source(content=data))
+        valid = self.source(content=self.prompt_weights('expected'))
+        with patch('freevideo_engine.prompt_vlm.assets.default_ready', return_value=False):
+            with self.assertRaisesRegex(ValueError, 'Install the built-in Qwen3-VL model'):
+                self.inspect_local(valid)
+        (stock / 'config.json').write_bytes(b'[]')
+        with self.assertRaisesRegex(ValueError, 'built-in config.json file is missing or damaged'):
+            self.inspect_local(valid)
+        (valid.parent / 'config.json').write_bytes(b'{}')
+        with self.assertRaisesRegex(ValueError, 'Missing prompt model files'):
+            self.inspect_local(valid)
 
     def test_failed_validation_or_activation_keeps_current_selection(self):
         identity = self.install_local(self.source())['id']

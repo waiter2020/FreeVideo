@@ -59,7 +59,7 @@ jobs:
           python scripts/check_installation.py
           python -m unittest discover -s scripts -p 'test_hf_*.py'
           python -m unittest discover -s scripts -p 'test_local_*.py'
-          python -m unittest scripts.test_model_packages scripts.test_image_package_requests scripts.test_video_package_requests
+          python -m unittest scripts.test_model_packages scripts.test_image_package_requests scripts.test_video_package_requests scripts.test_model_component_jobs
           bash -n setup.sh test.sh freevideo scripts/bootstrap_linux.sh
           ./setup.sh --help
           ./test.sh --help

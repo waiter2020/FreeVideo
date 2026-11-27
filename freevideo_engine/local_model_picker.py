@@ -16,6 +16,8 @@ FILE_TYPES = {
     'encoder_shards': ('Encoder weights or shard index / 编码器权重或分片索引',
                        ('*.safetensors', '*.safetensors.index.json')),
     'vae': ('VAE weights / VAE 权重', ('*.safetensors',)),
+    'prompt-model': ('Qwen3-VL weights or shard index / Qwen3-VL 权重或分片索引',
+                     ('*.safetensors', '*.safetensors.index.json')),
     'cache': ('FreeVideo cache manifest / FreeVideo 缓存清单', 'manifest.json'),
     'model-file': ('Model weights / 模型权重', ('*.safetensors', '*.pt', '*.pth', '*.onnx', '*.json', '*.gguf')),
 }

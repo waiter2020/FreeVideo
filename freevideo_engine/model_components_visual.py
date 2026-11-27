@@ -1,9 +1,13 @@
 """Model slots for prompt processing, visual tools, and live previews."""
+from functools import partial
 import hashlib
 import json
 from pathlib import Path
 import re
 
+from .local_model_copy import source_record
+from .local_video_catalog import RAW_DTYPES, read_tensor_layout
+from .long_paths import io_path
 from .model_components import Slot
 
 
@@ -11,7 +15,7 @@ PROMPT_REQUIRED = {'config.json', 'generation_config.json', 'preprocessor_config
                    'tokenizer_config.json', 'video_preprocessor_config.json'}
 PROMPT_SUPPORT = {'chat_template.json', 'chat_template.jinja', 'merges.txt', 'tokenizer.json',
                   'vocab.json', 'added_tokens.json', 'special_tokens_map.json'}
-PROMPT_SHARD = re.compile(r'model-[0-9]{5}-of-[0-9]{5}\.safetensors')
+PROMPT_SHARD = re.compile(r'model-([0-9]{5})-of-([0-9]{5})\.safetensors')
 PROMPT_INDEX = 'model.safetensors.index.json'
 PROMPT_SINGLE = 'model.safetensors'
 
@@ -22,16 +26,73 @@ def prompt_layout(names):
         raise ValueError('Missing prompt model files: ' + ', '.join(sorted(missing)))
     if 'tokenizer.json' not in names and not {'merges.txt', 'vocab.json'} <= names:
         raise ValueError('Choose a prompt model bundle that includes its tokenizer.')
-    shards = {name for name in names if PROMPT_SHARD.fullmatch(name)}
+    shards = {name: tuple(map(int, match.groups())) for name in names if (match := PROMPT_SHARD.fullmatch(name))}
     if PROMPT_INDEX in names:
-        if not shards or PROMPT_SINGLE in names:
+        if (not shards or PROMPT_SINGLE in names
+                or any(total != len(shards) or not 1 <= index <= total for index, total in shards.values())):
             raise ValueError('Provide one complete set of prompt model shards and their index.')
-        weights = shards | {PROMPT_INDEX}
+        weights = set(shards) | {PROMPT_INDEX}
     elif PROMPT_SINGLE in names and not shards:
         weights = {PROMPT_SINGLE}
     else:
         raise ValueError('Provide a prompt model safetensors file or its complete shard set.')
     return PROMPT_REQUIRED | (PROMPT_SUPPORT & names) | weights
+
+
+def prompt_file_layout(names, selected):
+    """Build the complete local Transformers model around the selected weight or index."""
+    if selected not in names:
+        raise ValueError('The selected prompt model file is missing or unsafe.')
+    if selected == PROMPT_INDEX or PROMPT_SHARD.fullmatch(selected):
+        return {name: name for name in sorted(prompt_layout(names))}
+    if not selected.lower().endswith('.safetensors'):
+        raise ValueError('Choose Qwen3-VL safetensors weights or the model.safetensors.index.json file.')
+    layout = prompt_layout((names & (PROMPT_REQUIRED | PROMPT_SUPPORT)) | {PROMPT_SINGLE})
+    return {name: selected if name == PROMPT_SINGLE else name for name in sorted(layout)}
+
+
+def prompt_file_records(root, path, names, *, use_builtin_files=False):
+    from .prompt_vlm import assets
+
+    standalone = (path.name in names and path.suffix.lower() == '.safetensors'
+                  and not PROMPT_SHARD.fullmatch(path.name))
+    if not standalone or (not use_builtin_files and names & (PROMPT_REQUIRED | PROMPT_SUPPORT)):
+        layout = prompt_file_layout(names, path.name)
+        return [source_record(path.parent / name, target, root=path.parent) for target, name in layout.items()], []
+    if not assets.default_ready(root):
+        raise ValueError('Install the built-in Qwen3-VL model to import compatible standalone weights, '
+                         'or choose a folder with the model configuration and tokenizer.')
+
+    folder = assets.directory(root)
+    pins = {row['file']: row for row in assets.catalog()['files']}
+    metadata = sorted(prompt_layout(set(pins)) & (PROMPT_REQUIRED | PROMPT_SUPPORT))
+    weight = source_record(path, PROMPT_SINGLE, root=path.parent)
+    try:
+        actual = read_tensor_layout(weight['source'], weight['bytes'], dtypes=RAW_DTYPES)
+    except (OSError, ValueError) as error:
+        raise ValueError('The selected file does not contain valid BF16, FP16, or FP32 safetensors weights.') from error
+
+    expected = {}
+    for name, pin in pins.items():
+        if name != PROMPT_SINGLE and not PROMPT_SHARD.fullmatch(name):
+            continue
+        stock = source_record(folder / name, name, root=folder, size=pin['bytes'])
+        try:
+            tensors = read_tensor_layout(stock['source'], stock['bytes'], dtypes=RAW_DTYPES)
+        except (OSError, ValueError) as error:
+            raise ValueError(f'The built-in {name} file is damaged. Repair the built-in Qwen3-VL model.') from error
+        expected.update(tensors)
+    if {name: shape for name, (_, shape) in actual.items()} != {name: shape for name, (_, shape) in expected.items()}:
+        raise ValueError('These weights do not match the built-in Qwen3-VL model. '
+                         'Choose a complete model folder with its own configuration and tokenizer.')
+
+    files = [weight]
+    for name in metadata:
+        pin = pins[name]
+        record = source_record(folder / name, name, root=folder, sha256=pin['sha256'], size=pin['bytes'])
+        _verify_pin(Path(record['source']), pin)
+        files.append(record)
+    return files, metadata
 
 
 def validate_prompt(folder):
@@ -91,8 +152,8 @@ def _ensure(root, loader):
 
 def _verify_pin(path, row):
     try:
-        if path.stat().st_size == row['bytes']:
-            with path.open('rb') as stream:
+        if io_path(path).stat().st_size == row['bytes']:
+            with io_path(path).open('rb') as stream:
                 if hashlib.file_digest(stream, 'sha256').hexdigest() == row['sha256']:
                     return
     except OSError:
@@ -137,7 +198,8 @@ def slots(root, machine):
              consumers=('Prompt enhancement', 'Visual questions', 'Shot analysis', 'Director'),
              files={row['file']: prompt_path / row['file'] for row in prompt['files']},
              format='Dense Qwen3-VL Instruct, Transformers Safetensors', validate=validate_prompt,
-             layout=prompt_layout, source=prompt['repo'], license=prompt['license'],
+             layout=prompt_layout, local_file_records=partial(prompt_file_records, root), file_picker='prompt-model',
+             source=prompt['repo'], license=prompt['license'],
              install_default=lambda progress, check: _install_prompt(root, progress, check),
              default_status=lambda: dict(installed=assets.default_ready(root), label=prompt['repo'].rsplit('/', 1)[-1]),
              verify_default=lambda: _verify_pack(prompt_path, prompt['files']),
