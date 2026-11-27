@@ -193,14 +193,20 @@ def request_key(prompt, seed, canvas, sampling_plan, extra, machine, resources, 
                 'vdn': tree(machine['vdn_root'], code=True),
                 'encoder': tree(Path(machine['comfy_root']) / 'comfy', code=True)})
         models = phase('models', lambda: {key: tree(machine[key]) for key in ('cache', 'base', 'checkpoint')})
+        from .model_components import selected_files, selected_identity
+        from .model_components_generation import AUDIO_VAE, VIDEO_VAE
+        for component in (AUDIO_VAE, VIDEO_VAE):
+            if (version := selected_identity(root, component)) is not None:
+                selected_files(root, component)
+                models[component] = version
         from .encoder_checkpoint import configured_component, configured_encoder_file
         selected = configured_component(machine)
         models['encoder'] = (dict(id=selected['id'], sha256=selected['sha256']) if selected is not None
                              else file(configured_encoder_file(machine, None)))
         models['paths'] = file(machine['model_paths'])
         if sampling_plan.get('upscaler_sha256'):
-            from .two_pass import UPSCALER
-            models['upscaler'] = file(Path(machine['model_root']) / 'latent_upscaler' / Path(UPSCALER['file']).name)
+            from .two_pass import checkpoint_path
+            models['upscaler'] = file(checkpoint_path(root, machine['model_root']))
         native = machine.get('device_backend') == 'mps'
         if native:
             identity = machine.get('device_identity')

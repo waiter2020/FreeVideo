@@ -17,6 +17,7 @@ with a random salt kept on this machine.
 Scans of earlier files only list what they would remove until deletion is switched on
 (``settings.json``); a user's explicit delete removes what provably belongs only to the deleted item.
 """
+from contextlib import contextmanager
 import hashlib
 import hmac
 import json
@@ -52,6 +53,11 @@ CACHE_PATTERNS = (
     re.compile(r'[a-z0-9-]{1,40}/[0-9a-f]{64}/[0-9a-f]{38}-[0-9a-f]{16}\.previous\.json'),
     re.compile(r'[a-z0-9-]{1,40}/[0-9a-f]{64}/(?:[0-9a-f]{64}|[0-9a-f]{31}-[0-9a-f]{32})\.pt'),
 )
+CACHE_FILES = CACHE_PATTERNS + (
+    re.compile(r'[a-z0-9-]{1,40}/[0-9a-f]{64}/[0-9a-f]{32}\.partial'),
+    re.compile(r'[a-z0-9-]{1,40}/[0-9a-f]{64}/receipt\.[a-z0-9_]{8}\.tmp'),
+)
+TUNING_CACHE_FILES = (re.compile(r'[0-9a-f]{64}\.(?:pt|partial)'),)
 # FreeVideo's own folders stay even when empty; only a folder of one upload goes with its file.
 KEPT_FOLDERS = ('freevideo', 'agent', 'assets', 'freevideo-image-ref', 'freevideo-image', 'freevideo-draft')
 # A page's temporary pictures are kept a day at most; an upload nothing holds, a week.
@@ -323,6 +329,26 @@ def _derived_ok(row):
     return (isinstance(row, str) and any(p.fullmatch(row) for p in CACHE_PATTERNS[:1]))
 
 
+@contextmanager
+def cache_mutation(cache_root):
+    """Serialize publication and removal across workers; leave readers free to miss and recompute."""
+    from .locking import runtime_lock
+
+    lock = _base(cache_root).parent / 'private-store' / 'input-cache.lock'
+    with LOCK, runtime_lock(lock, inherit=False, wait_seconds=2.):
+        yield
+
+
+def cache_receipt_payload(receipt, path):
+    """Return the managed path of a receipt's payload, relative to the cache root."""
+    leaf = (_read(path) or {}).get('file')
+    if isinstance(leaf, str):
+        payload = receipt.rsplit('/', 1)[0] + '/' + leaf
+        if CACHE_PATTERNS[2].fullmatch(payload):
+            return payload
+    return None
+
+
 def hold(owner_id, *, refs=(), derived=(), names=None, root=None):
     """Add files to what ``owner_id`` holds. ``refs`` are input paths of FreeVideo's own names, ``derived``
     are input-cache receipts (<kind>/<identity>/<receipt>.json), ``names`` the display names of refs."""
@@ -368,35 +394,53 @@ def owners(root=None):
     return result
 
 
-def evict(cache_root, receipt, *, dry_run=False):
+def evict(cache_root, receipt, *, dry_run=False, expected=None):
     """Remove one input-cache receipt, its earlier copies and the file it names when no other receipt does.
 
     ``receipt`` is <kind>/<identity>/<receipt>.json under ``cache_root``. Returns the bytes removed."""
     if not _derived_ok(receipt):
         return 0
-    kind_identity, leaf = receipt.rsplit('/', 1)
-    folder = _base(cache_root) / kind_identity
-    value = _read(folder / leaf) or {}
-    payload = value.get('file') if isinstance(value.get('file'), str) else None
+    try:
+        with cache_mutation(cache_root):
+            return _evict(cache_root, receipt, dry_run=dry_run, expected=expected)
+    except BlockingIOError:
+        return 0
+
+
+def _evict(cache_root, receipt, *, dry_run=False, expected=None):
+    namespace, leaf = receipt.rsplit('/', 1)
+    folder = _base(cache_root) / namespace
+    current = check(cache_root, receipt, patterns=CACHE_PATTERNS)[0]
+    if expected is not None and (current is None or _read(current[0]) != expected):
+        return 0
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    selected = {receipt}
+    selected.update(namespace + '/' + name for name in names if name.startswith(leaf[:38] + '-')
+                    and CACHE_PATTERNS[1].fullmatch(namespace + '/' + name))
+    payloads, retained = set(), set()
     freed = 0
-    with LOCK:
-        status, size = safe_remove(cache_root, receipt, dry_run=dry_run, patterns=CACHE_PATTERNS, folders=0)
-        freed += size
-        try:
-            names = sorted(os.listdir(folder))
-        except OSError:
-            names = []
-        for other in names:
-            if other.startswith(leaf[:38] + '-') and other.endswith('.previous.json'):
-                freed += safe_remove(cache_root, kind_identity + '/' + other, dry_run=dry_run,
-                                     patterns=CACHE_PATTERNS, folders=0)[1]
-        if payload and Path(payload).name == payload:
-            # Receipts share a payload when their inputs encode to the same bytes; it goes with the last one.
-            users = [other for other in names if other.endswith('.json') and not other.endswith('.previous.json')
-                     and other != leaf and (_read(folder / other) or {}).get('file') == payload]
-            if not users:
-                freed += safe_remove(cache_root, kind_identity + '/' + payload, dry_run=dry_run,
-                                     patterns=CACHE_PATTERNS, folders=1)[1]
+    for name in names:
+        relative = namespace + '/' + name
+        if not any(pattern.fullmatch(relative) for pattern in CACHE_PATTERNS[:2]):
+            continue
+        checked, reason = check(cache_root, relative, patterns=CACHE_PATTERNS)
+        if checked is None and reason != 'read-only':
+            continue
+        payload = cache_receipt_payload(relative, checked[0] if checked is not None else folder / name)
+        status = 'kept'
+        if relative in selected:
+            status, size = safe_remove(cache_root, relative, dry_run=dry_run, patterns=CACHE_PATTERNS, folders=2)
+            freed += size
+        if payload is not None:
+            if status in ('removed', 'would-remove'):
+                payloads.add(payload)
+            else:
+                retained.add(payload)
+    for payload in payloads - retained:
+        freed += safe_remove(cache_root, payload, dry_run=dry_run, patterns=CACHE_PATTERNS, folders=2)[1]
     return freed
 
 
@@ -694,37 +738,44 @@ def _tree_files(base):
     return found
 
 
+def cache_files(base, patterns=CACHE_FILES):
+    """Recognized files within an input-cache root, indexed by relative path."""
+    root = _base(base)
+    files = {}
+    for path, size in _tree_files(root):
+        name = path.relative_to(root).as_posix()
+        if any(pattern.fullmatch(name) for pattern in patterns):
+            files[name] = (path, size)
+    return files
+
+
+def _is_tuning_cache(base):
+    return base.name == 'conditioning' and base.parent.name == 'tuning'
+
+
 def cache_usage(roots):
-    rows = [row for base in roots if base is not None for row in _tree_files(base)]
+    rows = []
+    for base in roots:
+        if base is not None:
+            base = Path(base)
+            patterns = TUNING_CACHE_FILES if _is_tuning_cache(base) else CACHE_FILES
+            rows.extend(cache_files(base, patterns).values())
     return dict(files=len(rows), bytes=sum(size for _, size in rows))
 
 
 def clear_cache(roots):
-    """Remove every file in the given cache folders (their own files only, as ``_tree_files`` lists them) and then
-    the folders left empty. Returns the bytes removed."""
+    """Remove managed files from shared and legacy conditioning caches. Returns bytes removed."""
     freed = 0
-    with LOCK:
-        for base in roots:
-            if base is None:
-                continue
-            try:
-                root = _base(base)
-            except OSError:
-                continue
-            for path, size in _tree_files(base):
-                if not _inside(os.path.realpath(path), root):
-                    continue
-                try:
-                    os.unlink(path)
-                    freed += size
-                except OSError:
-                    continue
-            for parent, folders, _ in os.walk(root, topdown=False):
-                for leaf in folders:
-                    try:
-                        os.rmdir(os.path.join(parent, leaf))
-                    except OSError:
-                        pass
+    for base in roots:
+        if base is None or not Path(base).is_dir():
+            continue
+        base = Path(base)
+        tuning = _is_tuning_cache(base)
+        patterns = TUNING_CACHE_FILES if tuning else CACHE_FILES
+        shared = base.parents[1] / 'input-cache' if tuning else base
+        with cache_mutation(shared):
+            for name in cache_files(base, patterns):
+                freed += safe_remove(base, name, patterns=patterns, folders=2)[1]
     return freed
 
 
@@ -733,21 +784,25 @@ def purge_prompt_text(cache_root, tuning_root=None):
     from .input_cache import holds_prompt_text
     removed = 0
     base = Path(cache_root)
-    for receipt in sorted(base.glob('*/*/*.json')) if base.is_dir() else []:
-        relative = receipt.relative_to(base).as_posix()
-        if not _derived_ok(relative) or receipt.name.endswith('.previous.json'):
-            continue
-        value = _read(receipt) or {}
-        payload = value.get('file')
-        if isinstance(payload, str) and Path(payload).name == payload and holds_prompt_text(receipt.parent / payload):
-            evict(base, relative)
-            removed += 1
-    if tuning_root is not None:
-        for path in sorted(Path(tuning_root).glob('*/conditioning/*.pt')) + sorted(Path(tuning_root).glob('conditioning/*.pt')):
-            if re.fullmatch('[0-9a-f]{64}\\.pt', path.name) and holds_prompt_text(path):
-                relative = path.relative_to(tuning_root).as_posix()
-                status, _ = safe_remove(tuning_root, relative, patterns=[re.compile(re.escape(relative))], folders=0)
+    with cache_mutation(base):
+        files = cache_files(base)
+        plaintext = {name for name, (path, _) in files.items()
+                     if CACHE_PATTERNS[2].fullmatch(name) and holds_prompt_text(path)}
+        if plaintext:
+            for name, (path, _) in files.items():
+                if name.endswith('.json') and cache_receipt_payload(name, path) in plaintext:
+                    safe_remove(base, name, patterns=CACHE_PATTERNS, folders=2)
+            for name in plaintext:
+                status, _ = safe_remove(base, name, patterns=CACHE_PATTERNS, folders=2)
                 removed += status == 'removed'
+        if tuning_root is not None:
+            tuning = Path(tuning_root)
+            for path in list(tuning.glob('*/conditioning/*.pt')) + list(tuning.glob('conditioning/*.pt')):
+                if re.fullmatch(r'[0-9a-f]{64}\.pt', path.name) and holds_prompt_text(path):
+                    relative = path.relative_to(tuning).as_posix()
+                    patterns = (re.compile(re.escape(relative)),)
+                    status, _ = safe_remove(tuning, relative, patterns=patterns, folders=0)
+                    removed += status == 'removed'
     return removed
 
 
@@ -783,7 +838,10 @@ def clean_temp(*, folder=None, now=None, older=TEMP_AGE):
         if now - newest < older:
             continue
         with LOCK:
-            clear_cache([path])
+            root = _base(path)
+            for item, _ in files:
+                relative = item.relative_to(root).as_posix()
+                safe_remove(root, relative, patterns=(re.compile(re.escape(relative)),), folders=10)
             try:
                 os.rmdir(path)
                 removed += 1

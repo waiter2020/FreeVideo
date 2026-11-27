@@ -24,7 +24,11 @@ LIMIT = 96 * 1024
 def load_weights(path=None):
     """(k, weight[24][3k^2], bias[3k^2]); ValueError when malformed. Same file format as the video preview's."""
     from ..frame_preview import load_weights as load
-    return load(WEIGHTS if path is None else path)
+    if path is None:
+        from ..model_components import selected_file
+        from ..paths import data_root
+        path = selected_file(data_root(), 'h3-image-preview', WEIGHTS.name, WEIGHTS)
+    return load(path)
 
 
 def render(rows, velocity, sigma, latent_h, latent_w, weights, tensors=None, max_side=MAX_SIDE):

@@ -157,7 +157,7 @@ def run(args):
     from .macos_power import awake
     from .generate import child
     from .support_report import write as write_debug, code_identity
-    from .two_pass import plan
+    from .two_pass import checkpoint_sha256, plan
     require_native()
     from .preview import validate_flags, source as preview_source
     preview = getattr(args, 'preview', False) is True
@@ -251,6 +251,10 @@ def run(args):
             report['upscaled_preview'] = dict(output=refine_source['output'])
         env = environment(data_root(), dict(os.environ, PYTHONUNBUFFERED='1', OMP_NUM_THREADS='2', MKL_NUM_THREADS='2'))
         with runtime_lock() as descriptor, awake() as idle_sleep_prevented:
+            from .model_components import video_snapshot
+            report['model_components'] = video_snapshot(two_pass=sampling['enabled'], preview=preview)
+            if sampling.get('upscaler_sha256'):
+                sampling['upscaler_sha256'] = checkpoint_sha256()
             report['idle_sleep_prevented'] = idle_sleep_prevented
             env[LOCK_ENV] = str(descriptor)
             def execute(value, name, module='freevideo_engine.macos_generate'):

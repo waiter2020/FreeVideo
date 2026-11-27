@@ -274,9 +274,9 @@ def automatic_profile(args, canvas, *, stage, evidence, descriptor=None, environ
             if getattr(args, 'task', None):
                 planning_canvas['task'] = args.task
             if getattr(args, 'fast_mode', None) is not None:
-                # The planner puts the pixel head where the VAE decode was and counts two steps.
-                from .fast_tier import STEPS
-                planning_canvas.update(fast_mode=args.fast_mode, steps=STEPS)
+                # The planner counts the selected steps and reserves memory for the pixel head.
+                from .fast_tier import mode_spec
+                planning_canvas.update(fast_mode=args.fast_mode, steps=mode_spec(args.fast_mode)['steps'])
             if getattr(args, 'step_cache', None):
                 # The planner keeps the first-block cache only where it fits.
                 planning_canvas['step_cache'] = args.step_cache
@@ -585,8 +585,11 @@ def _run(args):
             raise ValueError('Choose --first-frame-reference or --continue-anchor, not both')
         first_frame = dict(requested=True, used=False)
     from .media_request import read as read_media, task_for, cache_key
-    from .original_audio import cli_media, prepare_request
+    from .original_audio import cli_media, original, prepare_request
     media = cli_media(args, read_media(getattr(args, 'media', None)))
+    from . import fast_tier
+    fast_mode = getattr(args, 'fast_mode', None)
+    fast_spec = fast_tier.request(args, original_audio=fast_mode is not None and original(media) is not None)
     upscale_work = None
     if getattr(args, 'upscale_from', None):
         # A finished video upscaled by one step: its own frames are the first pass
@@ -612,10 +615,6 @@ def _run(args):
         hide_tail = dict(requested=True, used=False, reason='original_audio')
     hide_tail_frames = hide_tail['frames'] if hide_tail and hide_tail['used'] else 0
     continuation = None
-    from . import fast_tier
-    fast_spec = fast_tier.request(args)
-    if fast_spec is not None and original_audio is not None:
-        raise ValueError('The fastest mode cannot be used with the original sound of a video')
     from .two_pass import validate_steps
     requested_steps = getattr(args, 'base_steps', None)
     refine_steps = getattr(args, 'refine_steps', 3)
@@ -836,7 +835,8 @@ def _run(args):
               'encoder_mode': 'native H3 encoder library child' if args.prompt_file else 'preencoded shared conditioning'}
     if fast_spec is not None:
         # From here on, so that a failure while preparing the adapter is reported as this mode's.
-        report['fast_tier'] = dict(mode=fast_spec['mode'], adapter_sha256=fast_spec['adapter_sha256'])
+        report['fast_tier'] = dict(mode=fast_spec['mode'], steps=fast_spec['steps'],
+                                   adapter_sha256=fast_spec['adapter_sha256'])
     if continuation is not None:
         report['continuation'] = continuation_summary(continuation, hide_tail_frames=hide_tail_frames)
         if 'tail' in continuation:
@@ -868,6 +868,9 @@ def _run(args):
     try:
         from .sleep_guard import awake
         with runtime_lock() as descriptor, awake():
+            from .model_components import video_snapshot
+            report['model_components'] = video_snapshot(fast=fast_spec['mode'] if fast_spec is not None else None,
+                                                        two_pass=two_pass, preview=preview)
             if active_loras:
                 lora_request = artifacts / 'lora-request.json'
                 lora_result = artifacts / 'lora-result.json'
@@ -1280,6 +1283,8 @@ def _run(args):
                 report['benchmark_limit'] = {'pytorch_allocator_bytes': request['allocator_limit_bytes'],
                     'scope': 'PyTorch CUDA allocator only; other CUDA allocations and whole-device usage are measured separately.'}
             request_path = temporary / 'video.json'
+            if report['model_components']:
+                request['model_components'] = report['model_components']
             resume_decode = resume_refine = None
             # An upscale reuses its preview's first pass unless a later attempt
             # retains a newer checkpoint, or the current inputs no longer match.

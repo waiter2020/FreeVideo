@@ -13,6 +13,8 @@ from statistics import median
 import threading
 import time
 
+from .fast_tier import MODES as FAST_MODES
+
 
 def positive(value):
     return type(value) in (float, int) and math.isfinite(value) and value > 0
@@ -86,6 +88,12 @@ def timing_record(report, gpu_uuid, system, *, stage_details=True):
         task=video.get('config', {}).get('task', 't2va'),
         adapters=bool(report.get('profile', {}).get('engine', {}).get('loras') or
                       report.get('lora') or video.get('config', {}).get('online_lora')))
+    fast_mode = video.get('config', {}).get('fast_tier')
+    if fast_mode in FAST_MODES:
+        record['fast_mode'] = fast_mode
+        # The required Pi-H3 adapter does not count as a user LoRA.
+        count = (report.get('lora') or {}).get('adapter_count')
+        record['adapters'] = type(count) is int and count > 1
     if cache is not None:
         # Rows without the key are plain runs, as every run before the caches was.
         record['step_cache'] = cache
@@ -182,7 +190,7 @@ def estimate(records, canvas, *, base_steps=8, refine_steps=3, two_pass=True, ta
     upscale_factor = upscale_factor if two_pass else 2
     candidates = []
     for row in records:
-        if (row.get('flow', 'full') != 'full' or row['task'] != task or row['adapters'] != adapters
+        if (row.get('flow', 'full') != 'full' or row.get('fast_mode') or row['task'] != task or row['adapters'] != adapters
                 or row['shape'] != {k: canvas[k] for k in ('width', 'height', 'frames')}):
             continue
         cache = row.get('step_cache')
@@ -297,7 +305,7 @@ def _stage_forecast(records, request, cold_flags, prior):
         # behind: its samples are kept only when the whole record computes.
         found, total = [], None
         try:
-            if not _believable(row):
+            if row.get('fast_mode') != request.get('fast_mode') or not _believable(row):
                 continue
             same_task = row.get('task') == request.get('task', 't2va')
             same_lora = row.get('adapters', False) == bool(request.get('lora_count'))

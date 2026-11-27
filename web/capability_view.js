@@ -99,7 +99,8 @@ export function capabilitySurface(grid, state) {
     if (grid?.version !== 1 || grid.status !== 'ready' || typeof grid.revision !== 'string' || !grid.machine?.system
             || /darwin|mac|apple/i.test(grid.machine.system)
             || !Array.isArray(grid.sizes) || !grid.sizes.length || !Array.isArray(grid.lengths)) return null;
-    const tier = gridTier(grid, state.steps, state.twoPass, state.refine, state.stepCache, state.upscale);
+    const tier = state.fastMode ? grid.fast_modes?.[state.fastMode] ?? (state.fastMode === 'fast2' ? grid.fast_mode : null)
+        : gridTier(grid, state.steps, state.twoPass, state.refine, state.stepCache, state.upscale);
     if (!tier || !Array.isArray(tier.estimate_seconds) || !Array.isArray(tier.max_seconds)) return null;
     const lengths = grid.lengths.map(l => l.seconds);
     if (!lengths.length || lengths.some((s, i) => !Number.isInteger(s) || s < 2 || (i && s <= lengths[i - 1]))) return null;
@@ -291,7 +292,7 @@ export function createCapabilityView({node, api, t, getState, onPick, onEstimate
         current(); hideHover();
     }
     function applyGrid(animate = false) {
-        if (grid?.version === 1 && grid.status === 'ready') onGrid?.(grid);
+        onGrid?.(grid?.version === 1 && grid.status === 'ready' ? grid : null);
         surface = capabilitySurface(grid, getState()); element.hidden = !surface && !estimating;
         entry.disabled = !surface;
         onEstimate?.();

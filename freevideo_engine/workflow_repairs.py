@@ -8,6 +8,7 @@ in those is a real error and keeps its message.
 import json
 import time
 
+from .fast_tier import MODES as FAST_MODES
 from .long_paths import io_path
 
 # name -> (kind, default, options); kept equal to the node's inputs by tests/test_workflow_repairs.py.
@@ -23,7 +24,7 @@ TOLERATED = {
     'hide_tail': ('bool', False, None),
     'step_cache': ('choice', 'none', ('none', 'easycache-av', 'fbcache')),
     'upscale_factor': ('choice', '2', ('2', '1.5', '1.2')),
-    'fast_mode': ('choice', 'none', ('none', 'fast2')),
+    'fast_mode': ('choice', 'none', ('none', *FAST_MODES)),
 }
 KEPT = 50
 

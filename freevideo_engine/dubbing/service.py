@@ -141,12 +141,11 @@ class Service:
         root, _ = self.installation()
         try:
             state = pack.status(root)
+            state['ready'] = pack.effective_ready(root, settle_builtin=wait)
         except (OSError, ValueError):
             return dict(ready=False, bytes=0, busy=self.busy(), backends=backends.names())
-        if wait and not state['ready']:
-            state['ready'] = pack.settle(root)
-            if state['ready']:
-                state['bytes'] = 0
+        if state['ready']:
+            state['bytes'] = 0
         # The voice change reads the lines with the speech model of the subtitle pack, so one download brings both.
         speech = self.speech_state()
         if speech and not speech[0]:
@@ -192,7 +191,7 @@ class Service:
             if not isinstance(value, dict) or value.get('accept_download') is not True:
                 raise ValueError('consent_required')
         else:
-            if not pack.settle(root):
+            if not pack.effective_ready(root, settle_builtin=True):
                 raise ValueError('model_missing')
             value = request(value)
             for item in [value.get('reference')] + [line.get('reference') for line in value['lines']]:
@@ -349,7 +348,7 @@ class Service:
             # Allowlisted metadata only: never the text, file names or paths.
             report = {key: item for key, item in self.state.items()
                       if key in ('phase', 'error', 'exception', 'timings', 'worker_returncode', 'backend',
-                                 'sample_rate', 'reference_seconds', 'loaded_seconds')}
+                                 'sample_rate', 'reference_seconds', 'loaded_seconds', 'model_components')}
             if self.state.get('lines'):
                 report['lines'] = [{key: row.get(key) for key in LINE_KEYS if key not in ('id', 'reference')}
                                    for row in self.state['lines']]
@@ -492,6 +491,7 @@ class Service:
             self.progress(dict(phase='complete', lines=lines, backend=result.get('backend'),
                                sample_rate=result.get('sample_rate'),
                                reference_seconds=result.get('reference_seconds'),
+                               model_components=result.get('model_components'),
                                worker_returncode=child.returncode))
         finally:
             if child.poll() is None:

@@ -114,6 +114,8 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
     const source = el('form', 'st-sub');
     const family = isImage ? el('select') : null;
     const component = isImage ? el('select') : null;
+    const hubPreset = isImage ? null : el('select');
+    const hubPresetLabel = isImage ? null : el('label', 'st-label');
     const formatNote = isImage ? el('p', 'st-p') : null;
     const encoderFiles = isImage ? el('div') : null;
     const familyNote = isImage ? el('p', 'st-p', t('Install a base picture model above before adding weights for that family.',
@@ -137,6 +139,17 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
         encoderFiles.hidden = true;
         source.append(familyLabel, componentLabel, formatNote, encoderFiles, familyNote);
     }
+    if (hubPreset) {
+        for (const [value, name] of [['', 'FreeVideo H3 (VDN)'], ['fl2va', 'ComfyUI H3 · FL2VA'], ['ref2va', 'ComfyUI H3 · Ref2VA']]) {
+            const option = el('option', '', name);
+            option.value = value;
+            hubPreset.append(option);
+        }
+        hubPreset.value = '';
+        hubPresetLabel.append(el('span', '', t('Video model and preset', '视频模型与预设')), field(hubPreset));
+        hubPresetLabel.hidden = true;
+        source.append(hubPresetLabel);
+    }
     const label = el('label', 'st-label');
     label.append(el('span', '', t('Hugging Face model', 'Hugging Face 模型')));
     const input = el('input');
@@ -156,13 +169,19 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
     localSource.hidden = true;
     const localTitle = el('div', 'st-rt');
     localTitle.append(el('b', '', t('Import from this computer', '从本地导入')));
+    const localPath = el('input');
+    localPath.type = 'text';
+    localPath.autocomplete = 'off';
+    localPath.spellcheck = false;
+    const localPathLabel = el('label', 'st-label');
+    localPathLabel.append(el('span', '', t('Path in a configured model folder', '已配置模型文件夹中的路径')), field(localPath, {mono: true}));
     const localActions = el('div', 'st-actions st-video-model-actions');
     const localFile = button(isImage ? t('Choose local file', '选择本地文件') : t('Choose cache manifest', '选择缓存清单'),
         {iconName: 'folder', kind: 'fill'});
     const localFolder = isImage ? null : button(t('Choose source weights folder', '选择原始权重目录'), {iconName: 'folder', kind: 'fill'});
     const comfyFolder = isImage ? null : button(t('Scan ComfyUI H3 folder', '扫描 ComfyUI H3 权重目录'), {iconName: 'search', kind: 'fill'});
     localActions.append(...[localFile, localFolder, comfyFolder].filter(Boolean));
-    localSource.append(localTitle, localActions);
+    localSource.append(localTitle, localPathLabel, localActions);
     const comfyResults = isImage ? null : el('div', 'st-video-model-results st-video-model-comfy');
     if (comfyResults) {
         comfyResults.hidden = true;
@@ -222,7 +241,9 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
     const busy = () => RUNNING.has(phase());
     const blocked = () => setupBusy || busy() || requesting;
     const localAvailable = () => view.local_available === true;
+    const nativePicker = () => view.native_picker !== false;
     const comfyAvailable = () => localAvailable() && view.comfy_h3_available !== false;
+    const comfyHubAvailable = () => view.comfy_h3_hf_available ?? (view.comfy_h3_available === true);
     const localTask = () => localModel(task()) || localModel(task().candidate);
     const activating = () => task().operation === 'activate';
     function installedModels() {
@@ -262,17 +283,31 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
     function controls() {
         const locked = blocked();
         const importing = locked || !componentReady();
+        const native = nativePicker();
+        const localBlocked = importing || (!native && !localPath.value.trim());
         localSource.hidden = !localAvailable();
-        localFile.disabled = importing;
-        if (localFolder) localFolder.disabled = importing;
+        localPathLabel.hidden = native;
+        localPath.disabled = importing;
+        localFile.disabled = localBlocked;
+        setText(localFile, isImage
+            ? native ? t('Choose local file', '选择本地文件') : t('Check local file', '检查本地文件')
+            : native ? t('Choose cache manifest', '选择缓存清单') : t('Check cache manifest', '检查缓存清单'));
+        if (localFolder) {
+            localFolder.disabled = localBlocked;
+            setText(localFolder, native ? t('Choose source weights folder', '选择原始权重目录') : t('Check source weights folder', '检查原始权重目录'));
+        }
         if (comfyFolder) {
             comfyFolder.hidden = !comfyAvailable();
-            comfyFolder.disabled = importing;
+            comfyFolder.disabled = localBlocked;
             comfyResults.hidden = !comfyAvailable() || !comfyResults.childElementCount;
             for (const entry of comfyRows) paintComfyRow(entry, importing);
         }
         search.disabled = inspect.disabled = importing || !input.value.trim();
         input.disabled = importing;
+        if (hubPreset) {
+            hubPresetLabel.hidden = !comfyHubAvailable();
+            hubPreset.disabled = importing;
+        }
         if (family) {
             family.disabled = locked || !families().some(modelReady);
             component.disabled = locked || !componentReady();
@@ -382,6 +417,28 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
         component.focus();
     }
 
+    function focusVideo() {
+        if (!hubPreset || !view.available) return false;
+        if (!requesting && hubPreset.value) { hubPreset.value = ''; resetSearch(); }
+        source.scrollIntoView?.({block: 'start'});
+        input.focus();
+        return true;
+    }
+
+    function focusComfy() {
+        if (!hubPreset || !view.available) return false;
+        if (comfyHubAvailable()) {
+            if (!requesting && !hubPreset.value) { hubPreset.value = 'fl2va'; resetSearch(); }
+            source.scrollIntoView?.({block: 'start'});
+            hubPreset.focus();
+            return true;
+        }
+        if (!comfyAvailable()) return false;
+        localSource.scrollIntoView?.({block: 'start'});
+        (nativePicker() ? comfyFolder : localPath).focus();
+        return true;
+    }
+
     function showCandidate(model) {
         candidate = model;
         accept.checked = false;
@@ -437,6 +494,10 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
         setupBusy = installerBusy;
         if (value && !requesting) {
             view = value;
+            if (hubPreset?.value && !comfyHubAvailable()) {
+                hubPreset.value = '';
+                resetSearch();
+            }
             heading.hidden = panel.hidden = !view.available;
             notice.hidden = !view.available || !notice.textContent;
             paintFamilies();
@@ -480,7 +541,8 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
 
     function applyChange(result) {
         const value = result[words.response];
-        if (value) update({local_available: view.local_available, comfy_h3_available: view.comfy_h3_available, ...value});
+        if (value) update({local_available: view.local_available, native_picker: view.native_picker, comfy_h3_available: view.comfy_h3_available,
+            comfy_h3_hf_available: view.comfy_h3_hf_available, ...value});
         refresh();
     }
 
@@ -499,24 +561,29 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
     }
     const check = reference => {
         showCandidate(null);
-        return run('inspect', {reference, ...selection()}, t('Checking model compatibility…', '正在检查模型兼容性…'),
+        const preset = hubPreset?.value;
+        const target = preset ? {preset} : selection();
+        return run('inspect', {reference, ...target}, t('Checking model compatibility…', '正在检查模型兼容性…'),
             result => reviewSelection(result.candidate));
     };
+    const localSelection = payload => nativePicker() ? payload : {...payload, path: localPath.value.trim()};
+    const localChecking = () => t('Checking local model files…', '正在校验本地模型文件…');
     const pickLocal = (payload, trigger) => {
         showCandidate(null);
-        return run('local-pick', payload,
-            t('Waiting for the Windows file picker…', '请在 Windows 文件选择窗口中操作…'),
+        return run('local-pick', localSelection(payload),
+            nativePicker() ? t('Waiting for the Windows file picker…', '请在 Windows 文件选择窗口中操作…') : localChecking(),
             result => reviewSelection(result.candidate, trigger));
     };
     localFile.onclick = () => pickLocal(family ? selection() : {selection: 'cache'}, localFile);
     if (localFolder) localFolder.onclick = () => pickLocal({selection: 'source'}, localFolder);
-    if (comfyFolder) comfyFolder.onclick = () => run('local-pick', {selection: 'comfy_h3'},
-        t('Choose a ComfyUI H3 weight folder in Windows…', '请在 Windows 中选择 ComfyUI H3 权重目录…'), result => {
+    if (comfyFolder) comfyFolder.onclick = () => run('local-pick', localSelection({selection: 'comfy_h3'}),
+        nativePicker() ? t('Choose a ComfyUI H3 weight folder in Windows…', '请在 Windows 中选择 ComfyUI H3 权重目录…') : localChecking(), result => {
             if (!Array.isArray(result.candidates)) return;
             showCandidate(null);
             applyChange(result);
             showComfyScan(result.candidates);
         });
+    localPath.oninput = controls;
 
     function comfySelection(entry) {
         const preset = entry.model.presets?.find(option => option.id === entry.select.value);
@@ -607,6 +674,7 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
         family.onchange = () => { paintComponents(); resetSearch(); };
         component.onchange = resetSearch;
     }
+    if (hubPreset) hubPreset.onchange = resetSearch;
     accept.onchange = controls;
     decline.onclick = () => { showCandidate(null); reviewTrigger.focus(); };
     const start = (model, fromLocal = false, id = model.id) => run(fromLocal ? 'local-copy' : 'install', {id, accepted: true, ...modelSelection(model)},
@@ -614,11 +682,11 @@ export function hfModelSettings({request, refresh, kind = 'video', onActivate}) 
             showCandidate(null);
             applyChange(result);
         });
-    install.onclick = () => { if (candidate && accept.checked) start(candidate); };
+    install.onclick = () => { if (candidate && accept.checked) return start(candidate); };
     copyModel.onclick = () => { if (localModel(candidate)) start(candidate, true); };
     pause.onclick = () => run('cancel', {}, activating() ? t('Cancelling verification…', '正在取消验证…') :
         localTask() ? t('Cancelling import…', '正在取消导入…') : t('Pausing download…', '正在暂停下载…'), applyChange);
     resume.onclick = () => activating() ? activate(task().candidate || task()) :
         start(task().candidate || task(), localTask(), task().selection_id ?? task().id);
-    return {elements, update, busy, focusComponent};
+    return {elements, update, busy, focusComponent, focusComfy, focusVideo};
 }

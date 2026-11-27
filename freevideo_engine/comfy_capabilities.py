@@ -307,13 +307,20 @@ def _usage_query(query):
     upscale = float(query.get('upscale_factor', defaults['upscale']))
     if not 1 <= steps <= 32 or not 0 <= refine <= 31 or cache not in STEP_CACHES or upscale not in (1.2, 1.5, 2):
         raise ValueError('Unsupported sampling profile.')
+    fast_mode = query.get('fast_mode')
+    two_pass = flag == '1'
+    if fast_mode not in (None, '', 'none'):
+        from .fast_tier import bridge_steps
+        two_pass, steps, refine = bridge_steps(fast_mode, step_cache=cache, upscale_factor=upscale)
+    else:
+        fast_mode = None
     if 'frames' in query and 'seconds' in query:
         raise ValueError('Specify frames or seconds, not both.')
     shape = geometry(width, height, frames=int(query['frames'])) if 'frames' in query else geometry(
         width, height, seconds=float(query.get('seconds', 10.125)))
     return dict(kind=kind, width=width, height=height, frames=shape['frames'], steps=steps,
-                two_pass=flag == '1', task=task, refine=refine, references=reference_parameters(references),
-                step_cache=cache, upscale=upscale)
+                two_pass=two_pass, task=task, refine=refine, references=reference_parameters(references),
+                step_cache=cache, upscale=upscale, **({'fast_mode': fast_mode} if fast_mode else {}))
 
 
 def _other_usage(params, failure=False):

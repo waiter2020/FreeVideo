@@ -172,7 +172,9 @@ class Service:
                     return
             from .worker import PRESTART_ENV
             env[PRESTART_ENV] = '1'
-            session = Worker(self.spawn(root, machine, env))
+            folder = assets.model_directory(root)
+            session = Worker(self.spawn(root, machine, env, folder=folder))
+            session.model_folder = folder
             with self.mutex:
                 admitted = ticket == self.prestart_ticket
                 if admitted:
@@ -246,9 +248,9 @@ class Service:
         return env
 
     @staticmethod
-    def spawn(root, machine, env, descriptor=None):
+    def spawn(root, machine, env, descriptor=None, *, folder=None):
         from .. import processes
-        command = processes.module_command('freevideo_engine.prompt_vlm.worker', assets.directory(root))
+        command = processes.module_command('freevideo_engine.prompt_vlm.worker', folder or assets.model_directory(root))
         command[0] = machine['comfy_python']
         return processes.popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace',
@@ -259,11 +261,11 @@ class Service:
         """wait=False answers from the cheap check, for callers on an event loop or UI thread."""
         root, machine = self.installation()
         try:
-            spec = assets.catalog()
+            spec = assets.model_details(root)
         except (OSError, ValueError):
             return dict(ready=False, model='', license='', bytes=0, busy=self.busy(), ram_bytes=self.ram_bytes(machine))
-        return dict(ready=assets.settle(root) if wait else assets.ready(root), model=spec['repo'], license=spec['license'],
-                    bytes=sum(row['bytes'] for row in spec['files']), busy=self.busy(),
+        return dict(ready=assets.settle(root) if wait else assets.ready(root), model=spec['model'], license=spec['license'],
+                    bytes=spec['bytes'], busy=self.busy(),
                     ram_bytes=self.ram_bytes(machine))
 
     def ram_bytes(self, machine):
@@ -352,6 +354,7 @@ class Service:
                 raise ValueError('busy')
             if action != 'install':
                 self.prestart_ticket += 1  # Invalidate pending imports before the worker starts.
+                value['_model_folder'] = assets.model_directory(root)
             self.key = secrets.token_urlsafe(24)
             self.stop.clear()
             self.result_expires = 0.
@@ -550,12 +553,12 @@ class Service:
                       if key in ('phase', 'error', 'exception', 'error_details', 'oom_source', 'timings', 'diagnostics',
                                  'resources', 'cleanup', 'worker_returncode', 'output_rejection', 'gpu_wait', 'check_counts')}
             try:
-                spec = assets.catalog()
+                spec = assets.model_details(root, value.get('_model_folder'))
             except (OSError, ValueError):
-                spec = dict(repo='', revision='')
+                spec = dict(model='', revision='')
             report.update(schema='freevideo.prompt-vlm', schema_version=2, action=action,
                           created_epoch=time.time(), report_id=uuid.uuid4().hex,
-                          elapsed_seconds=time.monotonic() - started, model=spec['repo'],
+                          elapsed_seconds=time.monotonic() - started, model=spec['model'],
                           model_revision=spec['revision'])
             self.report = report
             try:
@@ -702,6 +705,8 @@ class Service:
         elif self.release_readings:
             release = self.release_readings
         expired = None
+        stale = None
+        folder = value.get('_model_folder') or assets.model_directory(root)
         with self.mutex:
             session, self.prewarm = self.prewarm, None
             reason = self.prewarm_state.get('reason', 'none')
@@ -710,6 +715,9 @@ class Service:
             if session is not None and session.process.poll() is not None:
                 expired, session = session, None
                 reason = 'idle_exit' if expired.process.returncode == 0 else 'failed'
+            if session is not None and getattr(session, 'model_folder', folder) != folder:
+                stale, session = session, None
+                reason = 'model_changed'
             if session is not None:
                 session.claimed = True
                 self.active_worker = session
@@ -717,6 +725,8 @@ class Service:
         if expired is not None:
             expired.process.wait()
             expired.close()
+        if stale is not None:
+            self._cleanup_prestart(stale)
         prewarm = 'cold' if session is None else 'used' if session.ready.is_set() else 'waited'
         diagnostics = dict(prewarm=prewarm, prewarm_reason=reason if prewarm == 'cold' else 'none',
                            prewarm_age_seconds=time.monotonic() - session.started if session else None,
@@ -740,7 +750,7 @@ class Service:
             except (psutil.Error, OSError, RuntimeError):
                 footprint['prewarm_memory_unavailable'] = True
         else:
-            session = Worker(self.spawn(root, machine, env, descriptor))
+            session = Worker(self.spawn(root, machine, env, descriptor, folder=folder))
             self.active_worker = session
         child = session.process
         self.process = child
@@ -754,7 +764,7 @@ class Service:
         write_errors = []
         def submit():
             try:
-                request = dict(value)
+                request = {key: item for key, item in value.items() if key != '_model_folder'}
                 if prewarm != 'cold':
                     request['_prewarm'] = dict(sent_epoch=time.time())
                 child.stdin.write(json.dumps(request, ensure_ascii=True))

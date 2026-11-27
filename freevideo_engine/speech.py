@@ -169,7 +169,8 @@ def probabilities(samples, model_path):
     """float32 mono samples at 16 kHz → one speech probability per 512 samples (32 ms)."""
     import torch
     with _LOCK:
-        key = str(model_path)
+        path = Path(model_path)
+        key = (str(path), path.stat().st_mtime_ns)
         if key not in _LOADED:
             _LOADED.clear()
             _LOADED[key] = _model(onnx_weights(model_path))
@@ -248,7 +249,8 @@ def decode(path, cancelled=None):
 
 def _identity(path, model_path):
     stat, model = Path(path).stat(), Path(model_path).stat()
-    raw = json.dumps([str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns, model.st_size, VERSION])
+    raw = json.dumps([str(Path(path).resolve()), stat.st_size, stat.st_mtime_ns,
+                      str(Path(model_path).resolve()), model.st_size, model.st_mtime_ns, VERSION])
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 

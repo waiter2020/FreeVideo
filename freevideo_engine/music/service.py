@@ -129,7 +129,7 @@ def compose(out, caption, frames, *, seed, quiet=(), fps=24, server=None, cancel
     seconds = frames / fps
     if seconds > MAX_SECONDS:
         raise MusicError('invalid_request', 'too_long')
-    if not ready(machine['model_root']):
+    if not ready(machine['model_root']) and not _replacements_ready(root, machine['model_root']):
         phase('downloading', 0.)
         install(machine['model_root'], root, lambda fraction: phase('downloading', fraction), cancelled)
     if cancelled():
@@ -146,6 +146,13 @@ def compose(out, caption, frames, *, seed, quiet=(), fps=24, server=None, cancel
         with ACTIVE.lock:
             ACTIVE.process = None
             ACTIVE.idle.set()
+
+
+def _replacements_ready(root, model_root):
+    from ..image_gen import image_pack
+    from ..model_components_audio import MUSIC_SLOTS, music_paths, overrides
+    selected = overrides(root, MUSIC_SLOTS)
+    return bool(selected) and all(path.is_file() for path in music_paths(image_pack.base(model_root) / 'music', selected).values())
 
 
 def _run(out, caption, frames, seconds, seed, quiet, fps, server, cancelled, root, machine, avoid=()):

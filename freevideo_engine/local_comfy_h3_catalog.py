@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 import re
+import time
+from urllib.parse import quote
 
 from .adaln_assets import asset_path, digest, file_hash
 from .file_ops import publish
@@ -15,6 +17,8 @@ from .monitoring import load_ledger, save
 
 KIND = 'comfy_h3'
 PRESETS = {'fl2va': 'FL2VA', 'ref2va': 'Ref2VA'}
+COMPANION_REPO = 'Comfy-Org/MiniMax-H3'
+COMPANION_REVISION = 'f9ac699c76709e1407b6f1ed08bf61b4d42e8440'
 MAX_SCAN_FILES = 24
 MODEL_TARGET = 'assets/model.safetensors'
 OWNED = 'prepared/comfy-h3-assets'
@@ -30,7 +34,10 @@ FLOATS = {'F16', 'BF16', 'F32'}
 
 
 def _layout(row):
-    header = _tensor_header(row)
+    return checkpoint_format(_tensor_header(row))
+
+
+def checkpoint_format(header):
     root_shapes = {'video_patch_proj.weight': [5376, 96], 'audio_patch_proj.weight': [5376, 32],
                    'condition_proj.weight': [5376, 5120], 'final_layer.video_out.weight': [96, 5376],
                    'final_layer.audio_out.weight': [32, 5376]}
@@ -106,7 +113,7 @@ def _verified(root, role, checksum):
         return False
 
 
-def _publish(root, role, checksum, staged):
+def _publish(root, role, checksum, staged, *, repair=False):
     path = owned_asset(root, role, checksum)
     if not _verified(root, role, checksum):
         io_path(path.parent).mkdir(parents=True, exist_ok=True)
@@ -115,7 +122,15 @@ def _publish(root, role, checksum, staged):
         else:
             owned_stamp(root, path)
             if file_hash(io_path(path)) != checksum:
-                raise ValueError('A stored ComfyUI H3 file failed verification: ' + path.name)
+                if not repair or file_hash(io_path(staged)) != checksum:
+                    raise ValueError('A stored ComfyUI H3 file failed verification: ' + path.name)
+                retained = path.with_name(path.name + '.hash-rejected-' + str(time.time_ns()))
+                publish(path, retained)
+                try:
+                    publish(staged, path)
+                except BaseException:
+                    publish(retained, path)
+                    raise
         save(_asset_receipt(path), dict(sha256=checksum, fingerprint=owned_stamp(root, path)), durable=True)
     return path
 
@@ -198,12 +213,81 @@ def inspect(selection, preset, root, machine):
                 files=[model], dependencies=dependencies, reused_checkpoint=checksum)
 
 
-def stage(root, folder, candidate, progress):
+def inspect_file(source, preset, root, machine):
+    path = Path(source)
+    row = source_record(path, MODEL_TARGET, root=path.parent)
+    return inspect(dict(label=path.stem, format=_layout(row), compatible=True, files=[row]), preset, root, machine)
+
+
+def inspect_hub(reference, preset, root, machine, token):
+    from . import hf_video_catalog as hub
+    from .hf_image_catalog import _range, _reference
+    from .local_video_catalog import MAX_HEADER, tensor_layout
+
+    if preset not in PRESETS:
+        raise ValueError('Choose a native H3 workflow preset.')
+    repo, revision, prefix = _reference(reference, None, None)
+    info, entries = hub._info(repo, revision, token)
+    repo, revision = info['id'], info['sha']
+    exact = prefix in entries and prefix.lower().endswith('.safetensors')
+    if exact:
+        file = prefix
+    else:
+        path = (prefix or 'diffusion_models').rstrip('/') + '/'
+        choices = sorted(name for name in entries if name.startswith(path) and name.lower().endswith('.safetensors')
+                         and preset in Path(name).name.lower())
+        file = next((name for name in choices if Path(name).name == f'minimax_h3_{preset}_int8_convrot.safetensors'), None)
+        if file is None and len(choices) == 1:
+            file = choices[0]
+        if file is None:
+            raise ValueError('Paste the URL of the exact native H3 safetensors file.')
+    model = hub._row(repo, revision, entries, file, MODEL_TARGET)
+    if not model.get('sha256') or not 0 < model['bytes'] <= 120 * GIB:
+        raise ValueError('The native H3 checkpoint needs a pinned SHA-256 and supported file size.')
+    header_size = int.from_bytes(_range(model, 0, 7, token), 'little')
+    if not 2 <= header_size <= min(MAX_HEADER, model['bytes'] - 8):
+        raise ValueError('The selected native H3 checkpoint does not have a valid safetensors header.')
+    fmt = checkpoint_format(tensor_layout(_range(model, 8, 7 + header_size, token), model['bytes']))
+    dependencies, missing = {}, {}
+    files = [model]
+    for role, (name, size, checksum) in DEPENDENCIES.items():
+        if _verified(root, role, checksum):
+            continue
+        directory = Path(machine.get('comfy_root') or root) / 'models' / 'diffusion_models'
+        try:
+            dependencies[role] = _dependency_source(role, directory, root, machine)
+        except (OSError, ValueError, KeyError):
+            missing[role] = (name, size, checksum)
+    remote = {}
+    if missing:
+        _, companions = hub._info(COMPANION_REPO, COMPANION_REVISION, '')
+        for role, (name, size, checksum) in missing.items():
+            source = ('text_encoders/' if role == 'encoder' else 'vae/') + name
+            row = hub._row(COMPANION_REPO, COMPANION_REVISION, companions, source, 'assets/' + name)
+            if row.get('sha256') != checksum or row['bytes'] != size:
+                raise ValueError('The pinned native H3 companion cannot be verified: ' + name)
+            remote[role] = row['target']
+            files.append(row)
+    license_file = next((name for name in ('LICENSE', 'LICENSE.md') if name in entries), None)
+    if license_file:
+        files.append(hub._row(repo, revision, entries, license_file, 'LICENSE'))
+    identity = digest([repo.casefold(), revision, file, preset, model['sha256']])[:24]
+    total = sum(row['bytes'] for row in files)
+    copies = sum(_copy_bytes(row) for row in dependencies.values())
+    return dict(kind=KIND, backend=KIND, id=identity, model=preset, preset=preset, format=fmt,
+                label=Path(file).stem, repo=repo, revision=revision, path=file, compatible=True,
+                bytes=total, download_bytes=total, copy_bytes=copies, required_bytes=total + copies + MARGIN,
+                files=files, dependencies=dependencies, remote_dependencies=remote, license=hub._license(info),
+                license_url=f'{hub.HUB}/{repo}/blob/{revision}/{quote(license_file)}' if license_file
+                else f'{hub.HUB}/{repo}/tree/{revision}')
+
+
+def stage(root, folder, candidate, progress, *, repair=False):
     [(target, model_bytes, checksum)] = candidate['local_hashes']
     model = candidate['files'][0]
     if target != MODEL_TARGET or model_bytes != model['bytes']:
         raise ValueError('Invalid staged ComfyUI H3 checkpoint.')
-    path = _publish(root, 'checkpoint', checksum, asset_path(folder, MODEL_TARGET))
+    path = _publish(root, 'checkpoint', checksum, asset_path(folder, MODEL_TARGET), repair=repair)
     save(_source_index(root, model), dict(sha256=checksum), durable=True)
     assets = {'checkpoint': path.relative_to(root).as_posix()}
     copied = 0 if candidate['reused_checkpoint'] else model_bytes
@@ -216,11 +300,41 @@ def stage(root, folder, candidate, progress):
                 _link_encoder(root, folder, dependency)
             else:
                 copy_files(folder, [dependency], lambda done: progress(copied + done))
-            _publish(root, role, expected, asset_path(folder, dependency['target']))
+            _publish(root, role, expected, asset_path(folder, dependency['target']), repair=repair)
         if dependency is not None:
             copied += _copy_bytes(dependency)
         assets[role] = owned_asset(root, role, expected).relative_to(root).as_posix()
     progress(copied)
+    return assets
+
+
+def stage_hub(root, folder, candidate, progress, *, repair=False):
+    model = candidate['files'][0]
+    staged = asset_path(folder, MODEL_TARGET)
+    if not _verified(root, 'checkpoint', model['sha256']):
+        if _layout({'source': str(staged), 'target': MODEL_TARGET, 'bytes': io_path(staged).stat().st_size}) != candidate['format']:
+            raise ValueError('The downloaded native H3 checkpoint changed after inspection.')
+        _publish(root, 'checkpoint', model['sha256'], staged, repair=repair)
+    path = owned_asset(root, 'checkpoint', model['sha256'])
+    assets = {'checkpoint': path.relative_to(root).as_posix()}
+    copied = 0
+    for role, (_, _, checksum) in DEPENDENCIES.items():
+        if not _verified(root, role, checksum):
+            local = candidate['dependencies'].get(role)
+            if local is None:
+                remote = candidate['remote_dependencies'].get(role)
+                if remote is None:
+                    raise ValueError('A shared native H3 asset changed. Inspect the model again.')
+                staged = asset_path(folder, remote)
+            else:
+                staged = asset_path(folder, local['target'])
+                if local.get('link_existing'):
+                    _link_encoder(root, folder, local)
+                else:
+                    copy_files(folder, [local], lambda done: progress(copied + done))
+                copied += _copy_bytes(local)
+            _publish(root, role, checksum, staged, repair=repair)
+        assets[role] = owned_asset(root, role, checksum).relative_to(root).as_posix()
     return assets
 
 

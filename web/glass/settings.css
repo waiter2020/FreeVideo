@@ -333,6 +333,18 @@ dialog.fv-set :is(.st-video-model-results,.st-video-model-variants)>.st-row+.st-
 dialog.fv-set .st-facts.st-video-model-facts dd{white-space:normal;overflow-wrap:anywhere;font-size:var(--fv-fs-2)}
 dialog.fv-set .st-video-model-facts a{color:var(--fv-accent-ink);text-decoration:underline}
 
+dialog.fv-set .st-model-management{margin-bottom:var(--fv-sp-16)}
+dialog.fv-set .st-model-search + .st-card{margin-top:var(--fv-sp-12)}
+dialog.fv-set .st-model-job{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:var(--fv-sp-8)}
+dialog.fv-set .st-model-job>.st-bar{grid-column:1 / -1}
+dialog.fv-set .st-model-job-text{margin:0;overflow-wrap:anywhere}
+dialog.fv-set .st-model-detail .st-model-version{padding-inline:0}
+dialog.fv-set .st-model-detail .st-re{flex-wrap:wrap}
+dialog.fv-set .st-model-detail .st-actions{flex-wrap:wrap}
+dialog.fv-set :is(.st-model-import,.st-model-review){border-top:1px solid var(--fv-line);padding-top:var(--fv-sp-12);margin-top:var(--fv-sp-8)}
+dialog.fv-set .st-model-review>.st-p{overflow-wrap:anywhere}
+dialog.fv-set .st-model-review>a{color:var(--fv-accent-ink);text-decoration:underline}
+
 /* ── The plan sheet (g3, modal over the room) ── */
 dialog.fv-set .st-dlg{position:fixed;inset:0;margin:auto;width:min(600px,calc(100vw - 2 * var(--st-gap)));height:fit-content;max-height:calc(100dvh - 2 * var(--fv-sp-32));padding:0;
   flex-direction:column;border-radius:var(--fv-rad-console);overflow:hidden;color:var(--fv-fg);

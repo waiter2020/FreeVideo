@@ -351,12 +351,12 @@ ApplicationWindow {
         else backend.close()
     }
     function askExit() {
-        if (s.busy && !s.cleanup.busy) closePending = true
+        if ((s.busy && !s.cleanup.busy) || !!s.pi_h3_pack?.busy) closePending = true
         else exitAfterQuestions()
     }
     onClosing: function(event) {
         event.accepted = false
-        if (s.busy && !s.cleanup.busy) closePending = true
+        if ((s.busy && !s.cleanup.busy) || !!s.pi_h3_pack?.busy) closePending = true
         else askClose()
     }
 
@@ -1130,6 +1130,60 @@ ApplicationWindow {
                                 FText { objectName: "videoModelStatus"; text: t("Not installed", "未安装"); color: theme.muted; Layout.fillWidth: true }
                             }
                             FButton { objectName: "videoModelAdd"; text: t("Add", "添加"); enabled: !!s.can_add_video; onClicked: backend.action("add-video", false) }
+                        }
+                    }
+                    FCard {
+                        objectName: "piH3PackCard"; visible: !!s.pi_h3_pack?.visible
+                        Layout.fillWidth: true; padding: 22; spacing: 12
+                        FText { text: t("Video models", "视频模型"); font.weight: Font.DemiBold; Layout.fillWidth: true }
+                        Repeater {
+                            model: s.pi_h3_pack?.rows?.length || 0
+                            ColumnLayout {
+                                required property int index
+                                readonly property var modelData: s.pi_h3_pack.rows[index]
+                                objectName: "piH3PackRow-" + modelData.mode
+                                Layout.fillWidth: true; spacing: 8
+                                FDivider { visible: index > 0; Layout.bottomMargin: 4 }
+                                RowLayout {
+                                    Layout.fillWidth: true; spacing: 12
+                                    ColumnLayout {
+                                        Layout.fillWidth: true; spacing: 3
+                                        FText {
+                                            objectName: "piH3PackTitle-" + modelData.mode
+                                            text: modelData.title; font.weight: Font.DemiBold; Layout.fillWidth: true
+                                            Accessible.role: Accessible.StaticText; Accessible.name: text
+                                        }
+                                        FText {
+                                            objectName: "piH3PackStatus-" + modelData.mode
+                                            text: modelData.detail; color: modelData.error ? theme.danger : theme.muted
+                                            wrapMode: Text.WordWrap; Layout.fillWidth: true
+                                            Accessible.role: Accessible.StaticText; Accessible.name: modelData.title + " · " + text
+                                        }
+                                        FText {
+                                            objectName: "piH3PackSize-" + modelData.mode
+                                            text: modelData.bytes > 0 ? gb(modelData.bytes) : ""
+                                            visible: modelData.show_download && !!text; color: theme.muted
+                                            font.pixelSize: theme.micro; Layout.fillWidth: true
+                                        }
+                                    }
+                                    FButton {
+                                        objectName: "piH3PackDownload-" + modelData.mode
+                                        text: modelData.action; visible: modelData.show_download; enabled: modelData.can_start
+                                        Accessible.name: text + " " + modelData.title
+                                        onClicked: backend.piH3PackAction("install", modelData.mode, "")
+                                    }
+                                    FButton {
+                                        objectName: "piH3PackCancel-" + modelData.mode
+                                        text: t("Cancel", "取消"); visible: modelData.running; enabled: modelData.can_cancel; flat: true
+                                        Accessible.name: text + " " + modelData.title
+                                        onClicked: backend.piH3PackAction("cancel", modelData.mode, modelData.job_id)
+                                    }
+                                }
+                                FMeter {
+                                    objectName: "piH3PackProgress-" + modelData.mode
+                                    visible: modelData.running; active: visible; Layout.fillWidth: true; fraction: modelData.fraction
+                                }
+                            }
                         }
                     }
                     FCard {

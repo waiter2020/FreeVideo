@@ -77,7 +77,8 @@ def upscale_once(plan, channels):
         return None
     tick = time.perf_counter()
     video, _ = zero_latents(channels, plan['first'])
-    upscale(video, str(path), plan['upscale_target']['width'], plan['upscale_target']['height'])
+    upscale(video, str(path), plan['upscale_target']['width'], plan['upscale_target']['height'],
+            expected_sha256=plan.get('upscaler_sha256'))
     del video
     torch.cuda.empty_cache()
     return time.perf_counter() - tick

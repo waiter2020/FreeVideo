@@ -153,6 +153,18 @@ def ready(root=None, spec=None):
         return False
 
 
+def effective_ready(root, *, settle_builtin=False):
+    from ..model_components_audio import VOICE_SLOTS, overrides
+
+    selected = overrides(root, VOICE_SLOTS)
+    if not selected:
+        return settle(root) if settle_builtin else ready(root)
+    replacements = {name for files in selected.values() for name in files}
+    folder = directory(root)
+    ledger = _ledger(folder)
+    return _unpacked(root) and all(row['file'] in replacements or _intact(folder, row, ledger) for row in rows())
+
+
 def settle(root=None, spec=None):
     """Same answer, but a file that moved without a stamp (a copied folder) is hashed here once.
     For request handlers, never for a UI thread or under a lock."""
@@ -286,7 +298,7 @@ def wheels_folder(root=None):
     return base(root) / 'wheels'
 
 
-def install(root=None, progress=None, check=None):
+def install(root=None, progress=None, check=None, *, only=None, repair=False):
     """Download and verify the missing runtime wheels and model files, then unpack the runtime.
     Resumable; a file is kept only after its hash matched."""
     from .. import network, provision
@@ -307,7 +319,10 @@ def install(root=None, progress=None, check=None):
     ledger = _ledger(folder)
     cached = _ledger(cache)
     # A file without a stamp (a copied folder) is hashed once here and stamped.
-    todo = [row for row in rows(spec) if not provision.verified(folder / row['file'], row, ledger)]
+    entries = [row for row in rows(spec) if only is None or row['file'] in only]
+    if only is not None and set(only) != {row['file'] for row in entries}:
+        raise PackError('unknown_component')
+    todo = [row for row in entries if not provision.verified(folder / row['file'], row, ledger)]
     save(folder / LEDGER, ledger)
     fetch = [] if _unpacked(root, spec) else [row for row in wheels if not provision.verified(cache / row['file'], row, cached)]
     save(cache / LEDGER, cached)
@@ -352,7 +367,10 @@ def install(root=None, progress=None, check=None):
             progress(dict(phase='unpack', done=done, total=total))
             _unpack(root, wheels, check)
         for row in todo:
-            transfer(row, folder / row['file'], remote(spec, row), folder / LEDGER, ledger)
+            path = folder / row['file']
+            if repair and path.is_file() and not path.is_symlink():
+                network.retain_partial(path, 'hash-rejected')
+            transfer(row, path, remote(spec, row), folder / LEDGER, ledger)
     except PackError:
         raise
     except InterruptedError:

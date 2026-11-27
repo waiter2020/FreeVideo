@@ -143,7 +143,7 @@
 .fv-body[data-cols="3"] .fv-sc-section[data-section=advanced] .fvs-tray{margin-top:12px}
 .fv-studio.fv-create .fv-body[data-cols="3"] .fvs-chip.fv-reference-trigger.fv-sc-mention{width:auto;padding:0 var(--fv-sp-12,12px);gap:6px;font-size:var(--fv-fs-2,13px)}
 /* compact layout: only the prompt (taller) and the main button */
-.fv-body[data-cols="3"] .fv-controls[data-compact=true] .fv-sc-section:not([data-section=prompt]),.fv-body[data-cols="3"] .fv-controls[data-compact=true] :is(.fv-sc-tools,.fv-sc-section[data-section=prompt] .fvs-tray){display:none}
+.fv-body[data-cols="3"] .fv-controls[data-compact=true] .fv-sc-section:not([data-section=prompt],[data-section=model]),.fv-body[data-cols="3"] .fv-controls[data-compact=true] :is(.fv-sc-tools,.fv-sc-section[data-section=prompt] .fvs-tray){display:none}
 .fv-body[data-cols="3"] .fv-controls[data-compact=true] .fvs-console-prompt textarea{min-height:min(52vh,420px)}
 /* (position: the words only a screen reader reads are placed absolutely and stay inside the tray, in every look; as a window the tray is their place already) */
 .fv-body[data-cols="3"] .fv-sc-section .fvs-tray.fv-at>.fv-at-body{position:relative;grid-template-columns:minmax(0,1fr);row-gap:12px;padding-top:0;--fv-at-w:132px}

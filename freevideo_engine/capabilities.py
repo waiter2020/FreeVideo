@@ -10,6 +10,7 @@ import math
 from statistics import median
 from types import SimpleNamespace
 
+from . import fast_tier, tiers as quality_tiers
 from .effort_forecast import positive, stage_forecast
 from .geometry import geometry
 from .hardware import GiB, Hardware
@@ -18,7 +19,6 @@ from .media_request import TASKS
 from .policy import BLOCK_BYTES, ResourceBudgetError, choose
 from .stage_estimate import STAGES, _params, gpu_key, predict_prior
 from .two_pass import first_pass_policy, plan as sampling_plan
-from . import tiers as quality_tiers
 
 # Shared by all queries, including the default summary; parity with the editor
 # is checked in test_capabilities (JS uses positive Math.round, not bankers' rounding).
@@ -26,26 +26,16 @@ SIZE_PRESETS = (.5, .75, .98, 1., 1.5, 2.)
 TIERS = {name: (tier['steps'], tier['two_pass']) for name, tier in quality_tiers.TIERS.items()}
 PLAN_NAMES = {'-1': 'refused', '0': 'normal', '1': 'slower_streaming',
               '2': 'admitted_tight_memory'}
-# The fastest mode (fast_mode 'fast2'): one pass of two steps, decoded by the adapter's pixel head. It is not one of the
-# quality levels (`tiers`), so every reader of those keeps its four levels; `fast_mode` carries its own rows.
-FAST2_STEPS = 2
 
 
 def _fast_mode_listing(machine):
-    """Whether this machine is offered the fastest mode at all, and why not: the adapter replaces int8 layers and runs
-    on NVIDIA's CUDA build only."""
-    if machine['mac']:
-        return dict(listed=False, unlisted_reason='mac')
-    # Setup's vendor first, then the torch build (a ROCm build passes the capability check but saves no CUDA version);
-    # a record without either is told by the card's name. Older NVIDIA drivers name a card without the vendor
-    # ("GeForce RTX 3090"), so the name rules out AMD's words rather than asking for NVIDIA's.
-    name = str(machine['name']).casefold()
-    if (machine['cap'] is None or machine.get('vendor') not in (None, 'nvidia') or machine.get('cuda_missing')
-            or any(word in name for word in ('amd', 'radeon', 'instinct'))):
-        return dict(listed=False, unlisted_reason='gpu')
-    if machine['precision'] != 'int8':
-        return dict(listed=False, unlisted_reason='engine')
-    return dict(listed=True, unlisted_reason=None)
+    """Whether the installed model and GPU can run either pi-H3 adapter."""
+    reason = fast_tier.unsupported(mac=machine['mac'], gpu_name=machine['name'], vendor=machine.get('vendor'),
+                                  cuda_missing=machine['cap'] is None or machine.get('cuda_missing'),
+                                  precision=machine['precision'])
+    return dict(listed=reason is None, unlisted_reason=reason)
+
+
 # WholeVideoProgress.for_request starts an ordinary new-prompt request with
 # these flags. Unobserved encoder/model residency stays cold; compilation is
 # unknown (the prior's half-cold default), even later in the same session.
@@ -284,7 +274,7 @@ def _machine(machine, in_use=None):
                 # Setup's vendor, and whether the saved torch build is a CUDA one: a ROCm build saves no CUDA version.
                 # A record from before either was saved has neither, and is judged by the card's name as before.
                 vendor=str(machine['gpu_vendor']).casefold() if machine.get('gpu_vendor') else None,
-                cuda_missing='cuda_version' in observed and not observed['cuda_version'])
+                cuda_missing='cuda_version' in observed and observed['cuda_version'] in (None, '', 'None'))
 
 
 def _request(width, height, frames, steps, two_pass, task='t2va', refine=3,
@@ -292,7 +282,7 @@ def _request(width, height, frames, steps, two_pass, task='t2va', refine=3,
     """Scalar request shared by admission and offline, recorded-row reviews."""
     from .two_pass import render_canvas
     canvas = dict(render_canvas(geometry(width, height, frames=frames))[0], task=task, steps=steps)
-    if fast_mode == 'fast2':
+    if fast_mode in fast_tier.MODES:
         canvas['fast_mode'] = fast_mode
     if reference_rows is not None:
         if not valid_reference_rows(reference_rows):
@@ -403,7 +393,8 @@ def _calibration(machine, hardware, records, params, version):
         found = []
         for row in rows:
             try:
-                if row.get('flow', 'full') != 'full' or not positive(row.get('request_seconds')) or row['request_seconds'] > 1e6:
+                if (row.get('flow', 'full') != 'full' or row.get('fast_mode') or
+                        not positive(row.get('request_seconds')) or row['request_seconds'] > 1e6):
                     continue
                 shape = row['shape']
                 canvas = geometry(**{k: shape[k] for k in ('width', 'height', 'frames')})
@@ -443,6 +434,7 @@ def _whole_records(records, request, adapters):
     return [r for r in records if r.get('shape') == shape
             and r.get('flow', 'full') == 'full' and r.get('task') == request['task']
             and r.get('adapters', False) == adapters and r.get('two_pass') == request['two_pass']
+            and r.get('fast_mode') == request.get('fast_mode')
             and r.get('base_steps') == request['base_steps'] and r.get('refine_steps') == request['refine_steps']
             and r.get('step_cache') == request.get('step_cache')
             and r.get('upscale_factor', 2) == request.get('upscale_factor', 2)
@@ -535,19 +527,21 @@ def build(machine, records, *, aspect='16:9', size=None, task='t2va', adapters=F
 
     tiers = {name: rows(tier['steps'], tier['two_pass'], tier['step_cache'], tier['upscale'])
              for name, tier in quality_tiers.table(machine['mac']).items()}
-    fast = _fast_mode_listing(machine)
-    if fast['listed']:
-        fast.update(rows(FAST2_STEPS, False, None, 2, fast_mode='fast2'))
-        # Where a length does not fit: the light level instead, or the longest length that fits at this size (never
-        # shortened without being asked). The page shows the light level only where it fits that size and length.
-        fast['shorten_seconds'] = list(fast['max_seconds'])
-        fast['actions'] = [['use_light', 'shorten'] if longest is not None else ['use_light'] for longest in fast['max_seconds']]
+    listing = _fast_mode_listing(machine)
+    fast_modes = {}
+    for mode in fast_tier.MODES:
+        fast = dict(listing)
+        if fast['listed']:
+            fast.update(rows(fast_tier.mode_spec(mode)['steps'], False, None, 2, fast_mode=mode))
+            fast['shorten_seconds'] = list(fast['max_seconds'])
+            fast['actions'] = [['use_light', 'shorten'] if longest is not None else ['use_light'] for longest in fast['max_seconds']]
+        fast_modes[mode] = fast
     default = next((i for i, s in enumerate(sizes) if s['pixels'] == .98), 0)
     result = dict(version=1, status='ready',
                 machine=dict(gpu_name=machine['name'], vram_gib=machine['vram'] / GiB,
                              ram_gib=machine['ram'] / GiB, system=machine['system'],
                              compile_owed=machine['compile_owed']),
-                aspect=aspect, sizes=sizes, lengths=lengths, tiers=tiers, fast_mode=fast,
+                aspect=aspect, sizes=sizes, lengths=lengths, tiers=tiers, fast_mode=fast_modes['fast2'], fast_modes=fast_modes,
                 summary=dict(width=sizes[default]['width'], height=sizes[default]['height'], tier='light',
                              max_seconds=tiers['light']['max_seconds'][default],
                              max_frames=tiers['light']['max_frames'][default]),

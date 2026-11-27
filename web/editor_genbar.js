@@ -67,7 +67,7 @@ export function clipFinalization(job) {
 // After the next frame is on screen; a page nobody sees has no frame to wait for.
 const painted = () => typeof document === 'undefined' || document.visibilityState !== 'visible' || typeof requestAnimationFrame !== 'function' ? Promise.resolve()
     : new Promise(resolve => requestAnimationFrame(() => { const {port1, port2} = new MessageChannel(); port1.onmessage = () => { port1.close(); resolve(); }; port2.postMessage(null); }));
-export function createEditorGenbar(host, {state, t, actions, text = ''}) {
+export function createEditorGenbar(host, {state, t, actions, text = '', modelPicker = null}) {
     const hint = el('span', 'fv-ed-gen-hint'), note = el('span', 'fv-ed-gen-note');
     note.setAttribute('role', 'status'); note.hidden = true;
     const input = el('textarea', 'fv-ed-description'); input.rows = 1; input.value = text;
@@ -193,6 +193,8 @@ export function createEditorGenbar(host, {state, t, actions, text = ''}) {
     // Where a narrow English bar starts Generate on a line of its own (editor.css); hidden elsewhere.
     const lineBreak = el('span', 'fv-ed-genbar-break'); lineBreak.setAttribute('aria-hidden', 'true');
     generate.before(lineBreak); host.lang = pageLanguage();
+    const restoreModelPicker = () => { if (modelPicker && modelPicker.parentNode !== host) lineBreak.before(modelPicker); };
+    restoreModelPicker();
     // Dubbing: the lines of a chosen stretch of speech take the description box's place.
     const voice = actions.voice || null, voicePanel = voice ? createVoicePanel(host, voice.controller, {t}) : null;
     if (voicePanel) tray.append(voicePanel.element);
@@ -302,6 +304,7 @@ export function createEditorGenbar(host, {state, t, actions, text = ''}) {
         const narrated = !previewSelection && !musical && !!narration?.target(selection);
         const dub =!previewSelection && voice?.controller.target(selection) ? voice.controller.session(voice.controller.target(selection)) : null;
         const voiced = !!dub && dub.phase !== 'none' && dub.phase !== 'error';
+        if (modelPicker) modelPicker.hidden = musical || narrated || voiced;
         // Where dubbing is not available the sentence stands beside the description and Generate; it takes nothing away.
         const installing = !previewSelection && !!voice?.install?.visible(selection) && !voice.install.later?.();
         const selected = !!selection && (!!previewSelection || musical || narrated || (actions.supportedSelection?.() ?? true));
@@ -399,7 +402,7 @@ export function createEditorGenbar(host, {state, t, actions, text = ''}) {
         if (passMenu) {
             const pass = actions.passMode();
             // While a part generates, the bar shows its progress and Cancel; the choice waits for the next press.
-            passMenu.hidden = !pass || musical || narrated || voiced || generate.hidden || busy;
+            passMenu.hidden = !pass || actions.piModel?.() || musical || narrated || voiced || generate.hidden || busy;
             if (pass) passControl.sync(pass);
             quality = effortControl && actions.effort();
             // Without a quality state (a panel that has only the two-pass choice) the menu shows that choice alone.
@@ -572,11 +575,13 @@ export function createEditorGenbar(host, {state, t, actions, text = ''}) {
         commit();
         remember(input.value);
         const shown = input.value;
+        const selectedModel = actions.videoModel?.();
         let reason = '';
         try {
             // The press shows before any planning, however long that takes.
             await painted();
-            const result = actions.press ? await actions.press(input.value, allowEmpty || allowDownload ? {allowEmpty, allowDownload} : undefined) : await actions.generate({target: 'both', text: input.value});
+            const options = allowEmpty || allowDownload || selectedModel !== undefined ? {allowEmpty, allowDownload, selectedModel} : undefined;
+            const result = actions.press ? await actions.press(input.value, options) : await actions.generate({target: 'both', text: input.value});
             if (result?.confirmDownload) confirmDownload(result.confirmDownload);
             // Never over what the user typed meanwhile, for another part.
             if (result?.text != null && result.text !== input.value && input.value === shown) input.value = result.text;
@@ -586,7 +591,7 @@ export function createEditorGenbar(host, {state, t, actions, text = ''}) {
         }
         // A specific reason is said once; the planning limits are already shown above.
         catch (error) { const result = actions.error(error, 'generate'); reason = result?.say || '';
-            if (result?.say && !['chain_too_long', 'chain_part_too_short', 'chain_short_parts', 'chain_source_full', 'timed_text', 'middle_frames'].includes(result.reason)) say(result.say, false, ['Editor generation', '剪辑器生成']);
+            if (result?.say && !['chain_too_long', 'chain_part_too_short', 'chain_short_parts', 'chain_source_full', 'timed_text', 'middle_frames', 'pi_video'].includes(result.reason)) say(result.say, false, ['Editor generation', '剪辑器生成']);
             else if (!result && !note.textContent) { reason = t('Generation could not start. Try again; if it keeps failing, report the problem.', '生成没能开始。请重试；仍然失败时，请提交问题。'); say(reason, false, ['Editor generation', '剪辑器生成']); } }
         finally { pressing.delete(key); render(); }
         return reason;
@@ -685,7 +690,8 @@ export function createEditorGenbar(host, {state, t, actions, text = ''}) {
         event.preventDefault(); event.stopPropagation(); passMenu.open = false; passMenu.querySelector('summary').focus();
         return true;
     }
-    return {element: host, duration, firstFrame, tray, say, downloadFailure, commit, dismiss, press: allowEmpty => press(allowEmpty === true), canGenerate: () => !generate.disabled,
+    return {element: host, duration, firstFrame, tray, say, downloadFailure, commit, dismiss, restoreModelPicker,
+        press: allowEmpty => press(allowEmpty === true), canGenerate: () => !generate.disabled,
         service(value) {
             service = value;
             if (!value && note.contains(retryService)) { retryService.remove(); note.hidden = true; }

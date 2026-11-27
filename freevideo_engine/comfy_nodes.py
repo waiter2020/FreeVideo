@@ -8,6 +8,7 @@ from comfy_api.latest import ComfyExtension, InputImpl, io, ui
 from . import comfy_bridge, job_record, usage_habit, workflow_repairs
 from .comfy_continuation import node_frames, optional_text, part_steps, request_options
 from .default_prompt import DEFAULT_PROMPT
+from .fast_tier import MODES as FAST_MODES
 from .original_audio import audio_use_option
 
 References = io.Custom('FREEVIDEO_REFERENCES')
@@ -134,7 +135,7 @@ def step_cache_option(value):
     return {'step_cache': value} if value in STEP_CACHE_OPTIONS and value != 'none' else {}
 
 
-FAST_MODE_OPTIONS = ('none', 'fast2')
+FAST_MODE_OPTIONS = ('none', *FAST_MODES)
 def fast_mode_option(value):
     """Bridge keyword for the Fastest mode widget; a workflow without it or with 'none' adds nothing."""
     return {'fast_mode': value} if value in FAST_MODE_OPTIONS and value != 'none' else {}
@@ -232,7 +233,7 @@ class FreeVideoGenerate(io.ComfyNode):
                 io.Video.Input('native_h3_video', optional=True, advanced=True),
                 io.Combo.Input('fast_mode', display_name='Fastest mode', options=list(FAST_MODE_OPTIONS), default='none',
                     optional=True, advanced=True,
-                    tooltip='Uses an additional two-step model and skips the video decoder.'),
+                    tooltip='Uses the selected pi-H3 DWD adapter for two or four steps.'),
             ],
             outputs=[io.Video.Output('video'), io.String.Output('report', display_name='Report JSON')],
             hidden=[io.Hidden.unique_id, io.Hidden.prompt, io.Hidden.extra_pnginfo],
@@ -251,7 +252,8 @@ class FreeVideoGenerate(io.ComfyNode):
         if native_h3_error:
             return native_h3_error
         refine_from = optional_text(refine_from)
-        if optional_text(upscale_from):
+        upscale_from = optional_text(upscale_from)
+        if upscale_from and not fast_mode_option(fast_mode):
             # The bridge reads the finished video's own request; the node's widgets do not apply.
             return True if optional_text(upscale_to) in (None, '', '4k') else 'Upscale size must be empty or 4k'
         try:
@@ -259,7 +261,7 @@ class FreeVideoGenerate(io.ComfyNode):
             if fast_mode_option(fast_mode):
                 from .fast_tier import bridge_steps
                 two_pass, base_steps, refine_steps = bridge_steps(fast_mode, preview=preview is True,
-                    refine_from=refine_from, continue_from=options.get('continue_from'),
+                    refine_from=refine_from, continue_from=options.get('continue_from'), upscale_from=upscale_from,
                     step_cache=step_cache_option(step_cache).get('step_cache'),
                     upscale_factor=upscale_option(upscale_factor).get('upscale_factor', 2))
                 preview = False
@@ -277,7 +279,9 @@ class FreeVideoGenerate(io.ComfyNode):
                 validate_steps(base_steps, refine_steps, two_pass)
                 if preview and not two_pass:
                     return 'Preview first needs the faster second pass.'
-            comfy_bridge.installation()
+            _, machine = comfy_bridge.installation()
+            if fast_mode_option(fast_mode):
+                comfy_bridge.require_fast_model(machine, fast_mode)
         except (OSError, ValueError, KeyError) as error:
             from .continuation import UNSUPPORTED
             if str(error).startswith(UNSUPPORTED):
@@ -376,7 +380,8 @@ class FreeVideoGenerate(io.ComfyNode):
                                  options.get('continue_from'), chain is not None and chain.get('count', 1) > 1))
                 video = dict(width=width, height=height, seconds=seconds, steps=base_steps, two_pass=two_pass,
                              refine=refine_steps, step_cache=step_cache_option(step_cache).get('step_cache'),
-                             upscale=upscale_option(upscale_factor).get('upscale_factor', 2)) if plain else None
+                             upscale=upscale_option(upscale_factor).get('upscale_factor', 2),
+                             **fast_mode_option(fast_mode)) if plain else None
                 stop_image_for_generation(PromptServer.instance, video=video)
             except Exception as error:
                 logging.warning('[FreeVideo] Could not stop image generation before the video: %s', error)
@@ -680,6 +685,8 @@ class FreeVideoLoRA(io.ComfyNode):
     def define_schema(cls):
         import folder_paths
         names = [name for name in folder_paths.get_filename_list('loras') if name.lower().endswith('.safetensors')]
+        from .swap_lora import registered_names
+        names = registered_names(names)
         return io.Schema(node_id='FreeVideoLoRA', display_name='FreeVideo · LoRA', category='FreeVideo',
             description='FreeVideo needs no acceleration LoRA.',
             inputs=[io.Combo.Input('lora', options=[NO_LORA, *names]),
@@ -691,7 +698,8 @@ class FreeVideoLoRA(io.ComfyNode):
         if lora == NO_LORA:
             return io.NodeOutput(list(previous or []))
         import folder_paths
-        path = folder_paths.get_full_path_or_raise('loras', lora)
+        from .swap_lora import selected
+        path = selected(lora) or folder_paths.get_full_path_or_raise('loras', lora)
         if strength != 0:
             from .lora_check import require_usable
             require_usable(path)

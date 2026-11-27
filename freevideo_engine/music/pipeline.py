@@ -20,6 +20,8 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
+from ..model_components_audio import MUSIC_SLOTS, music_paths, overrides
+
 SAMPLE_RATE = 48000
 # Exact checkpoint keys omitted from the instrumental LM-hint path. Never use
 # prefix exemptions here: a renamed or newly added checkpoint tensor must fail.
@@ -101,30 +103,17 @@ def validate_keys(expected, actual, unused=frozenset()):
         raise RuntimeError(f"checkpoint_keys: missing={sorted(missing)}, unexpected={sorted(unexpected)}")
 
 
-def _files(root):
+def _files(root, assets=None):
     """Return {component: {checkpoint key: (file, key in file)}} after checking every file exists."""
-    paths = {
-        "lm": root / LM_NAME / "model.safetensors",
-        "text": root / "Qwen3-Embedding-0.6B/model.safetensors",
-        "vae": root / "vae/diffusion_pytorch_model.safetensors",
-    }
-    dit_files = [root / DIT_BF16_NAME / "transformer" / name for name in TRANSFORMER_SHARDS] + [
-        root / DIT_BF16_NAME / CONDITION_ENCODER_FILE, root / DIT_NAME / DETOKENIZER_SHARD]
-    required = list(paths.values()) + dit_files + [
-        root / DIT_NAME / "config.json", root / DIT_NAME / "silence_latent.pt",
-        root / LM_NAME / "config.json", root / LM_NAME / "tokenizer.json",
-        root / LM_NAME / "tokenizer_config.json",
-        root / "Qwen3-Embedding-0.6B/config.json",
-        root / "Qwen3-Embedding-0.6B/tokenizer.json",
-        root / "Qwen3-Embedding-0.6B/tokenizer_config.json",
-        root / "vae/config.json",
-    ]
-    missing = [str(p) for p in required if not p.is_file()]
+    assets = assets if assets is not None else music_paths(root, {})
+    paths = {"lm": LM_NAME + "/model.safetensors", "text": "Qwen3-Embedding-0.6B/model.safetensors",
+             "vae": "vae/diffusion_pytorch_model.safetensors"}
+    missing = [str(path) for path in assets.values() if not path.is_file()]
     if missing:
         raise FileNotFoundError("Missing model files: " + ", ".join(missing))
     # Files are data only: no model code is imported from the model folder.
-    weights = {kind: _weight_map(path) for kind, path in paths.items()}
-    weights["dit"] = _dit_weight_map(root)
+    weights = {kind: _weight_map(assets[name]) for kind, name in paths.items()}
+    weights["dit"] = _dit_weight_map(root, assets)
     return weights
 
 
@@ -141,22 +130,23 @@ def _bf16_key(part, key):
     return key if key in ("null_condition_emb", "silence_latent") else "encoder." + key
 
 
-def _dit_weight_map(root):
+def _dit_weight_map(root, assets=None):
     """BF16 decoder/encoder from the official BF16 copy; detokenizer and FSQ from the F32 shard.
 
     The F32 shard also holds some decoder/encoder tensors; those duplicate the
     BF16 copy and are never read.
     """
     weights = {}
-    sources = [("transformer", root / DIT_BF16_NAME / "transformer" / name) for name in TRANSFORMER_SHARDS]
-    sources += [("condition_encoder", root / DIT_BF16_NAME / CONDITION_ENCODER_FILE)]
+    assets = assets if assets is not None else music_paths(root, {})
+    sources = [("transformer", assets[DIT_BF16_NAME + "/transformer/" + name]) for name in TRANSFORMER_SHARDS]
+    sources += [("condition_encoder", assets[DIT_BF16_NAME + "/" + CONDITION_ENCODER_FILE])]
     for part, path in sources:
         for key in _weight_map(path):
             name = _bf16_key(part, key)
             if name in weights:
                 raise RuntimeError(f"checkpoint_keys: duplicated key {name}")
             weights[name] = (path, key)
-    for key, value in _weight_map(root / DIT_NAME / DETOKENIZER_SHARD).items():
+    for key, value in _weight_map(assets[DIT_NAME + "/" + DETOKENIZER_SHARD]).items():
         if key.split(".")[0] in ("detokenizer", "tokenizer"):
             if key in weights:
                 raise RuntimeError(f"checkpoint_keys: duplicated key {key}")
@@ -230,7 +220,7 @@ def _materialize(model, weight_map, device, dtype, quantize):
     return model
 
 
-def _construct(kind, root, weights, device, dtype):
+def _construct(kind, root, weights, device, dtype, *, paths=None):
     from diffusers import AutoencoderOobleck
     from transformers import Qwen3Config
     from .layers import build_qwen
@@ -238,8 +228,9 @@ def _construct(kind, root, weights, device, dtype):
     from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
     from .acestep_model import AceStepConfig, AceStepConditionGenerationModel, AudioCodeQuantizer
 
+    paths = paths if paths is not None else music_paths(root, {})
     if kind == "lm":
-        return build_qwen(path=root / LM_NAME, device=device, dtype=dtype)
+        return build_qwen(path=paths[LM_NAME + "/model.safetensors"].parent, device=device, dtype=dtype)
 
     # Ordinary components allocate directly on the target. Sequential DiT uses
     # meta parameters with real CPU constructor buffers; blocks materialize
@@ -249,15 +240,15 @@ def _construct(kind, root, weights, device, dtype):
         torch.set_default_dtype(dtype)
         with torch.device(device), no_init_weights():
             if kind == "dit":
-                config = AceStepConfig(**_read_json(root / DIT_NAME / "config.json"))
+                config = AceStepConfig(**_read_json(paths[DIT_NAME + "/config.json"]))
                 config._attn_implementation = "sdpa"
                 model = AceStepConditionGenerationModel(config)
             elif kind == "text":
-                config = Qwen3Config(**_read_json(root / "Qwen3-Embedding-0.6B/config.json"))
+                config = Qwen3Config(**_read_json(paths["Qwen3-Embedding-0.6B/config.json"]))
                 config._attn_implementation = "sdpa"
                 model = build_qwen(config, device=device, dtype=dtype)
             else:
-                model = AutoencoderOobleck.from_config(_read_json(root / "vae/config.json"))
+                model = AutoencoderOobleck.from_config(_read_json(paths["vae/config.json"]))
     finally:
         torch.set_default_dtype(previous_dtype)
     # Upstream constructs RoPE on CPU before moving to CUDA. Computing pow on
@@ -303,7 +294,8 @@ class MusicPipeline:
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
         self.root = Path(root)
-        self.weights = _files(self.root)
+        self.paths = music_paths(self.root, overrides(None, MUSIC_SLOTS))
+        self.weights = _files(self.root, self.paths)
         self.device = torch.device(device)
         self.dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         self.mode = mode
@@ -311,10 +303,10 @@ class MusicPipeline:
         self.components = {}
         self.component_bytes = {}
         self.tokenizer = PreTrainedTokenizerFast.from_pretrained(
-            str(self.root / "Qwen3-Embedding-0.6B"), local_files_only=True,
+            str(self.paths["Qwen3-Embedding-0.6B/tokenizer.json"].parent), local_files_only=True,
         )
         # weights_only disallows pickle globals; this is a tensor, not code.
-        self.silence = torch.load(self.root / DIT_NAME / "silence_latent.pt",
+        self.silence = torch.load(self.paths[DIT_NAME + "/silence_latent.pt"],
                                   map_location="cpu", weights_only=True)
         if not isinstance(self.silence, torch.Tensor) or self.silence.ndim != 3:
             raise RuntimeError("checkpoint_shape: silence_latent")
@@ -325,7 +317,7 @@ class MusicPipeline:
         from transformers import AutoTokenizer
         from .constrained_logits import MetadataConstrainedLogitsProcessor
         self.lm_tokenizer = AutoTokenizer.from_pretrained(
-            str(self.root / LM_NAME), local_files_only=True, trust_remote_code=False, use_fast=True,
+            str(self.paths[LM_NAME + "/tokenizer.json"].parent), local_files_only=True, trust_remote_code=False, use_fast=True,
         )
         self.lm_processor = MetadataConstrainedLogitsProcessor(self.lm_tokenizer, max_duration=600)
         self.stage_times = {}
@@ -344,7 +336,7 @@ class MusicPipeline:
                                 size += math.prod(source.get_slice(name).get_shape()) * element
                 self.component_bytes[kind] = size
             else:
-                component = _construct(kind, self.root, self.weights[kind], self.device, self.dtype)
+                component = _construct(kind, self.root, self.weights[kind], self.device, self.dtype, paths=self.paths)
                 self.component_bytes[kind] = sum(t.numel() * t.element_size() for t in component.parameters())
                 self.components[kind] = component
         self.decode_chunk_size = self._chunk_size()
@@ -365,7 +357,7 @@ class MusicPipeline:
             shape_only = kind == "dit" and self.mode in ("stream", "int8")
             target = "meta" if shape_only else self.device
             started = time.perf_counter()
-            self.components[kind] = _construct(kind, self.root, self.weights[kind], target, self.dtype)
+            self.components[kind] = _construct(kind, self.root, self.weights[kind], target, self.dtype, paths=self.paths)
             if shape_only and self.mode == "stream":
                 self._stream_dit(self.components[kind])
             elif shape_only:

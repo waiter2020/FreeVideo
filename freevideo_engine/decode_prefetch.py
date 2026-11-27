@@ -21,11 +21,11 @@ guard.
 import json
 import os
 import sys
-from pathlib import Path
 import threading
 import time
 
 from .encoder_prewarm import CHUNK, GiB, available_memory as host_available_memory, cgroup_memory
+from .model_components_generation import vae_directory
 
 
 def available_memory():
@@ -50,7 +50,7 @@ def available_memory():
 
 def decoder_ranges(base):
     plans = []
-    for path in sorted((Path(base) / 'vae').glob('*.safetensors')):
+    for path in sorted(vae_directory(base).glob('*.safetensors')):
         size = path.stat().st_size
         with path.open('rb') as file:
             length = int.from_bytes(file.read(8), 'little')

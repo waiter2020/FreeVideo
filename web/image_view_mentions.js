@@ -14,17 +14,19 @@ const SEPARATORS = {latin: '\\s', cjk: '\\s?'};
 export const PICTURE_WORDS = new RegExp(keywordSource('image', undefined, SEPARATORS) + '(\\d+)', 'gu');
 export const SUBJECT_WORDS = new RegExp(keywordSource('subject', undefined, SEPARATORS) + '(\\d+)', 'gu');
 const TOKEN = new RegExp('@' + keywordSource('image') + ' ?(\\d+|\\?)', 'gu');
+const NUMBERED_PICTURE = new RegExp(`${TOKEN.source}|<Picture (\\d+)>|${PICTURE_WORDS.source}|\\b[Pp]icture\\s(\\d+)`, 'gu');
 export const mentionText = n => t('@Image{n}', '@图{n}', { n });
 
 // The text with each mention renumbered from `before` (the pictures as they were) to `after` (as they are now).
 // `caret` is moved by the change in length of the mentions in front of it.
 export function renumberMentions(text, before, after, caret = 0) {
     let shift = 0;
-    const next = text.replace(TOKEN, (whole, n, at) => {
+    const next = text.replace(NUMBERED_PICTURE, (whole, tagged, engine, localized, legacy, at) => {
+        const n = tagged ?? engine ?? localized ?? legacy;
         if (n === '?') return whole;
         const picture = before[Number(n) - 1];
         const k = picture ? after.indexOf(picture) : -1;
-        const written = whole.replace(/(\d+)$/, k >= 0 ? String(k + 1) : '?');
+        const written = k < 0 && !tagged ? mentionText('?') : whole.replace(/\d+(?=>?$)/, k >= 0 ? String(k + 1) : '?');
         if (at + whole.length <= caret) shift += written.length - whole.length;
         return written;
     });
@@ -33,7 +35,10 @@ export function renumberMentions(text, before, after, caret = 0) {
 
 // What the engine reads: each mention as <Picture N>; one without a picture is left out.
 export function mentionsToEngine(text, count) {
-    return text.replace(TOKEN, (_, n) => n !== '?' && Number(n) >= 1 && Number(n) <= count ? `<Picture ${n}>` : '').replace(/ {2,}/g, ' ');
+    return text.replace(NUMBERED_PICTURE, (_, tagged, engine, localized, legacy) => {
+        const n = Number(tagged ?? engine ?? localized ?? legacy);
+        return n >= 1 && n <= count ? `<Picture ${n}>` : '';
+    }).replace(/ {2,}/g, ' ');
 }
 // A picture drawn as a sketch (image editor's sketch mode) is a plan of the picture, not its look: each thing drawn in it
 // is the real thing it stands for, in the same place, size, direction and pose. The words sent around it are plain

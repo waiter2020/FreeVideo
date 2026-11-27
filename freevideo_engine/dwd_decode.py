@@ -12,6 +12,7 @@ import time
 import torch
 
 from .decode import DECODE_LABELS
+from .model_components_generation import vae_directory
 
 # The phase the pixel head reports while it runs.
 HEAD_LABEL = 'Drawing the video'
@@ -52,7 +53,7 @@ def pixels_to_file(features, grid, audio_latents, out_path, *, base, adapter, ar
     audio_vae = None
     if model_cache is not None:
         from .resident_models import key, file_identity
-        audio_key = key([file_identity(path) for path in sorted((Path(base) / 'audio_vae').iterdir()) if path.is_file()])
+        audio_key = key([file_identity(path) for path in sorted(vae_directory(base, audio=True).iterdir()) if path.is_file()])
         audio_vae = model_cache.take('audio_vae', audio_key)
         model_cache.make_room('audio_vae', 1 * 2**30, model=audio_vae, ram_need=256 * 2**20)
     audio_cache_hit = audio_vae is not None

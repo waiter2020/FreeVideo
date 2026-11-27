@@ -120,7 +120,7 @@ def first_canvas(target, scale):
 
 
 def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3, staged=False, scale=2,
-         schedule=None):
+         schedule=None, installation_root=None):
     """Align the smaller canvas, lift, center-crop, then refine at the target.
 
     Odd multiples of 32 need up to 32 extra pixels before the latent crop.
@@ -188,7 +188,7 @@ def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3, sta
                   refine_steps=refine_steps, total_steps=base_steps + refine_steps,
                   first=first, second=shape, upscale_target=lift, crop=crop,
                   restart_seed_offset=1,
-                  upscaler_sha256=UPSCALER['sha256'] if upscaling else None,
+                  upscaler_sha256=checkpoint_sha256(installation_root) if upscaling else None,
                   audio_policy='first_pass_preserved_with_audio_clock_conditioning',
                   reason='%d steps on a smaller canvas, learned latent upscale, then the DMD schedule tail (%d steps).' % (base_steps, refine_steps))
     if default:
@@ -332,15 +332,37 @@ def placement_tokens(canvas):
     return stage_tokens(canvas)['engine']
 
 
-def checkpoint_path():
+def default_checkpoint(root=None, model_directory=None):
     """Setup's copy; an older lazily downloaded copy under models/ stays in use."""
-    from .paths import installed_model_root, model_root
-    installed = installed_model_root() / 'latent_upscaler' / Path(UPSCALER['file']).name
-    earlier = model_root() / 'latent_upscaler' / installed.name
+    from .paths import data_root, installed_model_root, model_root
+    if root is None or Path(root) == data_root():
+        models = model_root()
+        model_directory = model_directory or installed_model_root()
+    else:
+        models = Path(root) / 'models'
+        if model_directory is None:
+            import json
+            try:
+                model_directory = json.loads((Path(root) / 'machine.json').read_bytes())['model_root']
+            except (OSError, ValueError, KeyError, TypeError):
+                model_directory = models
+    installed = Path(model_directory) / 'latent_upscaler' / Path(UPSCALER['file']).name
+    earlier = models / 'latent_upscaler' / installed.name
     return earlier if earlier.is_file() and not installed.is_file() else installed
 
 
-def verified_checkpoint(path):
+def checkpoint_path(root=None, model_directory=None):
+    from .model_components import selected_file
+    default = default_checkpoint(root, model_directory)
+    return selected_file(root, 'h3-latent-upscaler', default.name, default)
+
+
+def checkpoint_sha256(root=None):
+    from .model_components import selected_hash
+    return selected_hash(root, 'h3-latent-upscaler', Path(UPSCALER['file']).name) or UPSCALER['sha256']
+
+
+def verified_checkpoint(path, root=None):
     """Whether setup's ledger of verified models covers this copy, unchanged since.
 
     Every two-pass request used to hash the whole checkpoint before sampling:
@@ -351,7 +373,7 @@ def verified_checkpoint(path):
     """
     from .paths import data_root
     import json
-    ledger = data_root() / 'verified-models.json'
+    ledger = Path(root or data_root()) / 'verified-models.json'
     try:
         stamps = json.loads(ledger.read_text(encoding='utf-8')) if ledger.is_file() else {}
     except (OSError, ValueError):
@@ -373,16 +395,18 @@ def verified_checkpoint(path):
     return True
 
 
-def ensure_checkpoint():
+def ensure_checkpoint(*, root=None, model_directory=None, progress=None, check=None, use_selected=True):
     """Also upgrade existing installations lazily; retain invalid local files."""
     from .network import download, model_urls
-    path = checkpoint_path()
-    if verified_checkpoint(path):
+    default = default_checkpoint(root, model_directory)
+    path = checkpoint_path(root, model_directory) if use_selected else default
+    if path != default or verified_checkpoint(path, root):
         return path
     network = {}
     from .paths import data_root
     import json
-    machine = data_root() / 'machine.json'
+    root = Path(root or data_root())
+    machine = root / 'machine.json'
     if machine.is_file():
         installed = json.loads(machine.read_text(encoding='utf-8'))
         network = installed.get('network', {}) or {}
@@ -390,9 +414,14 @@ def ensure_checkpoint():
             setup = Path(installed['setup_run']) / 'plan.json'
             if setup.is_file():
                 network = json.loads(setup.read_text(encoding='utf-8')).get('network', {}) or {}
-    network.setdefault('download_settings_path', str(data_root() / 'download-settings.json'))
+    network.setdefault('download_settings_path', str(root / 'download-settings.json'))
     network.setdefault('sources', {}).setdefault('models', [{'id': 'official'}, {'id': 'hf-mirror'}])
-    download(model_urls(network, UPSCALER), path, UPSCALER['sha256'],
+    if check is not None:
+        network['resource_check'] = check
+    def report(done, total, speed, **_):
+        if progress is not None:
+            progress(done, total)
+    download(model_urls(network, UPSCALER), path, UPSCALER['sha256'], report if progress else None,
              network=network, size=UPSCALER['bytes'], category='models')
     return path
 

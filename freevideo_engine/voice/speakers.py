@@ -21,14 +21,21 @@ def embedder(root=None, why=None):
     why = why if why is not None else []
     try:
         from ..dubbing import pack
-        file = pack.directory(root) / 'campplus.onnx'
+        from ..model_components import selected_file
+        from ..paths import data_root
+        source = root if root is not None else data_root()
+        file = pack.directory(source) / 'campplus.onnx'
+        if root is None and not file.is_file():
+            file = pack.directory() / 'campplus.onnx'
+            source = None
+        file = selected_file(root, 'campplus', 'campplus.onnx', file)
         if not file.is_file():
             why.append('model_missing')
             return None
         try:
             import onnxruntime
         except ImportError:
-            if not pack.activate(pack.runtime_path(root)):
+            if not pack.activate(pack.runtime_path(source)):
                 why.append('runtime_missing')
                 return None
             import onnxruntime

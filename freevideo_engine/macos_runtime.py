@@ -54,16 +54,22 @@ def upscale_latents(video, sampling, base, backend, checkpoint=None):
     """The same learned upscale/crop for resident and process-separated stages."""
     import torch
     from .latent_upscale import upscale
+    from .model_components import selected_file
     from .two_pass import UPSCALER, crop_latents
     from .sampling_progress import elapsed_reports
     event = dict(event='latent_upscale', completed_steps=sampling['base_steps'], total=sampling['total_steps'])
     print(json.dumps(event), flush=True)
-    checkpoint = checkpoint or Path(base).parent / 'latent_upscaler' / Path(UPSCALER['file']).name
+    expected_sha256 = sampling.get('upscaler_sha256')
+    if checkpoint is None:
+        default = Path(base).parent / 'latent_upscaler' / Path(UPSCALER['file']).name
+        checkpoint = (selected_file(None, 'h3-latent-upscaler', default.name, default)
+                      if expected_sha256 else default)
     tick = time.monotonic()
     with torch.no_grad(), elapsed_reports(lambda report: print(json.dumps(report), flush=True), event):
         backend.empty_cache()
         lifted, stats = upscale(video.to('mps'), checkpoint,
-            sampling['upscale_target']['width'], sampling['upscale_target']['height'], memory_saving=True)
+            sampling['upscale_target']['width'], sampling['upscale_target']['height'], memory_saving=True,
+            expected_sha256=expected_sha256)
         lifted = crop_latents(lifted, sampling).cpu()
         backend.synchronize()
         backend.empty_cache()

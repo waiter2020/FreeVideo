@@ -12,8 +12,9 @@ import {referenceInputs, mediaRows} from '../web/prompt_references.js';
 import {expandCast} from '../web/cast_mention.js';
 import {cleanAudioUse, cleanOptionalPrompt, cleanOptionalWidgets, optionalInputValue} from '../web/optional_inputs.js';
 import {hfModelSettings} from '../web/settings_video_models.js';
+import {createModelManagement} from '../web/model_management.js';
 import {t as settingsText} from '../web/settings_words.js';
-import {activeVideoModel, applyVideoModelSnapshot} from '../web/video_model.js';
+import {activeVideoModel, applyVideoModelSnapshot, piVideoModeInfo, piVideoProblem} from '../web/video_model.js';
 
 class Element {
     constructor(tag) {
@@ -23,7 +24,8 @@ class Element {
             const enabled = force ?? !classes.has(name);
             if (enabled) classes.add(name); else classes.delete(name);
             return enabled;
-        }, add(...names) { names.forEach(name => classes.add(name)); }, contains: name => classes.has(name)};
+        }, add(...names) { names.forEach(name => classes.add(name)); }, remove(...names) { names.forEach(name => classes.delete(name)); },
+            contains: name => classes.has(name)};
         this.style = {setProperty(name, value) { this[name] = value; }}; this.offsetHeight = 66;
     }
     append(...children) { for (const child of children) { child.parentNode = this; this.children.push(child); } }
@@ -789,6 +791,87 @@ class SettingsElement extends Element {
     }
 }
 
+test('model library reviews, installs and switches a replacement without removing the active version', async () => {
+    const original = globalThis.document;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    try {
+        const builtin = {id: 'builtin', label: 'Qwen3-VL-4B-Instruct', source: 'official', installed: true, actions: ['verify', 'reset']};
+        const version = {id: 'custom', label: 'Local Qwen', source: 'local', bytes: 20000, installed: true};
+        const model = {id: 'prompt-vlm', group: 'prompt', label: 'Prompt enhancement', label_zh: '提示词增强',
+            supported: true, default: builtin, active_id: builtin.id, versions: [], actions: ['install', 'activate', 'verify', 'reset', 'remove']};
+        const initial = {slots: [model], local_available: true};
+        const installed = {...initial, slots: [{...model, versions: [version]}]};
+        const calls = [];
+        const panel = createModelManagement({t: settingsText, refresh() {}, request: async (action, payload) => {
+            assert.equal(action, 'model-component');
+            calls.push(payload);
+            switch (payload.action) {
+                case 'inspect': return {candidate: {...version, id: 'candidate-1', files: ['weights.safetensors']}};
+                case 'install': return {model_components: {...initial, job: {id: 'work', slot: model.id, phase: 'copying', done_bytes: 1, total_bytes: 2}}};
+                case 'activate': return {model_components: {...installed, slots: [{...installed.slots[0], active_id: version.id}]}};
+                case 'reset': return {model_components: installed};
+                case 'remove': return {model_components: initial};
+                default: assert.fail(`Unexpected operation ${payload.action}`);
+            }
+        }});
+        const all = () => descendants(panel.element);
+        const control = (en, zh) => all().find(node => node.className === 'st-btn-t' && node.textContent === settingsText(en, zh))?.parentNode;
+        const confirm = () => {
+            const check = all().find(node => node.type === 'checkbox');
+            check.checked = true;
+            check.onchange();
+        };
+        panel.update(initial);
+        control('Manage', '管理').onclick();
+        const path = all().find(node => node.type === 'text');
+        path.value = 'D:/models/prompt';
+        path.oninput();
+        await all().find(node => node.tag === 'form').onsubmit({preventDefault() {}});
+        assert.deepEqual(calls.at(-1), {action: 'inspect', slot: model.id, source: 'local', path: path.value});
+        assert.equal(control('Install version', '安装版本').disabled, true);
+        confirm();
+        await control('Install version', '安装版本').onclick();
+        assert.deepEqual(calls.at(-1), {action: 'install', slot: model.id, candidate_id: 'candidate-1', accepted: true});
+        assert.equal(panel.busy(), true);
+        assert.equal(all().find(node => node.attributes.role === 'progressbar').attributes['aria-valuenow'], '50');
+        panel.update(installed);
+        await control('Use model', '使用模型').onclick();
+        assert.deepEqual(calls.at(-1), {action: 'activate', slot: model.id, version_id: 'custom'});
+        assert.equal(control('Remove', '移除'), undefined);
+        await control('Restore default', '恢复默认').onclick();
+        assert.deepEqual(calls.at(-1), {action: 'reset', slot: model.id});
+        control('Remove', '移除').onclick();
+        assert.equal(control('Remove version', '移除版本').disabled, true);
+        confirm();
+        await control('Remove version', '移除版本').onclick();
+        assert.deepEqual(calls.at(-1), {action: 'remove', slot: model.id, version_id: 'custom', accepted: true});
+        assert.equal(control('Use model', '使用模型'), undefined);
+    } finally { globalThis.document = original; }
+});
+
+test('model library filters by checkpoint and delegates existing controls', () => {
+    const original = globalThis.document;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    try {
+        let managed;
+        const video = {id: 'video-h3', group: 'video', label: 'Video checkpoint', manager: 'video', default: {id: 'builtin', label: 'MiniMax H3'}};
+        const speech = {id: 'voice-clone', group: 'audio', label: 'Voice cloning', default: {id: 'builtin', label: 'CosyVoice3'}};
+        const panel = createModelManagement({t: settingsText, onManage: item => { managed = item; }});
+        panel.update({slots: [video, speech], local_available: false});
+        const all = () => descendants(panel.element);
+        const search = all().find(node => node.type === 'search');
+        search.value = 'minimax';
+        search.oninput();
+        assert.deepEqual(all().filter(node => node.dataset.modelToggle).map(node => node.dataset.modelToggle), [video.id]);
+        all().find(node => node.dataset.modelToggle === video.id).onclick();
+        assert.equal(managed, video);
+        search.value = 'cosyvoice';
+        search.oninput();
+        all().find(node => node.dataset.modelToggle === speech.id).onclick();
+        assert.equal(all().some(node => node.tag === 'form'), false);
+    } finally { globalThis.document = original; }
+});
+
 test('local H3 scans keep checkpoints independent through review, copy and activation', async () => {
     const original = globalThis.document;
     globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
@@ -854,6 +937,82 @@ test('local H3 scans keep checkpoints independent through review, copy and activ
         assert.equal(activated, imported);
         assert.ok(refreshes >= 3);
         assert.equal(one.querySelectorAll('button')[0].hidden, true);
+    } finally { globalThis.document = original; }
+});
+
+test('video replacement accepts a configured path when the local native picker is unavailable', async () => {
+    const original = globalThis.document;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    try {
+        const requests = [];
+        const panel = hfModelSettings({refresh() {}, request: async (action, payload) => {
+            requests.push([action, payload]);
+            return {};
+        }});
+        const all = () => panel.elements.flatMap(descendants);
+        const control = (en, zh) => all().find(node => node.textContent === settingsText(en, zh))?.parentNode;
+        panel.update({available: true, local_available: true, native_picker: false});
+        const manifest = control('Check cache manifest', '检查缓存清单');
+        const pathLabel = control('Path in a configured model folder', '已配置模型文件夹中的路径');
+        const path = pathLabel.querySelectorAll('input')[0];
+        assert.equal(pathLabel.hidden, false);
+        assert.equal(manifest.disabled, true);
+        path.value = ' /models/prepare/manifest.json ';
+        path.oninput();
+        assert.equal(manifest.disabled, false);
+        await manifest.onclick();
+        assert.deepEqual(requests.at(-1), ['video-model-local-pick', {selection: 'cache', path: '/models/prepare/manifest.json'}]);
+    } finally { globalThis.document = original; }
+});
+
+test('video Hub import checks the selected native H3 preset and can still inspect VDN models', async () => {
+    const original = globalThis.document;
+    globalThis.document = {createElement: tag => new SettingsElement(tag), createElementNS: (_, tag) => new SettingsElement(tag)};
+    try {
+        const stock = {id: 'official', label: 'MiniMax H3'};
+        const repo = 'catalog/mini-max-h3', reference = `https://huggingface.co/${repo}`;
+        const remote = {id: 'remote-h3', kind: 'comfy_h3', preset: 'ref2va', label: 'Native checkpoint', repo,
+            revision: 'f'.repeat(40), license: 'apache-2.0', format: 'comfy_int8', compatible: true, bytes: 2 ** 30};
+        const initial = {available: true, local_available: true, comfy_h3_available: true, installed: [stock], active: stock};
+        const installed = {...initial, installed: [stock, remote]};
+        const calls = [];
+        let active;
+        const panel = hfModelSettings({refresh() {}, onActivate: value => { active = value; }, request: async (action, payload) => {
+            calls.push([action, payload]);
+            if (action === 'video-model-inspect') return {candidate: payload.preset ? remote : null};
+            if (action === 'video-model-install') return {video_models: installed};
+            if (action === 'video-model-activate') return {video_models: {...installed, active: remote}};
+            assert.fail(`Unexpected action ${action}`);
+        }});
+        const all = () => panel.elements.flatMap(descendants);
+        const find = (en, zh) => all().find(node => node.textContent === settingsText(en, zh));
+        const check = () => find('Check compatibility', '检查兼容性').parentNode.onclick();
+        panel.update(initial);
+        const input = find('Hugging Face model', 'Hugging Face 模型').parentNode.querySelectorAll('input')[0];
+        const preset = find('Video model and preset', '视频模型与预设').parentNode.querySelectorAll('select')[0];
+        input.value = reference;
+        input.oninput();
+        assert.equal(preset.value, '');
+        await check();
+        assert.deepEqual(calls.at(-1), ['video-model-inspect', {reference}]);
+        assert.equal(panel.focusComfy(), true);
+        assert.equal(preset.value, 'fl2va');
+        preset.value = 'ref2va';
+        preset.onchange();
+        await check();
+        assert.deepEqual(calls.at(-1), ['video-model-inspect', {reference, preset: 'ref2va'}]);
+        const agreement = all().find(node => node.type === 'checkbox');
+        const download = find('Download model', '下载模型').parentNode;
+        assert.equal(download.disabled, true);
+        agreement.checked = true;
+        agreement.onchange();
+        await download.onclick();
+        assert.deepEqual(calls.at(-1), ['video-model-install', {id: remote.id, accepted: true}]);
+        await find('Use model', '使用模型').parentNode.onclick();
+        assert.deepEqual(calls.at(-1), ['video-model-activate', {id: remote.id}]);
+        assert.equal(active, remote);
+        assert.equal(panel.focusVideo(), true);
+        assert.equal(preset.value, '');
     } finally { globalThis.document = original; }
 });
 
@@ -943,4 +1102,37 @@ test('Studio applies native H3 defaults to a frozen request without changing its
     assert.equal(graph.output[1].inputs.two_pass, true);
     const vdn = applyVideoModelSnapshot(structuredClone(graph), 1, {id: 'official'});
     assert.deepEqual(vdn.output[1].inputs, {...inputs, native_h3_preset: ''});
+});
+
+test('A pi-H3 snapshot fixes the adapter and steps without changing the draft or the active model', () => {
+    const active = {id: 'managed-ref', kind: 'comfy_h3'};
+    const draft = {output: {1: {class_type: 'FreeVideoGenerate', inputs: {
+        text: 'Rain', base_steps: 8, refine_steps: 6, two_pass: true, preview: true, step_cache: 'fbcache', upscale_factor: '1.5',
+    }}}};
+    for (const [model, steps] of [['fast2', 2], ['fast4', 4]]) {
+        const submitted = applyVideoModelSnapshot(structuredClone(draft), 1, active, model);
+        assert.deepEqual(submitted.output[1].inputs, {text: 'Rain', base_steps: steps, refine_steps: 3,
+            two_pass: false, preview: false, step_cache: 'none', upscale_factor: '2', fast_mode: model, native_h3_preset: ''});
+        assert.equal(cleanOptionalPrompt(submitted).output[1].inputs.fast_mode, model);
+    }
+    const current = applyVideoModelSnapshot(structuredClone(draft), 1, {id: 'official'}, 'current');
+    assert.deepEqual(current.output[1].inputs, {...draft.output[1].inputs, fast_mode: 'none', native_h3_preset: ''});
+    const linked = structuredClone(draft); linked.output[1].inputs.base_steps = ['2', 0];
+    assert.throws(() => applyVideoModelSnapshot(linked, 1, active, 'fast4'), /pi_h3_linked_sampling/);
+    assert.deepEqual(linked.output[1].inputs.base_steps, ['2', 0]);
+});
+
+test('Video admission reads the model-specific duration and preserves legacy fast2 grids', () => {
+    const grid = {status: 'ready', sizes: [{width: 384, height: 256}], lengths: [{frames: 39}, {frames: 56}],
+        fast_mode: {listed: true, max_frames: [56], plan: [[0, 0]], estimate_seconds: [[5, 6]]},
+        fast_modes: {fast4: {listed: true, max_frames: [39], plan: [[0, -1]], estimate_seconds: [[9, null]]}}};
+    const info = (mode, frames) => piVideoModeInfo(grid, mode, 384, 256, frames);
+    const en = en => en;
+    assert.equal(info('fast2', 56).seconds, 6);
+    assert.equal(info('fast4', 39).seconds, 9);
+    assert.match(piVideoProblem(en, 'fast4', {info: info('fast4', 56), frames: 56}), /exceed/);
+    assert.equal(piVideoProblem(en, 'fast2', {info: info('fast2', 56), frames: 56}), '');
+    assert.match(piVideoProblem(en, 'fast4', {multipart: true}), /independent clip/);
+    assert.match(piVideoProblem(en, 'fast4', {originalAudio: true}), /own audio/);
+    assert.match(piVideoProblem(en, 'fast4', {info: {known: true, listed: false, reason: 'gpu'}}), /NVIDIA/);
 });

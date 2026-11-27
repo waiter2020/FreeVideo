@@ -43,6 +43,10 @@ def catalog():
     return json.loads(Path(__file__).with_name('depth_reference_model.json').read_text(encoding='utf-8'))
 
 
+def default_weight(root):
+    return Path(root) / 'models' / 'depth-anything-v2-small' / catalog()['files'][0]['file']
+
+
 def canonical_json(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
 
@@ -85,8 +89,8 @@ def ensure_weights(root, emit, check):
     from .prompt_vlm.assets import remote
     spec = catalog()
     row = spec['files'][0]
-    folder = Path(root) / 'models' / 'depth-anything-v2-small'
-    path = folder / row['file']
+    path = default_weight(root)
+    folder = path.parent
     with _lock(folder / 'download.lock', check):
         if path.is_file() and path.stat().st_size == row['bytes'] and digest(path, check) == row['sha256']:
             return path
@@ -170,7 +174,7 @@ def inspect_video(path, check=lambda: None, *, depth=False):
                 frames=len(pts), pts=pts, time_base=str(time_base), rotation=rotation)
 
 
-def identity(source, video, device, check=lambda: None, mode='depth'):
+def identity(source, video, device, check=lambda: None, mode='depth', weight_sha256=None):
     output = {key: video[key] for key in ('width', 'height', 'fps_num', 'fps_den', 'frames')}
     output.update(fit='source', audio=False)
     pix_fmt = 'yuv420p' if video['width'] % 2 == video['height'] % 2 == 0 else 'yuv444p'
@@ -185,7 +189,9 @@ def identity(source, video, device, check=lambda: None, mode='depth'):
                         encoder='gray-to-'+pix_fmt+'/libx264/crf16/threads2', runtime_backend='numpy-cpu'))
     spec = catalog()
     return dict(source_sha256=digest(source, check), source_size=Path(source).stat().st_size,
-                model_id=spec['repo'], weights_sha256=spec['files'][0]['sha256'], source_commit=spec['source_commit'],
+                model_id=spec['repo'] if weight_sha256 is None else 'Custom Depth Anything V2 Small',
+                weights_sha256=weight_sha256 or spec['files'][0]['sha256'],
+                source_commit=spec['source_commit'] if weight_sha256 is None else None,
                 code_version=CODE_VERSION, preprocessing_version=PREPROCESSING_VERSION,
                 selection_spec=dict(source_start_pts=video['pts'][0], source_end_pts=video['pts'][-1],
                                     source_time_base=video['time_base'], crop_rect=None,
@@ -505,7 +511,11 @@ def _convert(request, emit, check):
     emit(phase='depth_reference', detail='Checking depth reference cache')
     initial_hash, initial_size = digest(source, check), source.stat().st_size
     video = inspect_video(source, check)
-    config = identity(source, video, device, check)
+    from .model_components import selected_file
+    default = default_weight(root)
+    selected = selected_file(root, 'depth-reference', default.name, default)
+    weight_sha256 = None if selected == default else digest(selected, check)
+    config = identity(source, video, device, check, weight_sha256=weight_sha256)
     if config['source_sha256'] != initial_hash or config['source_size'] != initial_size:
         raise ValueError('Source video changed during depth inspection')
     cache = Path(request['cache'])
@@ -515,7 +525,7 @@ def _convert(request, emit, check):
         found = _cached(target, config, check)
         if found is not None:
             return dict(path=str(found), cache_hit=True, key=key)
-        weights = ensure_weights(root, emit, check)
+        weights = ensure_weights(root, emit, check) if selected == default else selected
         # Parent releases idle Comfy/engine/encoder models only on a cache miss.
         emit(phase=STAGE, stage=STAGE, label='Extracting depth from the reference video',
              done=0, total=video['frames'], unit='frames', detail='Loading depth model', waiting_for_device=True)

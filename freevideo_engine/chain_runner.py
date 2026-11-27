@@ -430,8 +430,29 @@ class ChainRunner:
             raise ChainShortPartsTooMany(parts, limit)
 
     def create(self, payload):
+        from . import fast_tier
         from .lora_triggers import apply_chain_triggers
         record = store.validate(payload)
+        prompt = record['snapshot']['prompt']
+        mode = prompt[record['node']]['inputs'].get('fast_mode')
+        if mode in fast_tier.MODES:
+            from .audio_use_request import graph_audio
+            blocks = record['blocks']
+            original_audio = bool(payload.get('original_audio') or graph_audio(prompt, record['node']))
+            try:
+                fast_tier.bridge_steps(mode, parts=len(blocks),
+                    continue_from=any(row['after'] or row['before'] for row in blocks),
+                    original_audio=original_audio)
+            except ValueError as failure:
+                raise chain_plan.PlanError('fast_mode_incompatible', str(failure),
+                    error_zh='pi-H3 仅支持单段新生成，并生成自己的音轨。请调整片段或切换视频模型。') from failure
+            from .comfy_bridge import installation, require_fast_model
+            try:
+                _, machine = installation()
+                require_fast_model(machine, mode)
+            except FileNotFoundError as failure:
+                raise chain_plan.PlanError('fast_mode_files_missing', str(failure),
+                    error_zh='所选 pi-H3 的文件缺失或未通过校验。请安装或重试下载。') from failure
         apply_chain_triggers(record)
         with self.lock:
             # Before anything is written or queued: a refused chain leaves every record and file as it was.

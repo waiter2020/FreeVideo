@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import lru_cache
 
-# Unshifted points of a schedule that is not the uniform grid (fast_tier.RAW_GRID).
+# Unshifted points of a schedule that is not the uniform grid.
 _RAW_GRID = ContextVar('freevideo_raw_grid', default=None)
 
 

@@ -158,7 +158,7 @@ def _engine_version():
 WORK_LABELS = {'encoding': 'Encoding text and images', 'load': 'Preparing offloaded weight storage',
                'decode': 'Decoding the video'}
 WORK_UNITS = ('bytes', 'layers', 'files', 'frames', 'chunks')
-_DECODE_PARTS = {'Loading video VAE': 'vae_load', 'Decoding the video': 'video_decode',
+_DECODE_PARTS = {'Loading video VAE': 'vae_load', 'Decoding the video': 'video_decode', 'Drawing the video': 'video_decode',
                  'Loading and decoding audio': 'audio_load_decode', 'Saving MP4 and audio': 'encode'}
 
 
@@ -169,7 +169,7 @@ class WholeVideoProgress:
     set the initial ruler; only real events release its count ceiling. Replay
     options control smoothing, silent countdown and the ceiling's time shares.
     """
-    DECODE_PARTS = tuple(_DECODE_PARTS.values())
+    DECODE_PARTS = tuple(dict.fromkeys(_DECODE_PARTS.values()))
 
     def __init__(self, clock=time.perf_counter, *, hardware=None, request=None,
                  cold_flags=None, records=(), rate=.005, smoothing='track',
@@ -244,7 +244,7 @@ class WholeVideoProgress:
     @classmethod
     def for_request(cls, machine, canvas, output_directory, *, base_steps=8,
                     refine_steps=3, two_pass=True, preview=False, upscale=False,
-                    encoder_prewarm=None, options=None, step_cache=None, upscale_factor=2):
+                    encoder_prewarm=None, options=None, step_cache=None, upscale_factor=2, fast_mode=None):
         import platform
         from .effort_forecast import start_context
         started, opened = time.perf_counter(), time.monotonic()
@@ -259,7 +259,7 @@ class WholeVideoProgress:
         tracker = cls(hardware=hardware, records=records, cold_flags=flags, started=started,
                       request=dict(canvas, base_steps=base_steps, refine_steps=refine_steps,
                                    two_pass=two_pass, flow='upscale' if upscale else 'preview' if preview else 'full',
-                                   step_cache=step_cache, upscale_factor=upscale_factor),
+                                   step_cache=step_cache, upscale_factor=upscale_factor, fast_mode=fast_mode),
                       **(options or {}))
         tracker.history = (output_directory, machine, opened)
         return tracker
@@ -927,6 +927,16 @@ def installation(source=None, environ=None):
     return root, plain_data(machine)
 
 
+def require_fast_model(machine, mode, *, environ=None):
+    """Check hardware and verify the requested adapter before enqueueing or starting it."""
+    from . import fast_tier
+    if machine.get('video_model') is False:
+        raise ValueError('Install the FreeVideo INT8 video model to use pi-H3.')
+    env = os.environ if environ is None else environ
+    fast_tier.validate_setup(fast_tier.setup_reason(machine))
+    return fast_tier.files(env.get('FREEVIDEO_MODEL_ROOT') or machine['model_root'], mode, engine_root=machine.get('root'))
+
+
 def validate_request(prompt, width, height, seconds, seed, *, continue_from=None, frames=None,
                      two_pass=True, preview=False, refine_from=None, media=None, original_audio=False,
                      allow_empty_prompt=False):
@@ -1402,6 +1412,9 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
     if upscale_to not in (None, '', '4k'):
         raise ValueError('Upscale size must be 4k')
     if upscale_to:
+        if fast_mode is not None:
+            from .fast_tier import bridge_steps
+            bridge_steps(fast_mode, upscale_from=upscale_to)
         # The 4K size: a small frame-wise model, not a generation (frame_upscale).
         return upscale_frames(upscale_from, output_directory, source=source, environ=environ, progress=progress,
                               interrupted=interrupted, release_models=release_models, comfy_metadata=comfy_metadata)
@@ -1488,8 +1501,6 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
                               allow_empty_prompt=allow_empty_prompt)
     source = Path(source or source_root()).resolve()
     root, machine = installation(source, environ)
-    if fast_mode is not None and machine.get('device_backend') == 'mps':
-        raise ValueError('The fastest mode is not available on Mac')
     continuation = None
 
     def check_ending():
@@ -1534,6 +1545,8 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
         except ValueError:
             pass
     environment = engine_environment(root, source, environ)
+    if fast_mode is not None:
+        require_fast_model(machine, fast_mode, environ=environment)
     environment.update(FREEVIDEO_HOME=str(root), PYTHONPATH=str(source), PYTHONUNBUFFERED='1',
                        PYTHONUTF8='1', PYTHONIOENCODING='utf-8', NO_COLOR='1', FREEVIDEO_UI_EVENTS='1')
     for key in ('FREEVIDEO_RUNTIME_LOCK_FD', 'FREEVIDEO_RUNTIME_LOCK_HANDLE'):
@@ -1561,8 +1574,6 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
     if step_cache is not None:
         command += ['--step-cache', step_cache]
     if fast_mode is not None:
-        # The folder the engine process resolves (paths.installed_model_root). Before queueing, so a missing file is named at once.
-        fast_tier.files(environment.get('FREEVIDEO_MODEL_ROOT') or machine['model_root'])
         command += ['--fast-mode', fast_mode]
     if two_pass and upscale_factor != 2:
         command += ['--upscale-factor', '%g' % upscale_factor]
@@ -1617,7 +1628,7 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
         whole_progress = WholeVideoProgress.for_request(machine, canvas, output_directory,
             base_steps=base_steps, refine_steps=refine_steps, two_pass=two_pass,
             preview=preview, upscale=bool(upscale), encoder_prewarm=state['encoder_prewarm'],
-            step_cache=None if upscale else step_cache, upscale_factor=upscale_factor)
+            step_cache=None if upscale else step_cache, upscale_factor=upscale_factor, fast_mode=fast_mode)
     except Exception:
         # A progress estimate cannot prevent generation, even without its parameters.
         try:
@@ -1721,9 +1732,12 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
         from .media_request import task_for
         from .two_pass import plan, sampling_canvas
         from .generate import hide_tail_geometry
-        from .original_audio import prepare_request
+        from .original_audio import original, prepare_request
         from copy import deepcopy
-        original_audio, audio_canvas = prepare_request(deepcopy(extra.get('media') or {}), width, height,
+        media = deepcopy(extra.get('media') or {})
+        if fast_mode is not None:
+            fast_tier.bridge_steps(fast_mode, original_audio=original(media) is not None)
+        original_audio, audio_canvas = prepare_request(media, width, height,
             continuation=continue_from is not None, backend=machine.get('device_backend', 'cuda'))
         if original_audio is not None:
             canvas = audio_canvas
@@ -1784,7 +1798,11 @@ def generate(prompt, width, height, seconds, seed, output_directory, *,
             keyed = dict(keyed, step_cache=step_cache)
         if fast_mode is not None:
             # The same step count without the adapter is another video.
-            keyed = dict(keyed, fast_mode=fast_mode, fast_adapter=fast_tier.FILES[fast_tier.ADAPTER][1])
+            adapter, constants = fast_tier.component_hashes(
+                environment.get('FREEVIDEO_MODEL_ROOT') or machine['model_root'], fast_mode, engine_root=root)
+            keyed = dict(keyed, fast_mode=fast_mode, fast_adapter=adapter)
+            if constants != fast_tier.CONSTANTS_FILE[1]:
+                keyed['fast_constants'] = constants
         if hide_tail_frames:
             keyed = dict(keyed, hide_tail_frames=hide_tail_frames)
         identify = lambda check: request_key(prompt, seed, canvas, keyed, extra, machine,

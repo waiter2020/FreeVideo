@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from .fast_tier import MODES as FAST_MODES
 from .hardware import Hardware, detect
 from .kernel_capabilities import available_backends
 from .policy import choose
@@ -136,8 +137,8 @@ def main():
                           help='Sample a smaller canvas, upscale latents and refine (default: on; 8 + 3 steps)')
     generate.add_argument('--step-cache', choices=('easycache-av', 'fbcache'),
                           help='Approximate reuse between sampling steps (disabled by default)')
-    generate.add_argument('--fast-mode', choices=('fast2',),
-                          help='Fastest mode: two steps with an additional adapter, pixels without the video VAE')
+    generate.add_argument('--fast-mode', choices=FAST_MODES,
+                          help='Pi-H3 DWD: two or four sampling steps with the corresponding adapter')
     generate.add_argument('--base-steps', type=int, choices=range(1, 33), metavar='1..32',
                           help='First-pass steps (default: 8, or explicit profile). Changes may reduce quality.')
     generate.add_argument('--refine-steps', type=int, choices=range(1, 32), default=3, metavar='1..31',

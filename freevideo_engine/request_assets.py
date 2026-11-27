@@ -33,7 +33,7 @@ def _sampling(root, machine, request):
         return plan(canvas, two_pass, task, base_steps=base, refine_steps=refine), []
     two_pass = bool(request.get('two_pass', True))
     sampled = plan(canvas, two_pass, task, base_steps=request.get('base_steps', 8),
-                   refine_steps=request.get('refine_steps', 3), scale=request.get('upscale_factor', 2))
+                   refine_steps=request.get('refine_steps', 3), scale=request.get('upscale_factor', 2), installation_root=root)
     rows = sampling_assets.pending(root, machine, sampled, task)
     items = []
     if rows:
@@ -51,8 +51,9 @@ def _upscaler(root, sampled):
     if not sampled.get('enabled') or not sampled.get('upscaler_sha256'):
         return []
     try:
-        path = two_pass.checkpoint_path()
-        if path.is_file() and path.stat().st_size == two_pass.UPSCALER['bytes']:
+        default = two_pass.default_checkpoint(root)
+        path = two_pass.checkpoint_path(root)
+        if path.is_file() and (path != default or path.stat().st_size == two_pass.UPSCALER['bytes']):
             return []
     except OSError:
         pass

@@ -42,6 +42,24 @@ def directory(root):
     return Path(root) / 'models' / 'prompt-vlm' / spec['revision']
 
 
+def model_directory(root):
+    from ..model_components import selected_directory
+    return selected_directory(root, 'prompt-vlm', directory(root))
+
+
+def model_details(root, folder=None):
+    from ..model_components import receipt
+    spec = catalog()
+    default = directory(root)
+    folder = model_directory(root) if folder is None else Path(folder)
+    if folder == default:
+        return dict(model=spec['repo'], revision=spec['revision'], license=spec['license'],
+                    bytes=sum(row['bytes'] for row in spec['files']))
+    _, record = receipt(root, 'prompt-vlm', folder.name)
+    return dict(model=record.get('repo') or 'Custom Qwen3-VL', revision=record.get('revision') or folder.name,
+                license=record.get('license', ''), bytes=record.get('bytes', 0))
+
+
 def ready(root):
     """Cheap, safe on the launcher's UI thread: version, sizes and modified times only.
 
@@ -62,9 +80,14 @@ _OUTCOME = {}
 _RUNNING = set()
 
 
-def _state(root, wait):
+def _state(root, wait, *, use_selected=True):
     try:
         spec, folder = catalog(), directory(root)
+        selected = model_directory(root) if use_selected else folder
+        if selected != folder:
+            return ((selected / 'config.json').is_file()
+                    and ((selected / 'model.safetensors').is_file()
+                         or (selected / 'model.safetensors.index.json').is_file()))
         receipt = json.loads((folder / 'verified.json').read_text(encoding='utf-8'))
         if receipt.get('revision') != spec['revision']:
             return False
@@ -100,6 +123,8 @@ def checking(root):
     call the model missing, or offer its download, in the meantime."""
     try:
         spec, folder = catalog(), directory(root)
+        if model_directory(root) != folder:
+            return False
         receipt = json.loads((folder / 'verified.json').read_text(encoding='utf-8'))
         if receipt.get('revision') != spec['revision']:
             return False
@@ -163,11 +188,15 @@ def remote(spec, row):
             mirror['repo'], mirror['revision'], row['file']))])
 
 
+def default_ready(root):
+    return _state(root, wait=False, use_selected=False)
+
+
 def install(root, progress, check):
     from .. import network, provision
     from ..adaln_assets import _download_plan
     from ..monitoring import save
-    if ready(root):
+    if default_ready(root):
         return
     folder, spec = directory(root), catalog()
     folder.mkdir(parents=True, exist_ok=True)

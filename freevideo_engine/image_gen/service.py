@@ -44,6 +44,7 @@ def write_refused(error):
 
 
 BODY_LIMIT = 64 * 1024
+PROMPT_LIMIT = 2000
 CANCEL_GRACE = 5.
 MAX_IMAGES = 4
 # Reference pictures H3 Image takes, each one labelled "Picture N" in upload order.
@@ -525,19 +526,28 @@ class Service:
                               message_en=image_pack_failure(code)['detail'], message_zh=image_pack_failure(code, zh=True)['detail'])
 
     def info(self):
+        from ..model_components import selected_file
+        from .segment import checkpoint_path
         engine_root, machine = self.installation()
         spec = image_pack.catalog()
         root = machine['model_root']
         ready, problem = self.pack_checked(image_pack.ready, root)
         ready = bool(ready)
         downloading = not ready and not problem and bool(self.pack_checked(image_pack.downloading, root, engine_root)[0])
+        segment_default = checkpoint_path(root)
+        try:
+            segment = selected_file(engine_root, 'sam2', segment_default.name, segment_default)
+            segment_ready = (segment.is_file() if segment != segment_default else
+                             bool(self.pack_checked(image_pack.ready, root, group='segment')[0]))
+        except (OSError, ValueError):
+            segment_ready = False
         return dict(ready=ready, model=spec['repo'], models=self.model_rows(machine, ready, downloading, problem),
                     checking=not ready and image_pack.checking(root),
                     downloading=downloading,
                     bytes=sum(row['bytes'] for row in spec['groups']['image']), busy=self.busy(),
                     max_images=MAX_IMAGES, sizes=self.size_tiers(machine), install=self.pack_state(ready, problem),
                     face_box=True,
-                    segment=dict(ready=bool(self.pack_checked(image_pack.ready, root, group='segment')[0]),
+                    segment=dict(ready=segment_ready,
                                  max_points=16, device='cpu',
                                  install=self.segment_installer.state() if self.segment_installer else None),
                     disk_free_bytes=self.disk_free(machine['model_root']),
@@ -950,9 +960,12 @@ class Service:
                 raise ValueError('invalid_request')
             record['source'] = source
         prompt = value.get('prompt')
+        if 'history_prompt' in value:
+            prompt = value['history_prompt']
+            if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > PROMPT_LIMIT:
+                raise ValueError('invalid_prompt')
         if isinstance(prompt, str) and prompt.strip():
-            # A keyed hash, never the text: when the last picture made with this prompt goes, the pages drop it from
-            # their history of prompts too.
+            # Match the prompt shown in history. Older callers only send the text used for generation.
             from .. import private_store
             record['prompt_hash'] = private_store.name('prompt', prompt.strip())
         prompt_ref = value.get('prompt_ref')
@@ -979,22 +992,23 @@ class Service:
         """Keep a picture's record beside the model record; records of pictures that are gone are dropped."""
         if not record or set(record) == {'origin'} and record['origin'] == 'generate':
             return
-        try:
-            output = self.output_directory()
-            rows = self.records(output)
-            rows[Path(path).name] = record
-            present = {entry.name for entry in output.iterdir()}
-            # A picture waiting in the trash keeps its record: undo needs it, and the final delete forgets its prompt by it.
+        with self.trash_mutex:
             try:
-                for entry in os.listdir(output / TRASH):
-                    found = re.fullmatch(r'%s-(.+)' % TRASH_BATCH.pattern, entry)
-                    if found:
-                        present.add(found.group(1))
-            except OSError:
+                output = self.output_directory()
+                rows = self.records(output)
+                rows[Path(path).name] = record
+                present = {entry.name for entry in output.iterdir()}
+                # Keep each undoable picture's record until permanent deletion.
+                try:
+                    for entry in os.listdir(output / TRASH):
+                        found = re.fullmatch(r'%s-(.+)' % TRASH_BATCH.pattern, entry)
+                        if found:
+                            present.add(found.group(1))
+                except OSError:
+                    pass
+                save(output / RECORDS_FILE, {name: row for name, row in rows.items() if name in present})
+            except (OSError, ValueError):
                 pass
-            save(output / RECORDS_FILE, {name: row for name, row in rows.items() if name in present})
-        except (OSError, ValueError):
-            pass
 
     def history_save(self, value):
         """Save the image editor's picture as a new work: the page uploads it to the request folder, it is written
@@ -1136,13 +1150,14 @@ class Service:
             return {}
 
     def history_delete(self, name):
-        path = self.history_path(name)
-        if not path.is_file():
-            raise ValueError('invalid_media')
-        if self.used_by_cards([name]):
-            raise ValueError('picture_in_use')
-        path.unlink()
-        self.works_deleted([name])
+        with self.trash_mutex:
+            path = self.history_path(name)
+            if not path.is_file():
+                raise ValueError('invalid_media')
+            if self.used_by_cards([name]):
+                raise ValueError('picture_in_use')
+            path.unlink()
+            self.works_deleted([name])
         return self.history()
 
     @staticmethod
@@ -1169,13 +1184,14 @@ class Service:
             gone = {name.rpartition('/')[2] for name in names}
             if gone & set(rows):
                 save(output / MODELS_FILE, {name: model for name, model in rows.items() if name not in gone})
-            records = self.records(output)
-            if gone & set(records):
-                kept = {name: row for name, row in records.items() if name not in gone}
-                save(output / RECORDS_FILE, kept)
-                kept_prompts = {row.get('prompt_hash') for row in kept.values()} | self.video_prompts()
-                private_store.forget_prompts({row.get('prompt_hash') for name, row in records.items() if name in gone}
-                                             - kept_prompts - {None})
+            with self.trash_mutex:
+                records = self.records(output)
+                if gone & set(records):
+                    kept = {name: row for name, row in records.items() if name not in gone}
+                    save(output / RECORDS_FILE, kept)
+                    kept_prompts = {row.get('prompt_hash') for row in kept.values()} | self.video_prompts()
+                    private_store.forget_prompts({row.get('prompt_hash') for name, row in records.items() if name in gone}
+                                                 - kept_prompts - {None})
         except (OSError, ValueError):
             pass
         try:
@@ -1325,25 +1341,26 @@ class Service:
         if not isinstance(names, list) or len(names) > HISTORY_LIMIT:
             raise ValueError('invalid_request')
         failed, deleted = [], []
-        kept = self.used_by_cards([name for name in names if isinstance(name, str)])
-        for name in dict.fromkeys(names):
-            try:
-                path = self.history_path(name)
-            except ValueError:
-                failed.append(dict(file=name if isinstance(name, str) else '', reason='invalid'))
-                continue
-            if name in kept:
-                failed.append(dict(file=name, reason='card', cards=kept[name]))
-                continue
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                failed.append(dict(file=name, reason='missing'))
-            except OSError:
-                failed.append(dict(file=name, reason='busy'))
-            else:
-                deleted.append(name)
-        self.works_deleted(deleted)
+        with self.trash_mutex:
+            kept = self.used_by_cards([name for name in names if isinstance(name, str)])
+            for name in dict.fromkeys(names):
+                try:
+                    path = self.history_path(name)
+                except ValueError:
+                    failed.append(dict(file=name if isinstance(name, str) else '', reason='invalid'))
+                    continue
+                if name in kept:
+                    failed.append(dict(file=name, reason='card', cards=kept[name]))
+                    continue
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    failed.append(dict(file=name, reason='missing'))
+                except OSError:
+                    failed.append(dict(file=name, reason='busy'))
+                else:
+                    deleted.append(name)
+            self.works_deleted(deleted)
         return dict(self.history(), failed=failed)
 
     def history_open(self):
@@ -1378,17 +1395,21 @@ class Service:
             session.process.wait()
             session.close()
 
-    def spawn_segment_worker(self, root, machine):
+    def spawn_segment_worker(self, root, machine, checkpoint=None):
         from .. import processes
-        row = image_pack.rows(group='segment')[0]
+        if checkpoint is None:
+            from .segment import checkpoint_path
+            checkpoint = checkpoint_path(machine['model_root'])
         command = processes.module_command('freevideo_engine.image_gen.segment_worker',
-                    image_pack.target(row, machine['model_root']), '--idle-seconds', 45.)
+                    checkpoint, '--idle-seconds', 45.)
         command[0] = machine['comfy_python']
         env = dict(self.environment(root), CUDA_VISIBLE_DEVICES='', HIP_VISIBLE_DEVICES='',
                    OMP_NUM_THREADS='4', MKL_NUM_THREADS='4', OPENBLAS_NUM_THREADS='4')
-        return Worker(processes.popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                      stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace',
-                      supervise=True, start_new_session=True))
+        worker = Worker(processes.popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace',
+                        supervise=True, start_new_session=True))
+        worker.segment_checkpoint = checkpoint
+        return worker
 
     def held_tokens(self):
         """The private_store tokens of the pictures a queued or running job, or a recent point selection, still reads."""
@@ -1443,8 +1464,9 @@ class Service:
 
     def segment(self, value):
         """Immediate admission, no waiting queue. The HTTP caller runs this off its event loop."""
-        from .segment import validate_points
+        from .segment import checkpoint_path, validate_points
         from ..locking import runtime_lock
+        from ..model_components import selected_file
         if not isinstance(value, dict):
             raise ValueError('invalid_request')
         validate_points(value.get('points'))
@@ -1462,9 +1484,12 @@ class Service:
             except (OSError, ValueError):
                 raise ValueError('segment_not_installed') from None
             try:
-                if not image_pack.ready(machine['model_root'], group='segment'):
+                default = checkpoint_path(machine['model_root'])
+                checkpoint = selected_file(root, 'sam2', default.name, default)
+                if not (checkpoint.is_file() if checkpoint != default else
+                        image_pack.ready(machine['model_root'], group='segment')):
                     raise ValueError('segment_not_installed')
-            except (OSError, image_pack.PackError):
+            except (OSError, ValueError, image_pack.PackError):
                 raise ValueError('segment_not_installed') from None
             self.segmenting = True
             self.segment_stop.clear()
@@ -1482,11 +1507,12 @@ class Service:
                         if self.closed or self.segment_stop.is_set() or self.yielding or self.video_busy():
                             raise ValueError('busy_video')
                         session = self.segment_worker
-                        if session is not None and session.process.poll() is not None:
+                        if session is not None and (session.process.poll() is not None or
+                                                    getattr(session, 'segment_checkpoint', checkpoint) != checkpoint):
                             self.close_segment_worker()
                             session = None
                         if session is None:
-                            session = self.segment_worker = self.spawn_segment_worker(root, machine)
+                            session = self.segment_worker = self.spawn_segment_worker(root, machine, checkpoint)
                     accepted = False
                     deadline = time.monotonic() + INFERENCE_TIMEOUT
                     try:
@@ -1532,10 +1558,15 @@ class Service:
         if not isinstance(value, dict):
             raise ValueError('invalid_request')
         path = self.media_path(value.get('image'))
+        from ..model_components import ComponentError
         from .face_box import WeightsError, detect
         try:
-            return detect(path)
-        except WeightsError:
+            try:
+                root, _ = self.installation()
+            except (OSError, ValueError):
+                root = None
+            return detect(path, root=root)
+        except (WeightsError, ComponentError):
             logging.warning('[FreeVideo] The face detector weights are missing or changed; faces are not looked for.')
             raise ValueError('model_unreadable') from None
 
@@ -1543,7 +1574,7 @@ class Service:
         if not isinstance(value, dict):
             raise ValueError('invalid_request')
         prompt = value.get('prompt')
-        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000:
+        if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > PROMPT_LIMIT:
             raise ValueError('invalid_prompt')
         model = value.get('model')
         if model is not None and model not in image_model.MODELS:
@@ -1625,7 +1656,11 @@ class Service:
     def start(self, action, value):
         try:
             return self.admit(action, value)
-        except BaseException:
+        except BaseException as error:
+            if (action == 'generate' and isinstance(value, dict) and value.get('retry_busy') is True
+                    and isinstance(error, ValueError) and str(error) == 'busy'):
+                # The image page retries the same request and owns cleanup if it stops waiting.
+                raise
             # A request turned away at the door leaves no job to clean up after it.
             images = value.get('images') if isinstance(value, dict) else None
             if isinstance(images, list):
@@ -1635,9 +1670,14 @@ class Service:
     def admit(self, action, value):
         if action not in ('generate', 'compose'):
             raise ValueError('invalid_request')
+        work_record = None
+        if isinstance(value, dict):
+            work_record = self.work_record(value, PURPOSE_ORIGIN.get(value.get('purpose'), 'generate'))
+            submission_only = {'history_prompt', 'retry_busy'}
+            if submission_only.intersection(value):
+                value = {key: item for key, item in value.items() if key not in submission_only}
         context = Context(action, value)
-        context.work_record = (self.work_record(value, PURPOSE_ORIGIN.get(value.get('purpose'), 'generate'))
-                               if isinstance(value, dict) else None)
+        context.work_record = work_record
         context.note_start()
         with self.mutex:
             if self.closed:

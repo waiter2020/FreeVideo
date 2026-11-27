@@ -77,18 +77,22 @@ class CosyVoice3:
 
     sample_rate = SAMPLE_RATE
 
-    def __init__(self, model_dir, device='cuda', fp16=False):
-        qwen_dir = os.path.join(model_dir, QWEN_DIR)
+    def __init__(self, model_dir, device='cuda', fp16=False, components=None):
+        components = components or {}
+
+        def asset(name):
+            return str(components.get(name, os.path.join(model_dir, name)))
+
+        qwen_dir = os.path.dirname(asset(QWEN_DIR + '/config.json'))
         self.frontend = CosyVoiceFrontEnd(
             lambda: get_qwen_tokenizer(token_path=qwen_dir, skip_special_tokens=True, version='cosyvoice3'),
             _feat_extractor(),
-            os.path.join(model_dir, 'campplus.onnx'),
-            os.path.join(model_dir, 'speech_tokenizer_v3.onnx'),
+            asset('campplus.onnx'),
+            asset('speech_tokenizer_v3.onnx'),
             device=device)
         llm, flow, hift = build_networks(qwen_dir)
         self.model = CosyVoice3Model(llm, flow, hift, device, fp16)
-        self.model.load(os.path.join(model_dir, 'llm.pt'), os.path.join(model_dir, 'flow.pt'),
-                        os.path.join(model_dir, 'hift.pt'))
+        self.model.load(asset('llm.pt'), asset('flow.pt'), asset('hift.pt'))
 
     def _run(self, texts, make_input, speed):
         import numpy as np

@@ -128,6 +128,8 @@ def sampling_provenance(request):
         base=str(Path(options.get('base') or base_path()).resolve()),
         engine_math={key: value for key, value in options.items() if key not in ENGINE_PLACEMENT},
         decoder_math={key: value for key, value in request['decoder_options'].items() if key not in DECODER_PLACEMENT})
+    if request.get('model_components'):
+        result['model_components'] = request['model_components']
     if 'sampling_plan' in request:
         from .two_pass import steps
         steps(request['sampling_plan'])

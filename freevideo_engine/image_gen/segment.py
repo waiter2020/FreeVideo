@@ -8,6 +8,11 @@ MAX_PIXELS = 4096 * 4096
 MAX_POINTS = 16
 
 
+def checkpoint_path(model_root):
+    from . import image_pack
+    return image_pack.target(image_pack.rows(group='segment')[0], model_root)
+
+
 def validate_points(points, size=None):
     if not isinstance(points, list) or not 1 <= len(points) <= MAX_POINTS:
         raise ValueError('invalid_points')

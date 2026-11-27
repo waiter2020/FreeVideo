@@ -1,7 +1,7 @@
 """Small persistent inputs, separate from optional performance tuning.
 
-Entries are content checked before reuse. Old namespaces and damaged files stay
-on disk; a miss never deletes user artifacts or substitutes a finished video.
+Entries are content checked before reuse. A miss recomputes the input and never
+deletes the original artifact or substitutes a finished video.
 
 A receipt's name is a keyed hash with this installation's salt, so neither a
 prompt nor its plain hash can be read from the folder; an entry holding a
@@ -10,6 +10,9 @@ one size (Settings), least recently used first; the receipts a run used are
 listed in its report, so deleting the work removes what only it used.
 """
 import copy
+from collections import Counter
+from contextlib import contextmanager
+from contextvars import ContextVar
 import hashlib
 import json
 import os
@@ -33,6 +36,7 @@ def digest(path):
 
 # The receipts this process used or wrote, as <kind>/<identity>/<receipt>.json, for the run's report.
 USED = []
+_CAPTURED = ContextVar('input_cache_receipts', default=None)
 # All kinds together, unless Settings says otherwise.
 DEFAULT_LIMIT = 2 * 10 ** 9
 MAX_ENTRIES = 16384
@@ -41,7 +45,19 @@ PLAIN_PROMPT = (b'X\x06\x00\x00\x00prompt', b'\x8c\x06prompt')
 
 
 def used():
-    return list(dict.fromkeys(USED))
+    captured = _CAPTURED.get()
+    return list(USED if captured is None else captured)
+
+
+@contextmanager
+def capture_used():
+    """Collect cache receipts for one request in a long-lived worker."""
+    receipts = []
+    token = _CAPTURED.set(receipts)
+    try:
+        yield receipts
+    finally:
+        _CAPTURED.reset(token)
 
 
 def _note(path):
@@ -49,8 +65,10 @@ def _note(path):
         relative = Path(path).relative_to(Path(path).parents[2]).as_posix()
     except (ValueError, IndexError):
         return
-    if relative not in USED:
-        USED.append(relative)
+    captured = _CAPTURED.get()
+    receipts = USED if captured is None else captured
+    if relative not in receipts:
+        receipts.append(relative)
 
 
 def holds_prompt_text(path):
@@ -95,7 +113,8 @@ class InputCache:
 
     def lookup(self, key):
         try:
-            entry = json.loads(self.receipt(key).read_text(encoding='utf-8'))
+            receipt = self.receipt(key)
+            entry = json.loads(receipt.read_text(encoding='utf-8'))
             if (entry.get('identity') != self.identity or not isinstance(entry.get('file'), str)
                     or Path(entry['file']).name != entry['file']
                     or type(entry.get('bytes')) is not int or not 0 < entry['bytes'] <= 128 * 2**20
@@ -107,9 +126,13 @@ class InputCache:
                 return None
             if holds_prompt_text(source):
                 # Saved by an earlier version with the prompt as text: it goes, and is computed again.
-                self.evict(self.receipt(key))
+                self.evict(receipt, expected=entry)
                 return None
-            _note(self.receipt(key))
+            try:
+                os.utime(receipt)
+            except OSError:
+                pass
+            _note(receipt)
             return source, entry
         except FileNotFoundError:
             return None
@@ -137,10 +160,6 @@ class InputCache:
                 return None
             from .file_ops import publish
             publish(temporary, destination)
-            try:
-                os.utime(self.receipt(key))
-            except OSError:
-                pass
             result = copy.deepcopy(entry['metrics'])
             # A receipt describes the original encoding. Keep its timings as
             # provenance, not work performed by this cache-hit request.
@@ -163,11 +182,28 @@ class InputCache:
         if not 0 < size <= 128 * 2**20:
             self.note = 'Input exceeds the small-input cache limit; original artifact retained'
             return False
-        self.root.mkdir(parents=True, exist_ok=True)
-        if disk_space.free_bytes(self.root) < size + 2**30:
-            self.note = 'Low disk space; existing caches retained, new input not cached'
-            return False
         checksum = digest(source)
+        from .private_store import cache_mutation
+        with cache_mutation(self.base):
+            budget = limit_bytes(self.base)
+            if size >= budget:
+                self.note = 'Input exceeds the available cache budget'
+                return False
+            self.root.mkdir(parents=True, exist_ok=True)
+            if disk_space.free_bytes(self.root) < size + 2**30:
+                self.note = 'Low disk space; existing caches retained, new input not cached'
+                return False
+            receipt, replaced = self._put(key, source, metrics, size, checksum, move)
+            self._prune(budget, MAX_ENTRIES, replaced=replaced)
+            if not receipt.is_file():
+                self.note = 'Input exceeds the available cache budget'
+                return False
+            _note(receipt)
+            return True
+
+    def _put(self, key, source, metrics, size, checksum, move):
+        from .private_store import CACHE_PATTERNS, cache_receipt_payload, check
+
         target = self.root / (checksum + '.pt')
         if target.exists() and digest(target) != checksum:
             target = self.root / (checksum[:31] + '-' + uuid.uuid4().hex + '.pt')
@@ -191,56 +227,83 @@ class InputCache:
                 if not move:
                     temporary.unlink(missing_ok=True)
         receipt = self.receipt(key)
-        if receipt.exists():
-            # Keep old receipts too, including malformed ones, for diagnostics.
-            prior = receipt.read_bytes()
-            previous = self.root / (receipt.stem[:38] + '-' + hashlib.sha256(prior).hexdigest()[:16] + '.previous.json')
-            if not previous.exists():
-                previous.write_bytes(prior)
+        name = receipt.relative_to(self.base).as_posix()
+        prior, _ = check(self.base, name, patterns=CACHE_PATTERNS)
+        replaced = cache_receipt_payload(name, prior[0]) if prior is not None else None
+        if replaced == target.relative_to(self.base).as_posix():
+            replaced = None
         save(receipt, {'identity': self.identity, 'file': target.name, 'bytes': size,
                        'sha256': checksum, 'metrics': metrics, 'created_epoch': time.time()},
              staging='receipt.')
-        _note(receipt)
-        self.prune()
-        return True
+        return receipt, replaced
 
-    def evict(self, receipt):
+    def evict(self, receipt, *, expected=None):
         """Remove one receipt, its earlier copies and its file when no other receipt names it."""
         from .private_store import evict
         try:
-            evict(self.base, Path(receipt).relative_to(self.base).as_posix())
+            evict(self.base, Path(receipt).relative_to(self.base).as_posix(), expected=expected)
         except ValueError:
             pass
 
     def prune(self, max_bytes=None, max_entries=MAX_ENTRIES):
-        """Drop the least recently used receipts of every kind, across identities, until under both limits.
-
-        Only files this cache wrote are removed; unreadable receipts are left in place."""
+        """Trim the shared input-cache, with archived and unreferenced files evicted first."""
         if max_bytes is None:
             max_bytes = limit_bytes(self.base)
-        rows, owners = [], {}
+        from .private_store import cache_mutation
         try:
-            for receipt in self.base.glob('*/*/*.json'):
-                if receipt.name.endswith('.previous.json'):
-                    continue
-                try:
-                    entry = json.loads(receipt.read_text(encoding='utf-8'))
-                    if not isinstance(entry['file'], str) or Path(entry['file']).name != entry['file']:
-                        continue
-                    data = receipt.parent / entry['file']
-                    rows.append((receipt.stat().st_mtime, receipt, data))
-                    owners[data] = owners.get(data, 0) + 1
-                except (OSError, ValueError, KeyError, TypeError):
-                    continue
-            total = sum({data: data.stat().st_size for _, _, data in rows if data.exists()}.values())
-            for _, receipt, data in sorted(rows, key=lambda row: row[0]):
-                if total <= max_bytes and len(rows) <= max_entries:
-                    break
-                receipt.unlink()
-                rows = [row for row in rows if row[1] != receipt]
-                owners[data] -= 1
-                if not owners[data] and data.exists():
-                    total -= data.stat().st_size
-                    data.unlink()
+            with cache_mutation(self.base):
+                self._prune(max_bytes, max_entries)
         except OSError as error:
             self.note = type(error).__name__ + ': input cache pruning skipped'
+
+    def _prune(self, max_bytes, max_entries, *, replaced=None):
+        from .private_store import CACHE_FILES, cache_files, cache_receipt_payload, safe_remove
+
+        files = cache_files(self.base)
+        total = sum(size for _, size in files.values())
+        receipts = {name: path for name, (path, _) in files.items() if name.endswith('.json')}
+        count = len(receipts)
+        if replaced is None and total <= max_bytes and count <= max_entries:
+            return
+        payloads = {name: cache_receipt_payload(name, path) for name, path in receipts.items()}
+        archives = [name for name in receipts if name.endswith('.previous.json')]
+        active = [name for name in receipts if not name.endswith('.previous.json')]
+
+        def remove(name):
+            nonlocal total, count
+            if name not in files:
+                return False
+            status, _ = safe_remove(self.base, name, patterns=CACHE_FILES, folders=2)
+            if status not in ('removed', 'gone'):
+                return False
+            total -= files.pop(name)[1]
+            if name in receipts:
+                count -= 1
+            return True
+
+        if replaced is not None and not any(payloads[name] == replaced for name in active):
+            old_receipts = [name for name in archives if payloads[name] == replaced]
+            for name in old_receipts:
+                remove(name)
+            if not any(name in files for name in old_receipts):
+                remove(replaced)
+        if total <= max_bytes and count <= max_entries:
+            return
+
+        owners = Counter(payload for name, payload in payloads.items() if name in files and payload is not None)
+        unused = [name for name in files if name not in receipts and not owners[name]]
+        archives = [name for name in archives if name in files]
+
+        def age(name):
+            try:
+                return files[name][0].stat().st_mtime
+            except OSError:
+                return 0
+
+        for name in sorted(unused, key=age) + sorted(archives, key=age) + sorted(active, key=age):
+            if total <= max_bytes and count <= max_entries:
+                break
+            if remove(name) and (payload := payloads.get(name)) is not None:
+                owners[payload] -= 1
+                if not owners[payload]:
+                    remove(payload)

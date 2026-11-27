@@ -109,11 +109,13 @@ export function createImageGenClient(fetchImpl = globalThis.fetch.bind(globalThi
     return {
         info, offers,
         // purpose: what the picture is for (for example 'cast-draft'), passed through as given.
-        async generate({prompt, width, height, images = [], mask, seed, loras, cast_view, model, remember, purpose, layout}) {
+        async generate({prompt, width, height, images = [], mask, seed, loras, cast_view, model, remember, purpose, layout,
+            history_prompt, retry_busy}) {
             const value = await post('generate', {...(model ? {model} : {}), [p.prompt]: prompt, [p.width]: width, [p.height]: height,
                 [p.images]: images, ...(mask ? {[p.mask]: mask} : {}), ...(seed === undefined ? {} : {[p.seed]: seed}),
                 ...(loras === undefined ? {} : {[p.loras]: loras}), ...(cast_view === 'back' ? {cast_view} : {}), ...(remember === true ? {remember} : {}),
-                ...(typeof purpose === 'string' && purpose ? {purpose} : {}), ...(Array.isArray(layout) && layout.length ? {layout} : {})});
+                ...(typeof purpose === 'string' && purpose ? {purpose} : {}), ...(Array.isArray(layout) && layout.length ? {layout} : {}),
+                ...(history_prompt === undefined ? {} : {history_prompt}), ...(retry_busy === true ? {retry_busy} : {})});
             return {...value, job: value[p.job]};
         },
         async status(job, model) {

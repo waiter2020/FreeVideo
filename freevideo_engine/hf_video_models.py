@@ -6,7 +6,9 @@ import os
 from pathlib import Path
 import re
 import secrets
+from tempfile import TemporaryDirectory
 import time
+from urllib.parse import quote
 
 from . import disk_space
 from .adaln_assets import asset_path, file_hash
@@ -78,7 +80,7 @@ def _contract(machine):
         transformer=file_hash(io_path(Path(machine['base']) / 'transformer' / 'config.json')),
         vdn=file_hash(io_path(Path(machine['checkpoint']) / 'model_spec.json')),
         device_backend=machine.get('device_backend', 'cuda'),
-        gpu_uuid=machine.get('gpu_uuid'),
+        gpu_uuid=machine.get('gpu_uuid') or machine.get('device_identity'),
     )
 
 
@@ -99,7 +101,7 @@ def _receipt(folder):
 
 def _comfy_contract(machine):
     return dict(recipe_version=1, device_backend=machine.get('device_backend', 'cuda'),
-                gpu_uuid=machine.get('gpu_uuid'))
+                gpu_uuid=machine.get('gpu_uuid') or machine.get('device_identity'))
 
 
 def _comfy_profile(root, model, assets):
@@ -128,13 +130,20 @@ def _with_comfy_encoder(profile, encoder):
                 shared_encoder={key: encoder[key] for key in ('id', 'label', 'sha256')})
 
 
+def _with_comfy_vaes(root, profile):
+    from .model_components_generation import native_vae_files
+    assets = native_vae_files(root, profile['assets'])
+    return dict(profile, **assets, assets=assets)
+
+
 def comfy_shared_encoder_profile(root, identity, machine, encoder):
     """Bind a validated shared component to a preset without editing its installed asset receipt."""
     folder = profile_folder(root, identity)
     receipt, cache = _receipt(folder)
     if cache is not None:
         raise ValueError('The selected video model is not a ComfyUI H3 checkpoint.')
-    return _with_comfy_encoder(_verified_comfy_profile(root, receipt, machine), encoder)
+    profile = _with_comfy_encoder(_verified_comfy_profile(root, receipt, machine), encoder)
+    return _with_comfy_vaes(root, profile)
 
 
 def resolve_comfy_h3(root, identity, machine=None, *, encoder_component=None):
@@ -214,6 +223,42 @@ def _stamp_cache(cache, manifest):
     return {name: fingerprint(asset_path(cache, name)) for name in sorted(payload | {'manifest.json'})}
 
 
+def _retained_profile(identity, folder):
+    from .model_components import retained_use
+    try:
+        from folder_paths import get_output_directory
+        output = Path(get_output_directory())
+    except (ImportError, AttributeError, OSError, TypeError):
+        return False
+    if retained_use(output, identity):
+        return True
+    root = (output / 'FreeVideo').resolve()
+    folder = folder.resolve()
+    for artifacts in root.glob('*/*/*.artifacts'):
+        if artifacts.is_symlink() or not artifacts.resolve().is_relative_to(root):
+            continue
+        if not any((artifacts / name).is_file() for name in ('first-pass.pt', 'latents.pt', 'refine-input.pt', 'refine-progress.pt')):
+            continue
+        try:
+            report = artifacts.with_suffix('.request.json')
+            summary = _read(report) if report.stat().st_size <= 2 * 1024 * 1024 and not report.is_symlink() else {}
+            if summary.get('success') is True and not summary.get('preview'):
+                continue
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        for name in ('video.json', 'engine-request.json', 'lora-request.json'):
+            path = artifacts / name
+            try:
+                if path.stat().st_size > 2 * 1024 * 1024 or path.is_symlink():
+                    continue
+                cache = _read(path).get('cache')
+                if isinstance(cache, str) and Path(cache).resolve().is_relative_to(folder):
+                    return True
+            except (OSError, ValueError, TypeError, AttributeError):
+                continue
+    return False
+
+
 class VideoModels(HubModelJobs):
     media = 'video'
 
@@ -239,35 +284,201 @@ class VideoModels(HubModelJobs):
             machine = self._machine()
         except ValueError:
             return dict(available=False, active=None, installed=[], task=task)
-        builtin = _official(machine, self.root)
-        installed = [builtin]
+        builtin = dict(_official(machine, self.root), repairable=False, removable=False)
+        installed, damaged = [builtin], []
+        active = machine.get(ACTIVE_KEY) or builtin
         for directory in sorted((self.root / 'prepared' / 'huggingface').glob('*')):
             if not PROFILE_ID.fullmatch(directory.name):
                 continue
+            row = None
             try:
-                receipt, cache = _receipt(profile_folder(self.root, directory.name))
+                folder = profile_folder(self.root, directory.name)
+                receipt = self._maintenance_record(folder)
+                row = dict(receipt['model'], repairable=self._repairable(receipt), removable=directory.name != active['id'])
+                _, cache = _receipt(folder)
                 if cache is None:
                     _verified_comfy_profile(self.root, receipt, machine)
-                installed.append(receipt['model'])
+                installed.append(row)
+            except (OSError, ValueError, TypeError, KeyError):
+                if row is not None:
+                    damaged.append(dict(row, damaged=True))
+        current = next((row for row in (*installed, *damaged) if row['id'] == active['id']), None)
+        if current is None:
+            current = dict(active, damaged=True, repairable=False, removable=False)
+            damaged.append(current)
+        return dict(available=True, active=current, installed=installed, damaged=damaged, task=task)
+
+    def _maintenance_record(self, folder):
+        receipt = _read(folder / PROFILE_FILE)
+        if receipt.get('schema_version') not in (1, 2) or receipt['model']['id'] != folder.name:
+            raise ValueError('Invalid installed video model receipt.')
+        return receipt
+
+    @staticmethod
+    def _repairable(receipt):
+        model = receipt['model']
+        return bool(receipt.get('origin') or model.get('repo') and model.get('revision'))
+
+    def verify(self, identity):
+        folder = profile_folder(self.root, identity) if identity != OFFICIAL_ID else None
+        return self._maintenance(identity, 'verify', self._verify_installation, folder)
+
+    def _verify_installation(self, folder):
+        from . import provision
+        machine = self._machine()
+        if folder is None:
+            baseline = machine.get(OFFICIAL_KEY) or _baseline(machine)
+            cache = Path(baseline['cache'])
+        else:
+            receipt, cache = _receipt(folder)
+            if cache is None:
+                profile = _verified_comfy_profile(self.root, receipt, machine)
+                for path in profile['assets'].values():
+                    self._check()
+                    path = Path(path)
+                    if file_hash(io_path(path)) != path.parent.name:
+                        raise ValueError('A native H3 asset failed SHA-256 verification.')
+                return
+        manifest = provision.verify_cache(dict(root=str(folder or self.root), model_dir=str(Path(machine['base']).parent),
+                                               verification='full'), cache)
+        if folder is not None and _stamp_cache(cache, manifest) != receipt['stamps']:
+            raise ValueError('The installed video model files changed. Repair or import it again.')
+
+    def remove(self, identity):
+        folder = profile_folder(self.root, identity)
+        self._maintenance_record(folder)
+        return self._maintenance(identity, 'remove', self._remove_version, identity, folder)
+
+    def _remove_version(self, identity, folder):
+        with self._maintenance_lease():
+            if (self._machine().get(ACTIVE_KEY) or {}).get('id') == identity:
+                raise ValueError('Activate another video model before removing this version.')
+            receipt = self._maintenance_record(folder)
+            if _retained_profile(identity, folder):
+                raise ValueError('A saved preview or recoverable video still uses this model.')
+            self._delete_import(folder)
+            if receipt['model'].get('kind') == 'comfy_h3':
+                self._remove_native_checkpoint(receipt)
+
+    def _remove_native_checkpoint(self, receipt):
+        from .local_comfy_h3_catalog import owned_asset, OWNED, _asset_receipt
+        relative = receipt['assets'].get('checkpoint')
+        if not isinstance(relative, str):
+            return
+        path = asset_path(self.root, relative)
+        if path != owned_asset(self.root, 'checkpoint', path.parent.name):
+            return
+        for folder in sorted((self.root / 'prepared' / 'huggingface').glob('*')):
+            if not PROFILE_ID.fullmatch(folder.name):
+                continue
+            try:
+                if self._maintenance_record(folder).get('assets', {}).get('checkpoint') == relative:
+                    return
+            except (OSError, ValueError, TypeError, KeyError):
+                return  # A damaged receipt can still own the checkpoint.
+        if path.parent.parent == asset_path(self.root, OWNED):
+            io_path(path).unlink(missing_ok=True)
+            io_path(_asset_receipt(path)).unlink(missing_ok=True)
+
+    def repair(self, identity, *, token=None):
+        from .hf_auth import validate
+        folder = profile_folder(self.root, identity)
+        receipt = self._maintenance_record(folder)
+        if not self._repairable(receipt):
+            raise ValueError('Inspect the original model again before replacing this version.')
+        token = validate(token or '')
+        return self._maintenance(identity, 'repair', self._repair_version, identity, folder, receipt, token, token=token)
+
+    def _repair_version(self, identity, folder, receipt, token):
+        from . import hf_video_catalog, local_comfy_h3_catalog, local_video_catalog
+        machine = self._machine()
+        model, origin = receipt['model'], receipt.get('origin') or {}
+        source = origin.get('path')
+        local = source is not None
+        if model.get('kind') == 'comfy_h3':
+            self._require_native()
+            if local:
+                candidate = local_comfy_h3_catalog.inspect_file(source, model['preset'], self.root, machine)
+            else:
+                url = 'https://huggingface.co/' + model['repo'] + '/blob/' + quote(model['revision'], safe='') + '/' + quote(model['path'])
+                candidate = local_comfy_h3_catalog.inspect_hub(url, model['preset'], self.root, machine, token)
+        elif local:
+            candidate = local_video_catalog.inspect(source, self.root, machine)
+        else:
+            candidate = hf_video_catalog.inspect(model['repo'], self.root, machine, revision=model['revision'],
+                                                subfolder=model.get('subfolder'), token=token)
+        if candidate.get('compatible') is False or not local and candidate['id'] != identity:
+            raise ValueError('The original source no longer matches this video model.')
+        candidate = dict(candidate, id=identity, source_selection=source)
+        with TemporaryDirectory(prefix='repair-video-', dir=io_path(folder.parent)) as temporary:
+            staged = Path(temporary) / identity
+            staged.mkdir()
+            if local:
+                self._update('copying', total_bytes=candidate['copy_bytes'])
+                hashes = self._copy_local_files(staged, candidate, lambda done: self._update('copying', done_bytes=done))
+                if hashes != [tuple(row) for row in origin.get('hashes', ())]:
+                    raise ValueError('The original local model changed. Import it as a new version.')
+                candidate['local_hashes'] = hashes
+            self._stage(candidate, token, folder=staged, remote=not local, repair=True)
+            with self._maintenance_lease():
+                self._replace_import(folder, staged, lambda: self._refresh_repaired_video(identity, folder))
+
+    def _refresh_repaired_video(self, identity, folder):
+        machine = self._machine()
+        receipt, cache = _receipt(folder)
+        if cache is None:
+            self._refresh_native_neighbors(folder, receipt)
+        if (machine.get(ACTIVE_KEY) or {}).get('id') != identity:
+            return
+        if cache is not None:
+            manifest = _read(cache / 'manifest.json')
+            machine.update(cache=str(cache), prepared_format='int8_convrot' if manifest['precision'] == 'int8' else 'fp8')
+        machine[ACTIVE_KEY] = receipt['model']
+        save(self.root / 'machine.json', machine, durable=True)
+
+    def _refresh_native_neighbors(self, repaired, receipt):
+        from .local_comfy_h3_catalog import owned_stamp, profile_assets
+        shared = set(receipt['assets'].values())
+        for folder in sorted(repaired.parent.glob('*')):
+            if folder == repaired or not PROFILE_ID.fullmatch(folder.name):
+                continue
+            try:
+                installed = self._maintenance_record(folder)
+                if installed['schema_version'] != 2 or not shared.intersection(installed['assets'].values()):
+                    continue
+                paths = profile_assets(self.root, installed['assets'])
+                stamps = {role: owned_stamp(self.root, Path(path)) for role, path in paths.items()}
             except (OSError, ValueError, TypeError, KeyError):
                 continue
-        return dict(available=True, active=machine.get(ACTIVE_KEY) or builtin, installed=installed, task=task)
+            if stamps != installed['stamps']:
+                save(folder / PROFILE_FILE, dict(installed, stamps=stamps), durable=True)
 
     def search(self, query, token=None):
         from . import hf_video_catalog
         self._machine()
         return hf_video_catalog.search(query, token=token)
 
-    def inspect(self, reference, revision=None, subfolder=None, token=None):
+    def inspect(self, reference, revision=None, subfolder=None, token=None, *, preset=None):
         from . import hf_video_catalog
-        candidate = hf_video_catalog.inspect(reference, self.root, self._machine(),
-                                             revision=revision, subfolder=subfolder, token=token)
+        machine = self._machine()
+        basename = reference.rsplit('/', 1)[-1].casefold() if isinstance(reference, str) else ''
+        if preset is None and basename.endswith('.safetensors'):
+            preset = next((name for name in ('fl2va', 'ref2va') if name in basename), None)
+        if preset is None:
+            candidate = hf_video_catalog.inspect(reference, self.root, machine,
+                                                 revision=revision, subfolder=subfolder, token=token)
+        else:
+            self._require_native()
+            from .hf_auth import validate
+            from .local_comfy_h3_catalog import inspect_hub
+            candidate = inspect_hub(reference, preset, self.root, machine, validate(token or ''))
         profile_folder(self.root, candidate['id'])
         return self._remember(candidate)
 
     def inspect_local(self, selection):
         from . import local_video_catalog
-        return self._remember_local(local_video_catalog.inspect(selection, self.root, self._machine()))
+        candidate = local_video_catalog.inspect(selection, self.root, self._machine())
+        return self._remember_local(dict(candidate, source_selection=str(selection)))
 
     def scan_comfy_h3(self, local_folder):
         from . import local_comfy_h3_catalog as catalog
@@ -284,9 +495,13 @@ class VideoModels(HubModelJobs):
             selection = self.comfy_selections.get(selection_id) if isinstance(selection_id, str) else None
         if selection is None:
             raise ValueError('Choose the ComfyUI H3 directory again.')
-        if self.comfy_smoke is None:
+        self._require_native()
+        candidate = catalog.inspect(selection, preset, self.root, self._machine())
+        return self._remember_local(dict(candidate, source_selection=selection['files'][0]['source']))
+
+    def _require_native(self):
+        if self.comfy_smoke is None or not getattr(self.comfy_smoke, 'available', lambda: True)():
             raise ValueError('The current ComfyUI runtime cannot validate this H3 model.')
-        return self._remember_local(catalog.inspect(selection, preset, self.root, self._machine()))
 
     def _profile_folder(self, identity):
         return profile_folder(self.root, identity)
@@ -303,15 +518,16 @@ class VideoModels(HubModelJobs):
             pass
         return None
 
-    def _stage(self, candidate, token, *, folder=None):
+    def _stage(self, candidate, token, *, folder=None, remote=False, repair=False):
         from . import hf_video_catalog, local_video_catalog, provision
         machine = self._machine()
         if candidate['kind'] == 'comfy_h3':
-            return self._stage_comfy(machine, candidate, folder)
-        local = folder is not None
+            return self._stage_comfy(machine, candidate, folder, token=token, remote=remote or folder is None, repair=repair)
+        local = folder is not None and not remote
+        direct = folder is None
         catalog = local_video_catalog if local else hf_video_catalog
         if not local:
-            folder = profile_folder(self.root, candidate['id'])
+            folder = folder or profile_folder(self.root, candidate['id'])
             folder.mkdir(parents=True, exist_ok=True)
             if self._complete_profile(folder, machine) is not None:
                 self._update('ready', done_bytes=candidate['bytes'])
@@ -349,9 +565,10 @@ class VideoModels(HubModelJobs):
             self._smoke(machine, folder, cache, descriptor)
         self._check()
         model = dict(public_candidate(candidate), format=_format(manifest))
+        origin = dict(path=candidate['source_selection'], hashes=candidate['local_hashes']) if candidate.get('source_selection') else None
         save(folder / PROFILE_FILE, dict(schema_version=1, model=model, cache=cache.relative_to(folder).as_posix(),
-                                        contract=_contract(machine), stamps=_stamp_cache(cache, manifest)), durable=True)
-        if not local:
+                                        contract=_contract(machine), stamps=_stamp_cache(cache, manifest), origin=origin), durable=True)
+        if direct:
             self._update('ready')
         return model
 
@@ -368,19 +585,40 @@ class VideoModels(HubModelJobs):
             return [(selected['target'], selected['bytes'], checksum)]
         return super()._copy_local_files(staging, selection, progress)
 
-    def _stage_comfy(self, machine, candidate, folder):
+    def _stage_comfy(self, machine, candidate, folder, *, token='', remote=False, repair=False):
         from . import local_comfy_h3_catalog as catalog
         from .encoder_checkpoint import configured_component
-        if folder is None or self.comfy_smoke is None:
-            raise ValueError('ComfyUI H3 checkpoints require the local model importer.')
+        self._require_native()
+        direct = folder is None
+        if remote:
+            folder = folder or self._profile_folder(candidate['id'])
+            folder.mkdir(parents=True, exist_ok=True)
+            if direct and self._complete_profile(folder, machine) is not None:
+                self._update('ready', done_bytes=candidate['bytes'])
+                return
+            downloads = list(candidate['files'])
+            if catalog._verified(self.root, 'checkpoint', downloads[0]['sha256']):
+                downloads = downloads[1:]
+            remaining, ledger = self._remaining(folder, downloads)
+            if disk_space.free_bytes(folder) < remaining + candidate['copy_bytes'] + catalog.MARGIN:
+                raise ValueError('Insufficient disk space for this native H3 model.')
+            if downloads:
+                self._download(machine, folder, dict(candidate, files=downloads), token, ledger)
 
         def progress(done):
             self._check()
-            self._update('copying', done_bytes=done)
+            self._update('copying', done_bytes=done + (candidate['bytes'] if remote else 0),
+                         total_bytes=(candidate['bytes'] + candidate['copy_bytes']) if remote else candidate['copy_bytes'])
 
-        assets = catalog.stage(self.root, folder, candidate, progress)
+        stage = catalog.stage_hub if remote else catalog.stage
+        if repair:
+            with self._maintenance_lease():
+                assets = stage(self.root, folder, candidate, progress, repair=True)
+        else:
+            assets = stage(self.root, folder, candidate, progress)
         model = public_candidate(candidate)
         profile = _with_comfy_encoder(_comfy_profile(self.root, model, assets), configured_component(machine))
+        profile = _with_comfy_vaes(self.root, profile)
         self._check()
         self._update('waiting_for_gpu')
         output = folder / 'comfy-h3-smoke.mp4'
@@ -394,8 +632,11 @@ class VideoModels(HubModelJobs):
         self._check()
         stamps = {role: catalog.owned_stamp(self.root, Path(path))
                   for role, path in catalog.profile_assets(self.root, assets).items()}
+        origin = dict(path=candidate['source_selection'], hashes=candidate['local_hashes']) if candidate.get('source_selection') else None
         save(folder / PROFILE_FILE, dict(schema_version=2, model=model, assets=assets,
-                                        contract=_comfy_contract(machine), stamps=stamps), durable=True)
+                                        contract=_comfy_contract(machine), stamps=stamps, origin=origin), durable=True)
+        if direct:
+            self._update('ready', candidate=model, done_bytes=candidate['bytes'] + candidate['copy_bytes'])
         return model
 
     def _smoke(self, machine, folder, cache, descriptor):

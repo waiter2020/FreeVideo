@@ -21,6 +21,7 @@ from .desktop_runtime import launcher_root, materialize_source
 from .download_settings import Probe, read as download_preferences, speed_text
 from .launcher_settings import Store, default_language
 from .launcher_copy import ACTION_COPY, Phrase, follow_language, size_text
+from .launcher_pi_h3 import PiH3Downloads
 from .launcher_terminal import Tail
 from .model_status import FAMILIES, NAMES
 from .model_guidance import (package_instructions, video_instructions, runtime_packages_supported, download_view,
@@ -244,6 +245,7 @@ class Session:
         self.log_source = None
         self.model_groups = []
         self.image_installer = self.h3_installer = self.prompt_installer = None
+        self.pi_h3 = PiH3Downloads()
         self.download_export = self.download_error = self.download_error_key = ''
         self._download_view = None
         # 'image' opens the image model's own list, which needs no file check; any other value is the video list.
@@ -1038,7 +1040,7 @@ class Session:
             return
         if (self.controller.busy or self.importer.busy or self.cleaner.busy or self.archives_busy
                 or self.closing or self.engine_updating or self.update_intent or self.upgrade.active or self.model_switch
-                or self.updater and self.updater.busy):
+                or self.pi_h3.busy or self.updater and self.updater.busy):
             return
         root, engine = self._image_location()
         # Repair and Remove need the engine lease, which a task (or the idle image session) holds; say why instead of failing a second later.
@@ -1057,6 +1059,15 @@ class Session:
             else:
                 self.image_installer = installer
         installer.start(action, background=action == 'install')
+
+    def pi_h3_pack_action(self, action, mode, job_id=''):
+        if self.closing or self.page != 'launcher' or not self.installation_engine():
+            return
+        if action == 'install' and (not self.can_manage() or self.updater and self.updater.busy):
+            return
+        if action == 'cancel' and not job_id:
+            return
+        self.pi_h3.request(action, mode, job_id or None)
 
     def generating(self):
         """Whether the opened ComfyUI is running or holding a job (read from the download thread)."""
@@ -1220,7 +1231,8 @@ class Session:
             self.persist()
 
     def background_download_busy(self):
-        return bool(any(item and item.busy for item in (self.image_installer, self.h3_installer)) or self.prompt_installer and self.prompt_installer.busy)
+        return bool(self.pi_h3.busy or any(item and item.busy for item in (self.image_installer, self.h3_installer))
+                    or self.prompt_installer and self.prompt_installer.busy)
 
     def prompt_model_action(self, action):
         from .prompt_vlm import installer as prompt_installer
@@ -1230,7 +1242,7 @@ class Session:
             return
         if (self.controller.busy or self.importer.busy or self.cleaner.busy or self.archives_busy
                 or self.closing or self.engine_updating or self.update_intent or self.upgrade.active or self.model_switch
-                or self.updater and self.updater.busy or not self.installation_engine()):
+                or self.pi_h3.busy or self.updater and self.updater.busy or not self.installation_engine()):
             return
         engine = self._image_location()[1]
         if self.prompt_installer and self.prompt_installer.busy:
@@ -1775,6 +1787,7 @@ class Session:
                     installer.cancel()
             if self.prompt_installer:
                 self.prompt_installer.cancel()
+            self.pi_h3.pause_owned()
         if self.task_busy() or self.updater and self.updater.busy:
             self.pending_update = (token, source)
             self.action_notice = 'update_queued'
@@ -2153,6 +2166,7 @@ class Session:
                 self.prompt_installer.cancel()
                 if self.prompt_installer.thread:
                     self.prompt_installer.thread.join(5)
+            self.pi_h3.close()
             self.controller.close()
             from .launcher_bridge import remove
             remove(self.bridge)
@@ -2253,6 +2267,8 @@ class Session:
         return bool((self.controller.selection or {}).get('ready')) or getattr(self.controller, 'section', None) == 'engine'
 
     def tick(self):
+        if not self.closing and sys.platform == 'win32':
+            self.pi_h3.poll(self.installation_engine())
         if isinstance(self.controller, Controller) and not self.controller.busy:
             self.controller.check_server_exit()
             self.controller.poll_access_proxy()
@@ -2988,6 +3004,7 @@ class Session:
         if inspection_read_error:
             download_state.update(error=self.t(*DOWNLOAD_COPY['error_read']), needs_check=True)
         return plain_data(dict(download_list=download_state, sampling_cache_bytes=total_bytes(), version=__version__, image_pack=image_pack,
+            pi_h3_pack=self.pi_h3.view(self.t, can_start=self.can_manage() and not (self.updater and self.updater.busy)),
             prompt_model=prompt_model, bytes_per_second=speed,
             disk=disk, decimal_sizes=sys.platform == 'darwin', zh=self.chinese(), ui_language=self.ui_language(), **self.language_view(),
             form=dict(self.form),

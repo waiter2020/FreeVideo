@@ -37,6 +37,15 @@
       "file": "pi-h3/pi_h3_2step_dwd_adapter_int8_convrot.safetensors",
       "bytes": 2192176240,
       "sha256": "ef98527409eee4eaec8183265f4ee22d265680524237fae7149dbc203e11e739",
+      "modes": ["fast2"],
+      "engine": true
+    },
+    {
+      "file": "pi-h3/pi_h3_4step_dwd_adapter_int8_convrot.safetensors",
+      "bytes": 2192176240,
+      "sha256": "a2fa1caae2cd4a12f85cc3eccd2a360fe9dabf430623d47deca619605e96ee6d",
+      "hf_mirror": "https://hf-mirror.com/Lakonik/pi-H3/resolve/4a864589b0fac3d14768f932c930c4dcf1a17b56/pi_h3_4step_dwd_adapter_int8_convrot.safetensors",
+      "modes": ["fast4"],
       "engine": true
     }
   ]

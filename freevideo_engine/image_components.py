@@ -98,7 +98,7 @@ def _verified_file(folder, name, stamp):
 
 
 def installed(root, identity, machine, *, model=None, role=None):
-    from .hf_image_models import _folder, _profile, FAMILIES
+    from .hf_image_models import _folder, _profile, device_identity, FAMILIES, recorded_device
 
     folder = _folder(root, identity)
     try:
@@ -106,7 +106,7 @@ def installed(root, identity, machine, *, model=None, role=None):
     except FileNotFoundError:
         _, legacy = _profile(root, identity)
         row = dict(legacy['model'], component='dit')
-        if legacy.get('gpu_uuid') != machine.get('gpu_uuid'):
+        if recorded_device(legacy) != device_identity(machine):
             raise ValueError('This component was installed on a different GPU.')
         actual_model = row['model']
         if actual_model == image_model.MOSS:

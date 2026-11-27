@@ -32,6 +32,14 @@ export class PromptVersions {
         this.edit(text, true);
         this.value.originalModel = model === text ? '' : model;
     }
+    replaceDraft(text) {
+        Object.assign(this.value, {original: text, originalModel: '', rewritten: '', model: '', selected: 'original', context: '', useOriginal: false});
+    }
+    mapDrafts(mapText) {
+        this.value.original = mapText(this.value.original);
+        if (this.value.rewritten) this.value.rewritten = mapText(this.value.rewritten);
+        this.value.context = '';
+    }
     key(context) { return JSON.stringify({text: this.value.original, ...context}); }
     // `model` is the rewrite as the model wrote it, kept when the box shows it in a shorter form.
     accept(key, context, text, model = text) {
@@ -86,7 +94,7 @@ const PROMPT_LIMIT = 12000;
 // `prepare` turns the user's text into what the model reads (character mentions written out with their pictures);
 // `restore` turns the rewrite back into the user's terms (the mentions written as the user wrote them), and `display`
 // into what the box shows; the restored rewrite is kept for the request (see prompt_sections.js).
-export function createPromptEnhancer({node, input, editor, api, context, setText, t, starter = '', prepare = text => text, resolve = async scene => scene, restore = text => text, display = text => text, onReport = () => {}, onChange = () => {}, issueButton = null}) {
+export function createPromptEnhancer({node, input, editor, api, context, setText, t, starter = '', prepare = text => text, resolve = async scene => scene, restore = text => text, display = text => text, onReport = () => {}, onChange = () => {}, issueButton = null, discardStale = false, releaseMedia}) {
     const saved = node.properties?.freevideo_prompt_versions;
     // Drafts saved before the starter became a placeholder hold it as the original.
     const versions = new PromptVersions(starter && saved?.original === starter ? {...saved, original: ''} : saved, input.value);
@@ -115,7 +123,7 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
         const b = el('button', text); b.type = 'button'; buttons[name] = b; tabs.append(b);
         b.dataset.fvTipName = text;
         b.dataset.fvTipUse = name === 'original' ? t('Show the prompt as written', '显示原始提示词') : t('Show the rewritten prompt', '显示改写后的提示词');
-        b.onclick = () => { if (running) cancelJob().catch(() => {}); versions.select(name); apply(); };
+        b.onclick = () => { if (running) cancelJob().catch(() => {}); draftRevision++; versions.select(name); apply(); };
     }
     const redo = el('button', t('Rewrite', '改写'), 'fv-quiet'); redo.type = 'button';
     redo.classList.add('fv-enhance-redo');
@@ -157,6 +165,7 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
     install.append(detail, actions);
     bar.append(label, tabs, redo, cancel); element.append(bar, editor || input, status, install);
     let disposed = false, token = '', job = '', running = null, consent = null, cancelling = false, waiting = false, replacing = false;
+    let draftRevision = 0;
     let retryWait = null;
     let downloadOnly = false, pausing = false, modelReading = null;
     const modelState = {info: null, text: '', busy: false}, modelListeners = new Set();
@@ -319,6 +328,7 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
     let silent = false, undoTimer = 0;
     function changed() {
         if (silent) return;
+        draftRevision++;
         // Ctrl+Z (or typing the old words back) while Undo is offered brings the saved versions back too, as the Undo key does.
         if (undoState && !undoKey.hidden && input.value === undoState.before) {
             const {snapshot} = undoState; show('');
@@ -336,7 +346,7 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
         const reply = await api.fetchApi('/freevideo/prompt-vlm/' + action, {method: 'POST',
             headers: {'Content-Type': 'application/json', 'X-FreeVideo-Prompt': token}, body: JSON.stringify(body)});
         const data = await reply.json();
-        if (!reply.ok) throw new Error(data.error || 'request_failed');
+        if (!reply.ok) throw Object.assign(new Error(data.error || 'request_failed'), {status: reply.status});
         return data;
     }
     async function cancelJob() {
@@ -360,14 +370,20 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
         quiet();
         return clock;
     }
-    async function poll(action, body, clock = null) {
-        if (disposed || cancelling) throw new Error('cancelled');
-        const started = await post(action, body); job = started.job;
+    async function poll(action, body, clock = null, checkCurrent = () => {}, onFinished) {
+        if (disposed || cancelling) { onFinished?.(); throw new Error('cancelled'); }
+        try { job = (await post(action, body)).job; }
+        catch (error) {
+            if (error.status >= 400 && error.status < 500) onFinished?.();
+            throw error;
+        }
         let failures = 0;
-        if (disposed || cancelling) await post('cancel', {job});
+        let finished = false;
         try {
+            if (disposed || cancelling) await post('cancel', {job});
             for (;;) {
                 if (disposed || cancelling) throw new Error('cancelled');
+                checkCurrent();
                 let row;
                 try { row = await post('status', {job}); failures = 0; }
                 catch (error) {
@@ -381,7 +397,9 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
                     });
                     continue;
                 }
+                if (['complete', 'failed', 'cancelled'].includes(row.phase)) { finished = true; onFinished?.(); }
                 if (disposed || cancelling) throw new Error('cancelled');
+                checkCurrent();
                 if (row.rewrite_report_id) {
                     node.properties.freevideo_prompt_report = row.rewrite_report_id;
                     node.graph?.change();
@@ -412,6 +430,7 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
         } catch (error) {
             // Losing a status reply must not leave an invisible model running.
             await post('cancel', {job}).catch(() => {});
+            if (onFinished && !finished && await stopped(job)) onFinished();
             throw error;
         } finally { job = ''; }
     }
@@ -464,11 +483,13 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
         // The engine is free again once the server reports the download job ended (at most 10 s).
         for (let i = 0; id && !disposed && i < 40; i++) {
             const row = await post('status', {job: id}).catch(() => null);
-            if (!row || ['complete', 'failed', 'cancelled'].includes(row.phase)) return;
+            if (!row) return false;
+            if (['complete', 'failed', 'cancelled'].includes(row.phase)) return true;
             await new Promise(resolve => setTimeout(resolve, 250));
         }
+        return false;
     }
-    async function enhance() {
+    async function enhance({isCurrent = () => true} = {}) {
         if (running) return running;
         if (!versions.value.original.trim()) {
             // An empty prompt is not a problem to report: the rewrite runs once there is text, before generating.
@@ -480,28 +501,46 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
             if (disposed || cancelling) throw new Error('cancelled');
             versions.value.useOriginal = false;
             const scene = context(), key = versions.key(scene), original = versions.value.original, edits = versions.value.edits;
+            const revision = draftRevision;
+            const checkCurrent = () => {
+                if (disposed || cancelling) throw new Error('cancelled');
+                if (!isCurrent() || (discardStale && (draftRevision !== revision || versions.key(context()) !== key))) throw new Error('stale');
+            };
+            checkCurrent();
             // The server counts what it receives, which includes the character descriptions the mentions are written out as.
-            const text = prepare(original), characters = [...text].length;
+            const text = prepare(original, scene), characters = [...text].length;
             if (characters > PROMPT_LIMIT) throw Object.assign(new Error('invalid_prompt'), {characters, expanded: text !== original});
             const clock = waitClock();
-            let result;
+            let result, sent, canRelease = true;
             try {
                 const info = await readModel();
                 if (disposed || cancelling) throw new Error('cancelled');
+                checkCurrent();
                 // The download offer and its progress own the line; the seconds start again after it.
                 if (!info.ready) { clock.pause(); show(''); }
-                if (!await installModel(info)) {
+                const installed = await installModel(info);
+                checkCurrent();
+                if (!installed) {
                     versions.value.enabled = false;
                     versions.select('original'); apply();
                     throw new Error('cancelled');
                 }
                 if (!info.ready) clock.restart();
                 // resolve turns the scene into what the server reads (the image page uploads its pictures here).
-                const sent = await resolve(scene);
+                sent = await resolve(scene, checkCurrent);
                 if (disposed || cancelling) throw new Error('cancelled');
-                result = await poll('rewrite', {text, ...sent}, clock);
-            } finally { clock.stop(); }
+                checkCurrent();
+                canRelease = false;
+                result = await poll('rewrite', {text, ...sent}, clock, checkCurrent, releaseMedia ? () => { canRelease = true; } : undefined);
+            } catch (error) {
+                checkCurrent();
+                throw error;
+            } finally {
+                clock.stop();
+                if (sent && canRelease) releaseMedia?.(sent);
+            }
             if (disposed || cancelling) throw new Error('cancelled');
+            checkCurrent();
             const restored = restore(result.text);
             if (edits !== versions.value.edits || !versions.accept(key, context(), display(restored), restored)) throw new Error('stale');
             apply(); show('');
@@ -650,6 +689,7 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
         return running;
     }
     toggle.onchange = () => {
+        draftRevision++;
         versions.value.enabled = toggle.checked;
         if (!toggle.checked) { cancelJob().catch(() => {}); versions.select('original'); apply(); }
         else { void prestart.request(); versions.value.useOriginal = false; save(); render(); enhance().catch(() => {}); }
@@ -667,7 +707,8 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
         onReverse(listener) { reverseListeners.add(listener); listener(reverseState); return () => reverseListeners.delete(listener); }, model: {read: readModel, download: downloadModel, subscribe(listener) {
         modelListeners.add(listener); listener(modelState);
         return () => modelListeners.delete(listener);
-    }}, async beforeGenerate() {
+    }}, async beforeGenerate({isCurrent = () => true} = {}) {
+        if (!isCurrent()) return false;
         if (running && downloadOnly) {
             // The download holds the engine the video needs: pause it (Retry resumes) instead of waiting for it.
             const request = running, downloading = consent ? '' : job;
@@ -675,25 +716,52 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
             await cancelJob().catch(() => {});
             await request;
             await stopped(downloading);
-            return;
+            return isCurrent() ? undefined : false;
         }
         if (running) {
             try { await running; }
             catch (error) {
-                if (versions.value.enabled && !versions.value.useOriginal) {
+                if (!isCurrent()) return false;
+                if (!(discardStale && error?.message === 'stale') && versions.value.enabled && !versions.value.useOriginal) {
                     // Generation does not start, so say why, as when no rewrite was running.
                     if (error?.message === 'cancelled' || cancelling || disposed) { if (!disposed) show(errorText({message: 'cancelled'})); return false; }
                     useOriginal(error); return;
                 }
             }
         }
+        if (!isCurrent()) return false;
         // An untouched box generates the starter prompt as it is.
         if (!versions.value.enabled || versions.value.useOriginal || !versions.value.original.trim()) return;
-        try { if (!versions.fresh(context())) await enhance(); }
+        try { if (!versions.fresh(context())) await enhance({isCurrent}); }
         catch (error) {
+            if (!isCurrent() || (discardStale && error?.message === 'stale')) return false;
             if (error?.message === 'cancelled' || cancelling || disposed) { show(errorText({message: 'cancelled'})); return false; }
             useOriginal(error);
         }
+        if (!isCurrent()) return false;
+    }, get draftRevision() { return draftRevision; },
+    replaceDraft(text) {
+        draftRevision++;
+        versions.replaceDraft(text);
+        replacing = waiting = false;
+        show(''); apply();
+    }, mapDrafts(mapText) {
+        draftRevision++;
+        versions.mapDrafts(mapText);
+        apply();
+    }, invalidateDraft({showOriginal = false} = {}) {
+        draftRevision++;
+        versions.value.context = '';
+        if (showOriginal) { versions.value.selected = 'original'; apply(); }
+        else save(false);
+    }, fallbackToOriginal(usable, reason) {
+        if (versions.value.selected !== 'rewritten') return false;
+        versions.value.context = '';
+        if (!usable(versions.value.original)) { save(false); return false; }
+        versions.value.selected = 'original';
+        apply();
+        show(reason, 'note');
+        return true;
     }, sync(model = '') {
         // The box was filled from elsewhere (a reused prompt, the node on the canvas): a new scene, not an edit.
         if (input.value === versions.text() && !model) return;

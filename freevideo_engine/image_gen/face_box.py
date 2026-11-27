@@ -19,9 +19,11 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import pickle
 import threading
 
 WEIGHTS = Path(__file__).with_name('face_box_weights.json')
+CHECKPOINT = 'yunet_final.pth'
 WEIGHTS_BYTES = 405729
 WEIGHTS_SHA256 = 'ee0a3035c5cbfc9484a31332223c9fd9c0ddcdb7c46b6a19e558ed393b6f2c67'
 # The picture is searched at most this long on its long side (smaller ones as they are): about 0.1 s on four cores.
@@ -38,6 +40,7 @@ VARIANCE = (0.1, 0.2)
 
 _lock = threading.Lock()
 _model = None
+_model_path = None
 
 
 class WeightsError(RuntimeError):
@@ -125,12 +128,16 @@ def build():
 
 
 def load(path=WEIGHTS):
-    """The network in evaluation mode on the CPU; raises WeightsError for weights that are not the pinned file."""
+    """Load the bundled verified payload or a compatible local state dict on the CPU."""
     import torch
-    data = weights_bytes(path)
-    model = build()
-    model.load_state_dict(torch.load(io.BytesIO(data), map_location='cpu', weights_only=True), strict=True)
-    return model.eval()
+    path = Path(path)
+    try:
+        source = io.BytesIO(weights_bytes(path)) if path.suffix == '.json' else path
+        model = build()
+        model.load_state_dict(torch.load(source, map_location='cpu', weights_only=True), strict=True)
+        return model.eval()
+    except (OSError, RuntimeError, ValueError, TypeError, EOFError, pickle.UnpicklingError) as error:
+        raise WeightsError('face detector weights are incompatible') from error
 
 
 def priors(height, width):
@@ -212,15 +219,18 @@ def find(model, image):
     return faces[:MAX_FACES]
 
 
-def detect(path):
+def detect(path, *, root=None):
     """{'width', 'height', 'faces'} of the picture at `path` as it is shown (its orientation tag applied).
 
     Boxes are [left, top, right, bottom] and may reach past the picture's edge; landmarks are the eyes, the nose and
     the mouth corners, left to right as seen. Raises ValueError('invalid_media') for a picture that cannot be read,
     WeightsError when the bundled weights are not the expected file.
     """
-    global _model
+    global _model, _model_path
     from PIL import Image, ImageOps
+    from ..model_components import selected_file
+    from ..paths import data_root
+    weights = selected_file(root or data_root(), 'face-box', CHECKPOINT, WEIGHTS)
     try:
         with Image.open(path) as opened:
             if opened.width * opened.height > MAX_PIXELS:
@@ -229,7 +239,8 @@ def detect(path):
     except (OSError, ValueError, Image.DecompressionBombError) as error:
         raise ValueError('invalid_media') from error
     with _lock:
-        if _model is None:
-            _model = load()
+        if _model is None or _model_path != weights:
+            _model = load(weights)
+            _model_path = weights
         faces = find(_model, image)
     return dict(width=image.width, height=image.height, faces=faces)

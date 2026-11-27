@@ -21,7 +21,7 @@ class Backend:
     needs_reference_text = True
     supports_instruction = False
 
-    def __init__(self, model_dir, device='cuda'):
+    def __init__(self, model_dir, device='cuda', components=None):
         raise NotImplementedError
 
     def synth(self, text, reference, reference_text, speed=1.0, instruction=None):
@@ -38,9 +38,9 @@ class CosyVoice3Backend(Backend):
     languages = ('zh', 'en', 'ja', 'ko', 'de', 'es', 'fr', 'it', 'ru')
     supports_instruction = True
 
-    def __init__(self, model_dir, device='cuda'):
+    def __init__(self, model_dir, device='cuda', components=None):
         from .cosyvoice3.build import CosyVoice3
-        self.model = CosyVoice3(model_dir, device=device)
+        self.model = CosyVoice3(model_dir, device=device, components=components)
 
     def synth(self, text, reference, reference_text, speed=1.0, instruction=None):
         if instruction:
@@ -57,7 +57,7 @@ def names():
     return sorted(REGISTRY)
 
 
-def create(name, model_dir, device='cuda'):
+def create(name, model_dir, device='cuda', **kwargs):
     """Build the named backend; an unknown name raises KeyError."""
     module, _, cls = REGISTRY[name].partition(':')
-    return getattr(importlib.import_module(module), cls)(model_dir, device=device)
+    return getattr(importlib.import_module(module), cls)(model_dir, device=device, **kwargs)

@@ -17,6 +17,7 @@ FILE_TYPES = {
                        ('*.safetensors', '*.safetensors.index.json')),
     'vae': ('VAE weights / VAE 权重', ('*.safetensors',)),
     'cache': ('FreeVideo cache manifest / FreeVideo 缓存清单', 'manifest.json'),
+    'model-file': ('Model weights / 模型权重', ('*.safetensors', '*.pt', '*.pth', '*.onnx', '*.json', '*.gguf')),
 }
 
 
@@ -58,9 +59,11 @@ def main(kind):
         Label(root, text='Select local model / 选择本地模型').pack(padx=28, pady=16)
         root.attributes('-topmost', True)
         root.update()
-        if kind in ('source', 'comfy_h3'):
+        if kind in ('source', 'comfy_h3', 'model-directory'):
             title = ('Select ComfyUI MiniMax H3 models / 选择 ComfyUI MiniMax H3 权重目录'
                      if kind == 'comfy_h3' else 'Select VDN-H3 source folder / 选择 VDN-H3 原始权重目录')
+            if kind == 'model-directory':
+                title = 'Select model directory / 选择模型目录'
             value = filedialog.askdirectory(parent=root, title=title, mustexist=True)
         else:
             title = 'Select model file / 选择模型文件'

@@ -31,6 +31,7 @@ REFERENCE_INPUTS = ('reference', *(f'reference_{i}' for i in range(2, 9)))
 
 def resolve_loras(serialized, names, resolve, previous=None):
     """Resolve a UI stack through Comfy's registered libraries, never raw paths."""
+    from .swap_lora import catalog as swap_catalog, selected as selected_swap_lora
     serialized = optional_text(serialized, '[]')
     if not isinstance(serialized, str) or len(serialized) > 128 * 1024:
         raise ValueError('Invalid LoRA selection')
@@ -50,10 +51,13 @@ def resolve_loras(serialized, names, resolve, previous=None):
         if (isinstance(strength, bool) or not isinstance(strength, (int, float))
                 or not math.isfinite(strength) or not -100 <= strength <= 100):
             raise ValueError('LoRA strength must be a finite number between -100 and 100')
-        if not isinstance(name, str) or name not in available or not name.lower().endswith('.safetensors'):
+        if not isinstance(name, str) or not name.lower().endswith('.safetensors'):
+            raise ValueError('Select an available safetensors LoRA from your ComfyUI model folders')
+        if name not in available and (name != swap_catalog()['name'] or selected_swap_lora(name) is None):
             raise ValueError('Select an available safetensors LoRA from your ComfyUI model folders')
         if strength != 0:
-            result.append({'path': str(Path(resolve(name)).resolve()), 'strength': strength})
+            selected = selected_swap_lora(name)
+            result.append({'path': str(Path(selected if selected is not None else resolve(name)).resolve()), 'strength': strength})
     return result
 
 

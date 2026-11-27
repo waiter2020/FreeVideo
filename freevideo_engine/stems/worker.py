@@ -15,9 +15,11 @@ def main(argv=None):
         parser.add_argument('--device', default='cuda')
         args = parser.parse_args(argv)
         from .separate import separate_file
+        from ..model_components import snapshot
         code = 'separation_failed'
         paths, numbers = separate_file(args.source, args.out, args.weights, device=args.device)
-        result = dict(ok=True, paths={name: str(Path(path)) for name, path in paths.items()}, **numbers)
+        result = dict(ok=True, paths={name: str(Path(path)) for name, path in paths.items()},
+                      model_components=snapshot(None, ('bandit-plus',)), **numbers)
         status = 0
     except Exception as exc:
         try:

@@ -10,6 +10,7 @@ silently turns it off for the rest of the request.
 """
 from contextlib import contextmanager
 import json
+import math
 import os
 from pathlib import Path
 
@@ -28,6 +29,7 @@ _sink = None
 _active = None
 _weights = None
 _decoder_bytes = 0   # GPU bytes the plan set aside for the small decoder; 0 keeps the per-pixel map
+_decoder_path = None
 _marker = None  # request-level file: a failure in one process keeps the request's later processes off
 _failed = False  # request-level: one failure turns previews off for every later pass
 _serial = 0      # request-level: numbers pictures across passes so the page never mistakes a new one for the old
@@ -44,7 +46,8 @@ def load_weights(path=WEIGHTS):
     k, weight, bias = value['k'], value['weight'], value['bias']
     outputs = 3 * k * k
     if (value.get('version') != 1 or type(k) is not int or not 1 <= k <= 8 or value.get('channels') != CHANNELS
-            or len(weight) != CHANNELS or any(len(row) != outputs for row in weight) or len(bias) != outputs):
+            or len(weight) != CHANNELS or any(len(row) != outputs for row in weight) or len(bias) != outputs
+            or any(type(item) not in (int, float) or not math.isfinite(item) for row in [*weight, bias] for item in row)):
         raise ValueError('Unsupported frame preview weights')
     return k, weight, bias
 
@@ -58,7 +61,7 @@ def configure(directory, emit=None, *, weights=None, request_state=None, decoder
     request stays off. `decoder_bytes` is the GPU memory the plan reserved for
     the small decoder; without it the per-pixel map draws every picture.
     """
-    global _sink, _weights, _failed, _serial, _marker, _decoder_bytes
+    global _sink, _weights, _failed, _serial, _marker, _decoder_bytes, _decoder_path
     _sink = _weights = None
     _decoder_bytes = decoder_bytes if type(decoder_bytes) is int and decoder_bytes > 0 else 0
     _failed, _serial = False, 0
@@ -69,7 +72,14 @@ def configure(directory, emit=None, *, weights=None, request_state=None, decoder
         _failed = True
         return False
     try:
-        k, weight, bias = load_weights(WEIGHTS if weights is None else weights)
+        from .frame_preview_decoder import WEIGHTS as DECODER
+        from .model_components import selected_file
+        from .paths import data_root
+        root = data_root()
+        _decoder_path = selected_file(root, 'video-preview-decoder', DECODER.name, DECODER) if decoder_bytes else None
+        if weights is None:
+            weights = selected_file(root, 'video-preview-linear', WEIGHTS.name, WEIGHTS)
+        k, weight, bias = load_weights(weights)
         if emit is None:
             from .sampling_progress import emit_event as emit
         _weights = (k, weight, bias)
@@ -170,7 +180,7 @@ class _Preview:
         try:
             from . import frame_preview_decoder
             if self.decoder is None or next(self.decoder.parameters()).device != device:
-                self.decoder = frame_preview_decoder.load(device)
+                self.decoder = frame_preview_decoder.load(device, _decoder_path or frame_preview_decoder.WEIGHTS)
             width = min(MAX_FRAME_WIDTH, x0.shape[2] * 4)
             def finish(picture):
                 if picture.shape[-1] > width:

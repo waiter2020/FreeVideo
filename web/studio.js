@@ -48,14 +48,15 @@ import { createFrameChip, createFrameIcon, createPopChip } from './glass/frame_p
 import { createWarm } from './studio_warm.js';
 import { attach as attachPlayer } from './glass/player_bar.js';
 import { framesOf, savedPrompt, savedSettings } from './result_reuse.js';
-import { activeVideoModel, addVideoLabel, addVideoModel, applyVideoModelSnapshot, COMFY_H3_SAMPLING,
-    missingVideoText, VIDEO_MODEL_CHANGED, videoModelState } from './video_model.js';
+import { addVideoLabel, addVideoModel, applyVideoModelSnapshot, COMFY_H3_SAMPLING,
+    createVideoModelPicker, isPiVideoModel, missingVideoText, piVideoDownloadText, piVideoModeInfo, piVideoProblem,
+    piVideoSteps, videoModelState } from './video_model.js';
 import { createPromptEnhancer } from './prompt_enhance.js';
 import { requestText, shownRewrite } from './prompt_sections.js';
 import { createRequestAssets, enabledLoras, referenceFiles } from './request_assets.js';
 import { promptDraftTrouble, rememberPromptDraft, restorePromptDraft, savePromptDraft, trackPromptDraft, watchPromptDraftTrouble } from './prompt_draft.js';
 import { canvasDimensions, imageSizeSelection } from './studio_size.js';
-import { createCapabilityView, capabilityContext, setupNote } from './capability_view.js';
+import { aboutTime, createCapabilityView, capabilityContext, setupNote } from './capability_view.js';
 import { createOtherUsageNotice } from './other_usage.js';
 import { openEditorView } from './editor_loader.js';
 import { frameShapes, frameSize } from './frame_sizes.js';
@@ -67,7 +68,7 @@ import { registerTourWorkspace, triggerFeatureTour, offerVersionTour } from './f
 import { createStudioLength, savedSeconds } from './studio_length.js?v=20261011-length';
 import { firstFrameRow } from './first_frame_row.js';
 import { createReplacePerson, swapMissingText } from './replace_person.js';
-import { swapState, swapMissing, effectiveRows, prepareSwapLora, releaseSwapLora, peopleOf } from './replace_state.js';
+import { swapState, swapMissing, effectiveRows, prepareSwapLora, releaseSwapLora, peopleOf, swapLoraNames } from './replace_state.js';
 import { swapLoraDownload } from './swap_lora.js';
 import { createStudioChain, chainPosition, chainParts, chainSplit, composePartText, readChainResult, sumPartEstimates, singleRunSnapshot } from './studio_chain.js?v=20261117-chain-errors';
 import { activeOriginal, checkOriginal, lockMark, blockOriginal, originalBlocked, usesOriginal, referenceRow, partsNeedTwoPassText } from './audio_original.js';
@@ -762,12 +763,17 @@ export function openStudio(node, {extendFrom = null} = {}) {
     // modal is above them and must remain interactive when the launcher reopens it.
     dialog.style.pointerEvents = 'auto';
     current = {node, dialog}; const cleanup = [];
-    let videoModel, comfyH3Model = null;
+    let videoModel, comfyH3Model = null, videoPicker = null, waitingForPi = null;
     let firstStart = null, exampleFocused = false;
     // The console (studio_console.js) is put together once every control exists; until then nothing reads it.
     let consoleUI = null, promptLibrary = null, reverseKey = null, reversePick = null;
     // Set while the editor borrows this panel's bar (current.borrow below).
     let borrowed = null, columns = null, placeReverse = () => {};   // (placeReverse: where the reverse-prompt key stands; set below, run again when the editor lends or takes back the bar)
+    const selectedVideoMode = () => borrowed ? borrowed.videoModelSelection?.() : videoPicker?.selection();
+    const piMode = () => isPiVideoModel(selectedVideoMode()) ? selectedVideoMode() : null;
+    const fixedVideoSampling = () => Boolean(comfyH3Model || piMode());
+    const piSamplingInputs = [...Object.keys(COMFY_H3_SAMPLING), 'refine_steps'];
+    const piFrames = () => value(node, 'frames') || Math.max(39, 5 + 17 * Math.ceil((Number(value(node, 'seconds')) * 24 - 5) / 17));
     // Frame & size picker and the stage's outline of a new frame (set with the size tray).
     let framePicker = null;
     const header = el('header', null, 'fv-header'), brand = el('div', null, 'fv-brand');
@@ -1165,7 +1171,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     // The Fast level is the `fast_mode` input; the engine takes its steps from it. The other sampling inputs hold the values
     // it accepts beside it (8 + 3, one pass, no cache, factor 2). The two-pass choice made before it comes back when it is left.
     let fastOffer = null, fastBack = null;
-    const fastOn = () => !comfyH3Model && Boolean(widget(node, 'fast_mode')) && value(node, 'fast_mode') === 'fast2';
+    const fastOn = () => !comfyH3Model && !selectedVideoMode() && Boolean(widget(node, 'fast_mode')) && value(node, 'fast_mode') === 'fast2';
     const fastLeft = () => { if (fastOn()) set(node, 'fast_mode', 'none'); };
     // A video made in parts is sampled at Light in two passes, whatever is chosen (the request says so at submission).
     const fastParts = () => fastOn() && lengthControl?.plan?.count > 1;
@@ -1215,12 +1221,14 @@ export function openStudio(node, {extendFrom = null} = {}) {
     }
     // The planner's answer for this machine (capabilities.fast_mode): no answer lists no Fast level.
     // Listed only once the files are known to be published; until then the four levels.
-    const fastLevels = () => withFastLevel(effortsFrom(fastGrid), fastOffer && fastPack.published === true ? fastOffer : null);
+    const fastLevels = () => withFastLevel(effortsFrom(fastGrid), fastOn() && fastOffer && fastPack.published === true ? fastOffer : null);
     function applyFastOffer(grid) {
         fastGrid = grid;
+        videoPicker?.setCapabilities(grid);
         if (grid?.status === 'ready') fastOffer = widget(node, 'fast_mode') ? fastOfferOf(grid) : null;
         effort.setLevels(fastLevels());
         if (fastOffer) fastPack.refresh();
+        if (piMode() && runButtonReady) updateRunButton();
         if (grid?.status !== 'ready' || !fastOn()) return;
         if (!fastOffer) chooseEffort(effort.levels().find(tier => tier.name === 'Light'));
     }
@@ -1250,7 +1258,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     }
     // A level chosen on the control.
     function chooseLevel(tier) {
-        if (comfyH3Model) return;
+        if (fixedVideoSampling()) return;
         if (!tier.fast) fastPack.forget();
         chooseEffort(tier);
         if (tier.twoPass) returnHeldPreview(); else holdPreview(false);
@@ -1263,7 +1271,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     };
     const previewFirst = el('input'); previewFirst.type = 'checkbox'; previewFirst.checked = value(node, 'preview') === true;
     function choosePassMode(mode) {
-        if (comfyH3Model || extension.source) return;
+        if (fixedVideoSampling() || extension.source) return;
         const wantsTwoPass = mode !== 'off', wantsPreview = mode === 'preview';
         if (fastOn()) return;
         // Chosen, so nothing waits; the workflow has to record that even when no other setting changes.
@@ -1281,7 +1289,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
         syncSamplingSteps(); updateRunButton();
     }
     function passState() {
-        if (comfyH3Model) return {mode: 'off', disabled: {off: true, on: true, preview: true}, hidden: {preview: true}, hint: ''};
+        if (fixedVideoSampling()) return {mode: 'off', disabled: {off: true, on: true, preview: true}, hidden: {preview: true}, hint: ''};
         if (fastOn()) return {mode: fastParts() ? 'on' : 'off', disabled: {off: true, on: true, preview: true}, hidden: {preview: !widget(node, 'preview')}, hint: '',
             why: fastParts() ? fastRowWords() : t('Fast makes the full size in one pass. Choose another level to use it.', '极速档一次生成全分辨率。选其他档位后可用。')};
         const passLinked = linked(node, 'two_pass'), previewLinked = linked(node, 'preview');
@@ -1352,11 +1360,22 @@ export function openStudio(node, {extendFrom = null} = {}) {
             return '';
         }
         let names;
-        try { const response = await api.fetchApi('/models/loras', {cache: 'no-store'}); if (!response.ok) throw new Error(response.statusText); names = await response.json(); }
+        try {
+            const response = await api.fetchApi('/models/loras', {cache: 'no-store'});
+            if (!response.ok) throw new Error(response.statusText);
+            names = await response.json();
+            if (!swapLoraNames(names).length) {
+                const status = await api.fetchApi('/freevideo/swap-lora', {cache: 'no-store'});
+                const managed = status.ok && await status.json();
+                if (managed?.managed) names = [managed.name];
+            }
+        }
         catch { return swapLoraText('unreadable'); }
         if (!state.on) return '';
         const now = value(loraNode, 'adapters') || '[]';
-        const result = prepareSwapLora(now, names, record);
+        const previous = record && swapLoraNames(names).includes(record.name) ? record : null;
+        const adapters = record && !previous ? releaseSwapLora(now, record) : now;
+        const result = prepareSwapLora(adapters, names, previous);
         if (!result.ok && result.reason === 'missing') return (await swapDownload.need(retry)) || swapLoraText('unreadable');
         if (!result.ok) return swapLoraText(result.reason);
         state.lora = result.record;
@@ -1507,12 +1526,12 @@ export function openStudio(node, {extendFrom = null} = {}) {
     // The run button exists only further down; until then its label is set there.
     let runButtonReady = false;
     function syncSamplingSteps(typing = false) {
-        if (!comfyH3Model && extension.source) {
+        if (!fixedVideoSampling() && extension.source) {
             const factor = continuationUpscale(baseSteps.value, twoPass.checked, refineSteps.value, stepCacheNow(), value(node, 'upscale_factor'), effort.levels());
             baseSteps.value = '8'; refineSteps.value = '3'; twoPass.checked = true; set(node, 'two_pass', true); clearStepCache(); setUpscale(factor); autoSinglePass = false;
             fastLeft();
         }
-        const fixedSampling = Boolean(comfyH3Model) || fastOn();
+        const fixedSampling = fixedVideoSampling() || fastOn();
         samplingFields.hidden = fixedSampling;
         const baseLinked = linked(node, 'base_steps');
         // Two-pass is offered at 8 first-pass steps, and from a single-pass level (it then gives Light).
@@ -1525,7 +1544,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
         // A preview stops after the first pass, so it needs two-pass sampling.
         // Steps half typed decide nothing; the two-pass rule above is applied to them once they are committed.
         const stepsWrong = !typing && previewStepsWrong();
-        if (!comfyH3Model && (!twoPass.checked || stepsWrong || fastOn()) && previewFirst.checked) {
+        if (!fixedVideoSampling() && (!twoPass.checked || stepsWrong || fastOn()) && previewFirst.checked) {
             // A linked value is another node's to change.
             if (stepsWrong && !linked(node, 'preview')) holdPreview(true);
             previewFirst.checked = false; set(node, 'preview', false);
@@ -1535,8 +1554,8 @@ export function openStudio(node, {extendFrom = null} = {}) {
         blockOriginal('preview', previewFirst.checked && !previewFirst.disabled, {release() { choosePassMode('on'); return ['Preview first was turned off for "Use as is".', '已为“原样使用”关闭“先出预览”。']; }});
         blockOriginal('fast', fastOn(), {release() { chooseEffort(effort.levels().find(tier => tier.name === 'Light')); return ['Switched to Light for "Use as is".', '已为“原样使用”改用轻量档。']; }});
         syncPassMode();
-        baseSteps.disabled = baseLinked || !widget(node, 'base_steps') || Boolean(comfyH3Model || extension.source);
-        refineSteps.disabled = !twoPass.checked || linked(node, 'refine_steps') || !widget(node, 'refine_steps') || Boolean(comfyH3Model || extension.source);
+        baseSteps.disabled = baseLinked || !widget(node, 'base_steps') || fixedVideoSampling() || Boolean(extension.source);
+        refineSteps.disabled = !twoPass.checked || linked(node, 'refine_steps') || !widget(node, 'refine_steps') || fixedVideoSampling() || Boolean(extension.source);
         baseSteps.min = twoPass.checked ? '2' : '1';
         refineSteps.max = baseLinked ? '31' : String(Math.max(3, Math.min(31, Number(baseSteps.value || 8) - 1)));
         refineSteps.setCustomValidity(twoPass.checked && !baseLinked && !refineSteps.disabled && Number(refineSteps.value) !== 3 && Number(refineSteps.value) >= Number(baseSteps.value)
@@ -1616,6 +1635,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     function refreshFast() { showEffortEstimate(); if (qualityChip.element.isConnected) qualityChip.place(); }
     function showEffortEstimate(steps = Number(baseSteps.value), twoPassPlan = twoPass.checked, cache = stepCacheNow(), factor = upscaleNow()) {
         if (comfyH3Model) return;
+        if (piMode()) { effort.setEstimate(''); effort.setWarning(''); effort.setWays(); return; }
         effort.setWarning(''); effort.setWays();
         if (!arguments.length && fastOn()) {
             // Its time where the planner has one; a video made in parts is sampled at Light.
@@ -1701,9 +1721,10 @@ export function openStudio(node, {extendFrom = null} = {}) {
         if (loraNode && !widget(loraNode, 'adapters')) adapters = value(loraNode, 'lora') !== 'None';
         const requestWidth = extension.source?.geometry.width ?? value(node, 'width');
         const requestHeight = extension.source?.geometry.height ?? value(node, 'height');
+        const explicitPi = piMode();
         // With the Fast level the length is planned at Light: a video made in parts is sampled at Light, and whether one run
         // fits the Fast level is its own cell (capabilityView.fast), which says so rather than splitting the video.
-        lengthControl?.refresh({width: requestWidth, height: requestHeight, task, adapters,
+        if (!explicitPi) lengthControl?.refresh({width: requestWidth, height: requestHeight, task, adapters,
             settings: fastOn() ? {tier: 'light', base_steps: 8, refine_steps: 3, two_pass: true, step_cache: null, upscale_factor: 2}
                 : {tier: effortFor(Number(baseSteps.value), twoPass.checked, Number(refineSteps.value), stepCacheNow(), effort.levels(), upscaleNow())?.name.toLowerCase() || 'custom',
                 base_steps: Number(baseSteps.value), refine_steps: Number(refineSteps.value), two_pass: twoPass.checked,
@@ -1712,11 +1733,16 @@ export function openStudio(node, {extendFrom = null} = {}) {
             const query = new URLSearchParams({width: requestWidth, height: requestHeight, seconds: value(node, 'seconds'), task,
                 base_steps: baseSteps.value, refine_steps: refineSteps.value, two_pass: twoPass.checked || fastOn() ? '1' : '0',
                 enhance: node.properties?.freevideo_prompt_versions?.enabled ? '1' : '0'});
+            if (explicitPi) query.set('fast_mode', explicitPi);
             for (const name of enabledLoras(loraNode, {upstream, widget, value})) query.append('lora', name);
             for (const row of referenceFiles(requestRefs)) query.append('ref', row);
             return query;
         };
         requestAssets.refresh(force);
+        if (explicitPi) {
+            clearTimeout(effortEstimateTimer); effortEstimateRequest?.abort(); effortEstimateKey = '';
+            return;
+        }
         const query = new URLSearchParams({width: requestWidth, height: requestHeight, seconds: value(node, 'seconds'), task, adapters: adapters ? '1' : '0'}).toString();
         if (query === effortEstimateKey && !force) { showEffortEstimate(); return; }
         clearTimeout(effortEstimateTimer);
@@ -2506,7 +2532,9 @@ export function openStudio(node, {extendFrom = null} = {}) {
         const parts = (effort?.element?.querySelector('.fv-effort-estimate')?.textContent || '').trim().split(' · ').filter(Boolean);
         keySetup = parts.some(setupPart);
         // A preview has no estimate of its own (the figures are for the whole two-pass run), so the line stays empty rather than show the wrong time.
-        const estimate = keyShowsEta && !comfyH3Model && !(previewFirst.checked && !previewFirst.disabled) ? parts.filter(part => !setupPart(part)).join(' · ') : '';
+        const pi = piMode(), piSeconds = pi ? piInfo(pi).seconds : null;
+        const estimate = !keyShowsEta ? '' : pi ? (piSeconds > 0 ? aboutTime(piSeconds, t) : '')
+            : !comfyH3Model && !(previewFirst.checked && !previewFirst.disabled) ? parts.filter(part => !setupPart(part)).join(' · ') : '';
         if (keyEta.textContent !== estimate) keyEta.textContent = estimate;
         const partCount = estimate ? effort?.element?.querySelector('.fv-effort-estimate')?.dataset.parts : undefined;
         if (partCount) { if (keyEta.dataset.parts !== partCount) keyEta.dataset.parts = partCount; } else delete keyEta.dataset.parts;
@@ -2535,7 +2563,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     liftMenu(keyMore, keyMenu);
     const syncKeyMore = () => {
         const state = passState();
-        keyMore.hidden = runMode !== 'single' || videoMissing || Boolean(comfyH3Model || state.hidden.preview || extension.source);
+        keyMore.hidden = runMode !== 'single' || videoMissing || fixedVideoSampling() || Boolean(state.hidden.preview || extension.source);
         for (const b of keyChoices) setAttr(b, 'aria-pressed', String((b.dataset.choice === 'preview') === (state.mode === 'preview')));
         keyChoices[1].disabled = state.disabled.preview && !(state.mode === 'preview');
         keyMenuWhy.hidden = !fastOn() && !previewStepsWrong(); keyMenuWhy.textContent = fastOn() ? fastRowWords() : previewStepsWrong() ? previewNeedsSteps() : '';
@@ -2668,9 +2696,10 @@ export function openStudio(node, {extendFrom = null} = {}) {
         return !n ? t('Add videos', '添加视频') : n === 1 ? t('Add 1 video', '添加 1 个视频') : t('Add {n} videos', '添加 {n} 个视频', { n });
     }
     function updateRunButton() {
-        const submitting = capturing || queueState?.submitting;
+        const pi = piMode(), installingPi = waitingForPi?.model === pi && waitingForPi !== null;
+        const submitting = capturing || queueState?.submitting || installingPi;
         updateFirstFrame();
-        const multiple = !comfyH3Model && lengthControl.plan?.count > 1;
+        const multiple = !fixedVideoSampling() && lengthControl.plan?.count > 1;
         // A long/continued video temporarily uses one run. Keep the user's mode
         // preference so returning to a short video and reloading show the same choice.
         runMode = multiple || extension.source ? 'single'
@@ -2684,12 +2713,12 @@ export function openStudio(node, {extendFrom = null} = {}) {
             : chain?.state === 'queued' ? (chain.waiting ? waitingText(chain.waiting, t) : t('Queued…', '排队中…'))
             : t('Generating part {part}…', '正在生成第 {part} 段…', { part: position.index + 1 });
         const fastShort = fastShortfall(), fastWait = fastUnknown();
-        const lengthBlocked = !comfyH3Model && lengthControl.blocked;
+        const lengthBlocked = !fixedVideoSampling() && lengthControl.blocked;
         generate.disabled = submitting || chainWait || (lengthBlocked && !lengthControl.retryable) || Boolean(fastShort)
             || fastWait === 'checking' || (runMode === 'loop' && queueState?.looping) || enhancer.reversing;
         paintReverse?.();
         // Planning the parts and adding a batch are different waits; a count is only shown when the queue really has one.
-        const adding = queueState?.batch ? t('Adding {current}/{total}…',
+        const adding = installingPi ? t('Installing pi-H3…', '正在安装 pi-H3…') : queueState?.batch ? t('Adding {current}/{total}…',
             '正在添加 {current}/{total}…', { current: Math.min(queueState.batch.done + 1, queueState.batch.total), total: queueState.batch.total })
             : capturing ? t('Planning segments…', '正在规划分段…') : t('Adding…', '正在添加…');
         const label = submitting ? adding
@@ -2723,7 +2752,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
             : fastShort ? fastShortfallWords(fastShort)
             : fastWait === 'checking' ? fastUnknownWords(fastWait)
             : t('A loop is running. Stop it to start again.', '正在循环生成，停止后可重新开始');
-        const lengthSaid = videoMissing ? '' : lengthBlocked ? lengthControl.visibleMessage : fastShort ? fastShortfallWords(fastShort)
+        const lengthSaid = videoMissing ? '' : pi && !borrowed ? piProblem(pi) : lengthBlocked ? lengthControl.visibleMessage : fastShort ? fastShortfallWords(fastShort)
             : fastWait ? fastUnknownWords(fastWait) : '';
         if (lengthWhy.textContent !== lengthSaid) lengthWhy.textContent = lengthSaid;
         if (lengthWhy.hidden !== !lengthSaid) lengthWhy.hidden = !lengthSaid;
@@ -2886,16 +2915,52 @@ export function openStudio(node, {extendFrom = null} = {}) {
             status.textContent = reply.status === 'cancelling' ? t('Stopping generation…', '正在停止生成…') : '';
         } catch (error) { cancelling = false; updateRunButton(); showQueueError(error); }
     }
+    function piInfo(model) {
+        const status = videoPicker.status(model);
+        if (status?.compatible === false) return {known: true, listed: false, reason: status.compatibility_reason};
+        return piVideoModeInfo(fastGrid, model, value(node, 'width'), value(node, 'height'), piFrames());
+    }
+    async function exactPiInfo(model) {
+        const current = piInfo(model), context = capabilityContext(node, {custom: true});
+        if (!context || current.maxFrames !== undefined || current.known && !current.listed) return current;
+        for (let attempt = 0; attempt < 4 && !disposed; attempt++) {
+            try {
+                const response = await api.fetchApi('/freevideo/capabilities?' + context, {cache: 'no-store'});
+                if (!response.ok) break;
+                const grid = await response.json();
+                if (grid.status === 'ready') return piVideoModeInfo(grid, model, value(node, 'width'), value(node, 'height'), piFrames());
+                if (grid.status !== 'computing') break;
+                await new Promise(resolve => setTimeout(resolve, Math.min(1000, 1000 * (grid.retry_after_seconds || .5))));
+            } catch { break; }
+        }
+        return current;
+    }
+    function piProblem(model, info = null) {
+        if (!isPiVideoModel(model)) return '';
+        let originalAudio = originalOn;
+        try { originalAudio ||= Boolean(activeOriginal(JSON.parse(value(mediaNode, 'assets') || '[]'))); } catch {}
+        const length = lengthControl.options();
+        return piVideoProblem(t, model, {continuation: extension.source || value(node, 'continue_from'),
+            multipart: !length.single && length.blockSeconds > 0 && length.seconds > length.blockSeconds
+                && Object.hasOwn(node.properties || {}, 'freevideo_block_seconds'),
+            originalAudio, settingsLinked: piSamplingInputs.some(name => linked(node, name)), info: info || piInfo(model), frames: piFrames()});
+    }
+    const piDraft = () => JSON.stringify([prompt.value, enhancer.draftRevision, runMode, byLine(), count.value, mode.value,
+        ...['width', 'height', 'seconds', 'frames', 'seed', 'continue_from'].map(name => value(node, name)),
+        value(mediaNode, 'assets'), value(loraNode, 'adapters'), referenceItems(node), extension.source?.video]);
+
     async function submitDraft(options) {
         // Borrowed by the editor: its Generate runs the editor's own submission (editor_bar.js), with this bar's values.
         if (borrowed) {
+            const lending = borrowed, selectedModel = lending.videoModelSelection?.();
             // The enhancement and the replace-person check are this bar's; what is then made is the editor's.
             if (swapState(mediaNode)) {
                 const missing = swapMissing(swapState(mediaNode));
                 if (missing) { status.dataset.error = 'true'; status.textContent = swapMissingText(missing, t); return; }
             }
             if (prompt.value.trim() && !swapState(mediaNode) && await enhancer.beforeGenerate() === false) return;
-            return borrowed.submit(options);
+            if (borrowed !== lending || lending.videoModelSelection?.() !== selectedModel) return;
+            return lending.submit(options);
         }
         if (videoMissing) {
             // The answer comes from this computer at once; the button waits for it so a click is never silent.
@@ -2906,9 +2971,13 @@ export function openStudio(node, {extendFrom = null} = {}) {
             return;
         }
         const emptyAllowed = options?.allowEmpty === true;
-        if (capturing || queueState?.submitting) return;
+        if (capturing || queueState?.submitting || waitingForPi) return;
         const selectedModel = videoModel;
         const nativeModel = comfyH3Model;
+        const selection = selectedVideoMode(), explicitPi = isPiVideoModel(selection);
+        const fixedSampling = nativeModel || explicitPi;
+        const problem = piProblem(selection);
+        if (problem) { status.dataset.error = 'true'; status.textContent = problem; return; }
         if (nativeModel && (extension.source || Object.keys(COMFY_H3_SAMPLING).some(name => linked(node, name)))) {
             status.dataset.error = 'true';
             status.textContent = extension.source
@@ -2921,11 +2990,11 @@ export function openStudio(node, {extendFrom = null} = {}) {
         // Ctrl+Enter leaves focus in a field: commit its edit (change fires on blur) first.
         const editing = dialog.contains(document.activeElement) ? document.activeElement : null;
         if (editing && editing !== generate) { editing.blur(); editing.focus({preventScroll: true}); }
-        if (!nativeModel) lengthControl.settleUnusedBlock();
+        if (!fixedSampling) lengthControl.settleUnusedBlock();
         // The fields of this request, shown or in a closed tray. A field in a form of its own (the preset name) is that form's
         // to check; the frame window's two boxes only mirror the width and height, which are checked themselves.
         const invalid = [...dialog.querySelectorAll('input:not(:disabled)')].find(e => !e.form && !e.classList.contains('fvp-dim')
-            && (!nativeModel || !e.closest('.fv-length-controls')) && !e.checkValidity());
+            && (!fixedSampling || !e.closest('.fv-length-controls')) && !e.checkValidity());
         if (invalid) {
             const details = invalid.closest('details'); if (details) details.open = true;
             // Three columns: a field in the folded Advanced options section opens it (the field must be on screen to say what is wrong).
@@ -2982,6 +3051,21 @@ export function openStudio(node, {extendFrom = null} = {}) {
         if (texts && !texts.length) { status.dataset.error = 'true'; status.textContent = t('Write one prompt per line, then add them.', '每行写一条提示词后再添加。'); prompt.focus(); return; }
         if (texts && texts.length > 100) { status.dataset.error = 'true'; status.textContent = t('At most 100 lines at a time; there are {count}.', '一次最多 100 行，现在有 {count} 行。', { count: texts.length }); prompt.focus(); return; }
         if (texts && timedParse(texts.join('\n'))[1].length) { status.dataset.error = 'true'; status.textContent = t('Timed lines cannot be split into separate videos. Turn off One prompt per line.', '带时间的台词不能拆成多个视频，请关闭“每行一条提示词”。'); return; }
+        if (explicitPi && !videoPicker.status(selection)?.present) {
+            const pending = waitingForPi = {model: selection, draft: piDraft()};
+            updateRunButton();
+            const currentDraft = () => !disposed && dialog.open && !borrowed && waitingForPi === pending
+                && selectedVideoMode() === selection && piDraft() === pending.draft;
+            const ready = await videoPicker.ensure(selection, currentDraft);
+            const same = currentDraft();
+            if (waitingForPi === pending) waitingForPi = null;
+            if (disposed || borrowed) return;
+            updateRunButton();
+            if (!ready) {
+                if (same) { status.dataset.error = 'true'; status.textContent = piVideoDownloadText(t, videoPicker.status(selection)); }
+                return;
+            }
+        }
         const originalSeed = value(node, 'seed'), seedMode = mode.value;
         // A request that is not accepted leaves the node mode as the user had it; a retry turns it on again.
         // Once the server has taken a request it stays taken; only a request it never took is undone.
@@ -2990,14 +3074,20 @@ export function openStudio(node, {extendFrom = null} = {}) {
         try {
             stopNote = ''; lastQueueError = null; failure.clear(); node.freevideoFailure = ''; node.freevideoFailureReport = null;
             capturing = true; updateRunButton(); status.dataset.error = 'false'; runOptions.open = false;
-            if (!nativeModel) lengthControl.freeze();
+            if (!fixedSampling) lengthControl.freeze();
             // Lines are sent as written: an enhanced rewrite would merge them into one description.
             if (!texts && (!extension.source || prompt.value.trim()) && !swapState(mediaNode) && await enhancer.beforeGenerate() === false) return;
             if (disposed) return;
             if (selected === 'input' && !dimensionsLinked) await inputRatio(true);
-            const lengthPlan = nativeModel ? null : await lengthControl.ready();
-            if (disposed || (!nativeModel && lengthControl.blocked)) return;
-            if (!nativeModel) {
+            const lengthPlan = fixedSampling ? null : await lengthControl.ready();
+            if (disposed || (!fixedSampling && lengthControl.blocked)) return;
+            if (explicitPi) {
+                const info = await exactPiInfo(selection);
+                if (disposed) return;
+                const problem = piProblem(selection, info);
+                if (problem) { status.dataset.error = 'true'; status.textContent = problem; return; }
+            }
+            if (!fixedSampling) {
                 // A saved or restored Fast setting on a machine the planner has not offered it to is sampled at Light.
                 if (fastOn() && !fastOffered()) chooseEffort(effort.levels().find(tier => tier.name === 'Light'));
                 const short = fastShortfall();
@@ -3007,7 +3097,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
             }
             if (originalOn && lengthPlan?.count > 1 && !twoPass.checked) { status.dataset.error = 'true'; status.textContent = partsNeedTwoPassText(t); return; }
             if (lengthPlan?.count > 1 && chosenMode !== 'single') { status.textContent = t('Videos made in parts cannot use batch or loop.', '分段视频不能批量或循环生成。'); return; }
-            const lengthOptions = nativeModel ? null : lengthControl.options();
+            const lengthOptions = fixedSampling ? null : lengthControl.options();
             const usageContext = nativeModel ? null : capabilityContext(node, {custom: true});
             const usageQuery = usageContext && !extension.source && !seconds.disabled ? new URLSearchParams(usageContext) : null;
             // Missing material dimensions or linked settings cannot describe the same request reliably.
@@ -3016,7 +3106,8 @@ export function openStudio(node, {extendFrom = null} = {}) {
                     seconds: lengthPlan?.partSeconds?.[0] ?? Number(seconds.value), base_steps: baseSteps.value,
                     refine_steps: refineSteps.value, two_pass: twoPass.checked ? '1' : '0',
                     // No cache is sent as the engine's own 'none': an absent one would read as the tier's default cache.
-                    step_cache: stepCacheNow() ?? 'none', upscale_factor: upscaleNow()})) usageQuery.set(key, val);
+                    step_cache: stepCacheNow() ?? 'none', upscale_factor: upscaleNow(),
+                    ...(explicitPi ? {fast_mode: selection, two_pass: '0', base_steps: piVideoSteps(selection), step_cache: 'none', upscale_factor: 2} : {})})) usageQuery.set(key, val);
                 await otherUsage.check(usageQuery);
             } else await otherUsage.check(null);
             if (disposed) return;
@@ -3031,7 +3122,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
             for (const section of controls.querySelectorAll('.fv-section')) section.inert = true;
             held = turnNodeOn(node);
             const graph = cleanOptionalPrompt(clonePrompt(await app.graphToPrompt()));
-            applyVideoModelSnapshot(graph, node.id, selectedModel);
+            applyVideoModelSnapshot(graph, node.id, selectedModel, selection);
             if (emptyAllowed && !prompt.value.trim() && !extension.source) allowEmptyPrompt(graph, node.id);
             snapshot = singleRunSnapshot(extendSnapshot(graph, node.id, source,
                 {multiple: lengthPlan?.count > 1}), node.id, lengthPlan);
@@ -3079,7 +3170,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     dialog.addEventListener('pointerdown', closeMenus);
     function updateDuration() {
         const requested = Math.ceil(Number(seconds.value) * 24), frames = requested + ((5 - requested) % 17 + 17) % 17;
-        const multiple = !comfyH3Model && lengthControl.plan?.count > 1;
+        const multiple = !fixedVideoSampling() && lengthControl.plan?.count > 1;
         const length = multiple ? lengthControl.plan.seconds : Number.isFinite(frames) ? frames / 24 : null;
         const whole = Math.round(length), minutes = Math.floor(whole / 60), rest = whole % 60;
         duration.textContent = length === null ? '—' : `${length <= 60 ? `${multiple ? length : length.toFixed(3)} s`
@@ -3338,9 +3429,12 @@ export function openStudio(node, {extendFrom = null} = {}) {
     // same chips and their rules stay in one place. Pressing Generate runs the editor's submission instead; the values
     // come from the same node the bar edits. Release puts everything back as it was.
     let popHolder = null;
-    current.borrow = ({mount, submit, label = null, previews = null, disabled = null, onSeconds = null, onFirstFrame = null, initial = {}, locked = []}) => {
+    current.borrow = ({mount, submit, label = null, previews = null, disabled = null, onSeconds = null, onFirstFrame = null,
+        modelPicker = null, videoModelSelection = null, initial = {}, locked = []}) => {
         if (borrowed || disposed) return null;
         columns?.restore(); // the editor shows the console bar, not the column
+        videoPicker.close(); waitingForPi = null;
+        if (modelPicker) { modelPicker.classList.add('fvs-chip'); videoPicker.element.replaceWith(modelPicker); }
         const outer = mount.closest('dialog') || document.body;
         const home = {parent: controls.parentNode, next: controls.nextSibling};
         // The pop-ups travel inside one display:contents holder, so a switch moves one node instead of every pop-up.
@@ -3357,7 +3451,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
             }
             element.dataset.fvLocked = name;
         };
-        const state = {shell, prompt, controls, sync: () => { updateRunButton(); consoleUI?.sync?.(); },
+        const state = {shell, prompt, controls, sync: () => { syncVideoSampling(); updateRunButton(); consoleUI?.sync?.(); },
             values: () => ({width: Number(value(node, 'width')), height: Number(value(node, 'height')), seconds: Number(value(node, 'seconds'))}),
             // Every setting changed in the bar while it is borrowed (the request is built from these).
             overrides: () => Object.fromEntries(shadow?.get(node) || []),
@@ -3367,6 +3461,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
             release({disposing = false} = {}) {
                 if (!borrowed) return;
                 borrowed = null; shadow = null;
+                if (modelPicker) { modelPicker.replaceWith(videoPicker.element); modelPicker.classList.remove('fvs-chip'); }
                 placeReverse();
                 unlock(); updateFirstFrame();
                 shell.remove();
@@ -3374,12 +3469,13 @@ export function openStudio(node, {extendFrom = null} = {}) {
                     if (home.next?.parentNode === home.parent) home.parent.insertBefore(controls, home.next); else home.parent.append(controls);
                     dialog.append(popHolder);
                     columns?.apply();
-                    syncSamplingColumns();
+                    syncVideoSampling(); syncSamplingColumns();
                 }
                 updateRunButton();
             }};
         shadow = new Map();
-        borrowed = {submit, label: () => (state.labelFn ?? label)?.(), previews, disabled, onSeconds, onFirstFrame, firstFrame: null, applying: false, release: state.release};
+        borrowed = {submit, label: () => (state.labelFn ?? label)?.(), previews, disabled, onSeconds, onFirstFrame, videoModelSelection,
+            firstFrame: null, applying: false, release: state.release};
         placeReverse();
         const unlock = () => {
             for (const control of lockedNow.splice(0)) { control.disabled = false; delete control.dataset.fvLocked; }
@@ -3401,12 +3497,12 @@ export function openStudio(node, {extendFrom = null} = {}) {
             if (borrowed) borrowed.applying = false;
             consoleUI?.sync?.(); updateRunButton();
         };
-        state.apply({initial, locked});
+        syncVideoSampling(); state.apply({initial, locked});
         consoleUI?.sync?.(); updateRunButton();
         return state;
     };
     capabilityView = createCapabilityView({node, api, t, getState: () => ({ratio,
-        custom: selected === 'custom', steps: Number(baseSteps.value), twoPass: twoPass.checked,
+        custom: selected === 'custom', steps: Number(baseSteps.value), twoPass: twoPass.checked, fastMode: piMode(),
         refine: Number(refineSteps.value), stepCache: stepCacheNow(), upscale: upscaleNow(), disabled: Boolean(extension.source) || dimensionsLinked || seconds.disabled}),
         onEstimate: () => showEffortEstimate(), onGrid: applyFastOffer, onPick: point => {
         pixels = point.pixels; mp.value = String(pixels);
@@ -3521,6 +3617,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     // length is made in parts.
     const longest = () => {
         if (comfyH3Model) return 15;
+        if (piMode()) return 60;
         try { const one = lengthControl?.absent ? null : lengthControl?.options().singleLimit; return one > 0 ? Math.max(5, Math.floor(one) * 8) : 60; } catch { return 60; }
     };
     // A locked length says what decides it: the audio used as is (the old field's lock shows that) or a connected node.
@@ -3536,7 +3633,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     }, true);
     const stepValue = stepper.element.querySelector('.fvs-step-value');
     const paintDuration = () => {
-        const plan = lengthControl?.plan, parts = !comfyH3Model && plan?.count > 1 ? plan.count : 0;
+        const plan = lengthControl?.plan, parts = !fixedVideoSampling() && plan?.count > 1 ? plan.count : 0;
         stepValue.dataset.fvTipUse = parts ? t('Made in {parts} parts and joined', '分 {parts} 段生成并拼接', { parts }) : t('Click to type an exact length', '点一下输入精确时长');
         stepper.sync();
     };
@@ -3573,6 +3670,12 @@ export function openStudio(node, {extendFrom = null} = {}) {
     };
     const loraCount = () => { try { return enabledCount(JSON.parse(value(loraNode, 'adapters') || '[]')); } catch { return 0; } };
     const shapeName = () => selected === 'input' ? t('Match image', '跟随图片') : studioShapes(t).find(([id]) => id === selected)?.[1] || t('Custom size', '自定义');
+    videoPicker = createVideoModelPicker({fetchApi: api.fetchApi.bind(api), t, scope: 'studio',
+        initial: value(node, 'fast_mode') === 'fast4' ? 'fast4' : null,
+        onChange: () => { waitingForPi = null; syncVideoSampling(); },
+        onActive: model => { videoModel = model; syncVideoSampling(); }});
+    if (fastGrid) videoPicker.setCapabilities(fastGrid);
+    cleanup.push(videoPicker.dispose);
     consoleUI = createConsole({t, body, controls, prompt: promptSection, runbar,
         trays: [{id: 'media', title: t('Media', '素材'), element: mediaDetails},
             {id: 'lora', title: 'LoRA', element: loraDetails},
@@ -3582,7 +3685,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
                 const n = mediaCount();
                 return {label: t('Media', '素材'), badge: n || null, tip: [t('Media', '素材'), t('Add reference images, video and sound', '加参考图、视频和声音')]};
             }},
-            {element: mention},
+            {element: mention}, {element: videoPicker.element},
             {element: framePicker.element},
             {element: stepper.element}, {element: qualityChip.element},
             // Prompt enhancement as a key in this row (lit while on); its versions and Rewrite follow it while it is on.
@@ -3603,7 +3706,7 @@ export function openStudio(node, {extendFrom = null} = {}) {
     if (body.dataset.cols === '3') controls.prepend(body.foldLeft), controls.append(body.settingsRail);
     if (body.dataset.cols === '3') {
         const part = id => consoleUI.chip(id);
-        columns = layoutColumns({t, controls, consoleUI, fold: body.foldLeft, rail: body.settingsRail, parts: {media: part('media'), mention, enhance: enhancer.chip, size: framePicker.element,
+        columns = layoutColumns({t, controls, consoleUI, fold: body.foldLeft, rail: body.settingsRail, parts: {model: videoPicker.element, media: part('media'), mention, enhance: enhancer.chip, size: framePicker.element,
             duration: stepper.element, quality: effort.element, pass: passMode, runbar,
             // The level's line and the Fast level's download row stand under the levels, as in the Quality window (the column has no such window).
             qualityMore: [levelUse, fastPack.element]}});
@@ -3613,27 +3716,34 @@ export function openStudio(node, {extendFrom = null} = {}) {
     paintDuration(); paintQuality();
     function syncSamplingColumns() {
         if (!columns) return;
-        const hidden = Boolean(comfyH3Model);
+        const hidden = fixedVideoSampling();
         for (const section of columns.parts.scroll.querySelectorAll('[data-section=quality], [data-section=pass]')) section.hidden = hidden;
         const labels = [t('Quality', '质量'), t('Second pass', '二采')];
         for (const button of body.settingsRail.querySelectorAll('.fv-sc-rail-icon')) {
             if (labels.includes(button.dataset.fvTipName)) button.hidden = hidden;
         }
     }
-    let videoProfileChanged = false;
-    function showActiveVideoModel(model) {
-        if (disposed || model === undefined) return;
-        videoModel = model;
-        const native = model?.kind === 'comfy_h3' ? model : null;
-        if (native?.id === comfyH3Model?.id) return;
+    let samplingProfile;
+    function syncVideoSampling() {
+        if (disposed) return;
+        const pi = piMode(), selection = selectedVideoMode();
+        const native = !pi && videoModel?.kind === 'comfy_h3' ? videoModel : null;
+        const profile = `${selection ?? ''}:${native?.id ?? ''}`;
+        if (samplingProfile === profile) return;
+        samplingProfile = profile;
         comfyH3Model = native;
-        const enabled = Boolean(native);
-        dialog.dataset.comfyH3 = String(enabled);
+        const enabled = Boolean(native || pi);
+        dialog.dataset.comfyH3 = String(Boolean(native));
+        dialog.dataset.piH3 = String(Boolean(pi));
         qualityChip.element.hidden = samplingWarning.hidden = enabled;
         if (enabled) qualityChip.close();
         syncSamplingColumns();
         comfyH3Notice.hidden = !enabled;
-        if (enabled) {
+        if (pi) {
+            const steps = piVideoSteps(pi);
+            comfyH3Notice.textContent = t('pi-H3 · Single pass · {steps} steps', 'pi-H3 · 单次采样 · {steps} 步', {steps});
+            comfyH3Notice.title = comfyH3Notice.textContent;
+        } else if (native) {
             const preset = native.preset === 'ref2va' ? 'Ref2VA' : native.preset?.toUpperCase();
             const title = [native.label, preset].filter(Boolean).join(' · ');
             const steps = COMFY_H3_SAMPLING.base_steps;
@@ -3641,14 +3751,12 @@ export function openStudio(node, {extendFrom = null} = {}) {
                 '{title} · 单次采样 {steps} 步，最长约 15 秒。此模型不支持预览、续写和 LoRA。', {title, steps});
             comfyH3Notice.title = comfyH3Notice.textContent;
         }
+        effort.setLevels(fastLevels());
         syncSamplingSteps();
         updateDuration();
         updateRunButton();
     }
-    const modelChanged = event => { videoProfileChanged = true; showActiveVideoModel(event.detail); };
-    window.addEventListener(VIDEO_MODEL_CHANGED, modelChanged);
-    cleanup.push(() => window.removeEventListener(VIDEO_MODEL_CHANGED, modelChanged));
-    activeVideoModel(api.fetchApi.bind(api)).then(model => { if (!videoProfileChanged) showActiveVideoModel(model); });
+    syncVideoSampling();
     // Space plays or pauses the stage video and M turns its sound on or off, unless a field or a control has the key.
     cleanup.push(listenDialogKey(dialog, 'keydown', event => {
         if (event.ctrlKey || event.metaKey || event.altKey || event.isComposing || event.repeat) return;
@@ -3799,12 +3907,8 @@ export function openStudio(node, {extendFrom = null} = {}) {
             if (!baseSteps.disabled) {
                 holdPreview(false);
                 const tier = settings.level && effort.levels().find(level => level.name === settings.level);
-                // A Fast preset where this machine does not list it, or before its files are here, is sampled at Light;
-                // with the level listed, its download is offered.
-                if (settings.level === FAST_EFFORT.name && (!tier || !fastPack.present)) {
-                    chooseEffort(effort.levels().find(level => level.name === 'Light'));
-                    if (tier) fastPack.ask();
-                } else if (tier) chooseEffort(tier);
+                if (settings.level === FAST_EFFORT.name) videoPicker.select('fast2');
+                else if (tier) chooseEffort(tier);
                 else if (settings.steps) {
                     fastLeft();
                     baseSteps.value = String(settings.steps.base); refineSteps.value = String(settings.steps.refine); twoPass.checked = Boolean(settings.steps.twoPass);

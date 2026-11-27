@@ -515,7 +515,7 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
                     // about: both estimates and the final request use this size.
                     const value = capabilityPoints(reply, {...options, ...size});
                     const ready = {maxSeconds: value.maxSeconds, maxFollowSeconds: value.maxFollowSeconds, maxRequestFrames: value.maxRequestFrames,
-                        sizes: reply.sizes, generationSize: size,
+                        sizes: reply.sizes, generationSize: size, grid: reply,
                         estimate: frames => interpolate(value.points, frames / 24)};
                     onReady(ready); poller.dispose();
                 } catch { if (active) poller.dispose(); }
@@ -524,17 +524,21 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
             // these limits; only the callback publishes a measured capability.
             read(); return fallback;
         },
-        // The longest single part this computer makes at a size other than the edit's; null when it cannot be told.
-        async requestFrames(size, settings) {
+        async capabilityGrid(size) {
             try {
                 for (let tries = 0; tries < 5 && !disposed; tries++) {
                     const reply = await json('/freevideo/capabilities?' + new URLSearchParams(size));
-                    if (reply?.status !== 'computing') return !reply || (reply.status && reply.status !== 'ready') ? null
-                        : capabilityPoints(reply, {...size, settings}).maxRequestFrames;
+                    if (reply?.status !== 'computing') return reply && (!reply.status || reply.status === 'ready') ? reply : null;
                     await new Promise(done => clock.setTimeout(done, 1000));
                 }
             } catch { /* not known */ }
             return null;
+        },
+        // The longest single part this computer makes at a size other than the edit's; null when it cannot be told.
+        async requestFrames(size, settings) {
+            const reply = await store.capabilityGrid(size);
+            try { return reply ? capabilityPoints(reply, {...size, settings}).maxRequestFrames : null; }
+            catch { return null; }
         },
         async startChain(payload) {
             if (standIn) return standIn.startChain(payload);
@@ -549,6 +553,8 @@ export function createEditorStore(api, {t = en => en, notify = () => {}, onGener
                 // The server's own sentence for a video with too many parts, or a continued part too short, is shown as it is.
                 const body = await response.json().catch(() => null);
                 if (['chain_too_long', 'chain_part_too_short', 'chain_short_parts'].includes(body?.code)) throw Object.assign(new Error(body.code), {code: body.code, said: [body.error, body.error_zh]});
+                if (body?.code === 'fast_mode_incompatible') throw Object.assign(new Error(body.code),
+                    {code: 'pi_video', say: t(body.error, body.error_zh || body.error)});
                 throw Object.assign(new Error(typeof body?.error === 'string' ? body.error : body?.message || `HTTP ${response.status}`),
                     {status: response.status, reason: body?.reason || body?.code, response: body});
             }

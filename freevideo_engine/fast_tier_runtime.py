@@ -7,13 +7,12 @@ The adapter also replaces three whole matrices in each of the last four blocks, 
 on the last step its features are kept for the pixel head (dwd_head), which runs
 after the transformer is released.
 """
-import hashlib
 import re
 import types
 
 import torch
 
-from .fast_tier import ADAPTER, CONSTANTS, FILES, files
+from .fast_tier import CONSTANTS, files, mode_spec
 from .paths import installed_model_root
 from .tensor_io import open_tensors
 
@@ -156,14 +155,11 @@ class ReplacedLinear(torch.nn.Module):
 
 
 class Runtime:
-    def __init__(self, device):
+    def __init__(self, device, mode):
         # Resolved here so that requests and reports carry the mode and no local path.
-        paths = files(installed_model_root())
-        self.device, self.adapter = device, paths[ADAPTER]
-        constants = paths[CONSTANTS]
-        if hashlib.sha256(constants.read_bytes()).hexdigest() != FILES[CONSTANTS][1]:
-            raise ValueError('The fastest mode constants file changed')
-        with open_tensors(constants) as source:
+        paths = files(installed_model_root(), mode)
+        self.device, self.adapter = device, paths[mode_spec(mode)['adapter']]
+        with open_tensors(paths[CONSTANTS]) as source:
             self.bias = {key: source.get_tensor(key).float() for key in source.keys() if key.endswith('folded_bias')}
             table = source.get_tensor('time_embedder.table').float()
         self.clock = Clock(table.to(device))
@@ -174,7 +170,7 @@ class Runtime:
         tensors = adapter_tensors(self.adapter, lambda name: name in names or name in root or (
             name.startswith('transformer_blocks.') and '.adaln_proj.linear.' in name))
         self.weights = {key: value.float().to(device) for key, value in tensors.items() if key.endswith('.adaln_proj.linear.weight')}
-        # The two-step adapter brings its own modulation bias for its last four blocks; it wins over the folded one.
+        # The adapter's own modulation bias for its last four blocks wins over the folded one.
         self.own_bias = {key: value.float() for key, value in tensors.items()
                          if key.startswith('transformer_blocks.') and key.endswith('.adaln_proj.linear.bias')}
         self.matrices = {key: value for key, value in tensors.items() if key in names}

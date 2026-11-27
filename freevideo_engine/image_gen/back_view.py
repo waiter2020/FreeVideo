@@ -11,7 +11,7 @@ import secrets
 import time
 
 MAX_RETRIES = 2
-_POSE_FILE = 'keypointrcnn_resnet50_fpn_coco-fc266e95.pth'
+POSE_FILE = 'keypointrcnn_resnet50_fpn_coco-fc266e95.pth'
 
 
 @dataclass(frozen=True)
@@ -48,33 +48,40 @@ def assess_keypoints(points, scores, box):
     return Assessment('side', .5)
 
 
-def load_detector(pack_dir):
-    """Use an already present torchvision checkpoint, on CPU; absent means skip.
-
-    A pack may supply detectors/<filename>, or an existing Torch Hub cache may
-    supply it. No package installation, network access, GPU residency or eager
-    torch import on installations without that checkpoint.
-    """
+def default_checkpoint(pack_dir):
+    """Use the pack's checkpoint or an existing Torch Hub cache."""
     import os
     cache = Path(os.environ.get('TORCH_HOME') or
                  Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'torch')
+    pack = Path(pack_dir) / 'detectors' / POSE_FILE
+    cached = cache / 'hub' / 'checkpoints' / POSE_FILE
     try:
-        checkpoint = next((p for p in (Path(pack_dir) / 'detectors' / _POSE_FILE,
-                                      cache / 'hub' / 'checkpoints' / _POSE_FILE) if p.is_file()), None)
+        return cached if not pack.is_file() and cached.is_file() else pack
     except OSError:
-        return None
-    if checkpoint is None:
-        return None
+        return pack
+
+
+def pose_model(checkpoint):
+    import torch
+    from torchvision.models.detection import keypointrcnn_resnet50_fpn
+    model = keypointrcnn_resnet50_fpn(weights=None, weights_backbone=None, min_size=512, max_size=768)
+    model.load_state_dict(torch.load(checkpoint, map_location='cpu', weights_only=True), strict=True)
+    return model.eval()
+
+
+def load_detector(pack_dir, *, checkpoint=None):
+    """Use an already present torchvision checkpoint; absence skips the optional check."""
+    custom = checkpoint is not None
+    checkpoint = default_checkpoint(pack_dir) if checkpoint is None else checkpoint
     try:
+        if not checkpoint.is_file() and not custom:
+            return None
         import torch
-        from torchvision.models.detection import keypointrcnn_resnet50_fpn
         from torchvision.transforms.functional import pil_to_tensor
-        model = keypointrcnn_resnet50_fpn(weights=None, weights_backbone=None,
-                                          min_size=512, max_size=768)
-        model.load_state_dict(torch.load(checkpoint, map_location='cpu', weights_only=True))
-        model.eval()
+        model = pose_model(checkpoint)
     except Exception:
-        # An optional cache/dependency failure must not fail image generation.
+        if custom:
+            raise
         return None
 
     def detect(image):

@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 import time
 
+from .model_components_generation import vae_directory
+
 
 def weight_cache_limits(allocator_bytes):
     """Bound optional retained weights by the actual admitted Metal capacity."""
@@ -82,9 +84,10 @@ def decode_to_file(latents, audio_latents, output, *, base, artifacts_dir,
     try:
         with torch.no_grad():
             phase('Loading video VAE')
-            vae = skeleton(AutoencoderKLMiniMaxH3, base / 'vae')
+            directory = vae_directory(base)
+            vae = skeleton(AutoencoderKLMiniMaxH3, directory)
             vae.encoder = vae.quant_conv = None
-            paths = tuple(sorted((base / 'vae').glob('*.safetensors')))
+            paths = tuple(sorted(directory.glob('*.safetensors')))
             load_parameters(vae, paths, device_for_name=lambda name:
                 'meta' if name.startswith('decoder.transformer_blocks.') else 'mps',
                 linear_fp16=False, mapped=False)

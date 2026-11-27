@@ -409,6 +409,17 @@ def _record_texts(context):
             yield json.dumps(row, default=str)
 
 
+def forgotten_prompts(prompts, output_root):
+    from . import private_store
+    matches = private_store.forgotten(prompts)
+    if not matches:
+        return []
+    # A kept or undoable work can use the prompt again after a deletion marked it forgotten.
+    from .comfy_library import _kept_facts
+    _, kept = _kept_facts(Path(output_root) / 'FreeVideo')
+    return [index for index in matches if private_store.name('prompt', prompts[index].strip()) not in kept]
+
+
 def register_routes(server, web, folder_paths, context):
     """The Settings page's cleanup: GET the list, POST the confirmed list; the earlier pictures one by one."""
     import asyncio
@@ -460,7 +471,7 @@ def register_routes(server, web, folder_paths, context):
             prompts = value.get('prompts') if isinstance(value, dict) else None
             if not isinstance(prompts, list) or len(prompts) > 1000:
                 raise ValueError('Invalid list')
-            result = await asyncio.to_thread(private_store.forgotten, prompts)
+            result = await asyncio.to_thread(forgotten_prompts, prompts, folder_paths.get_output_directory())
         except (OSError, ValueError, TypeError) as error:
             return web.json_response({'error': str(error)}, status=400, headers=headers)
         return web.json_response({'forget': result}, headers=headers)
@@ -506,7 +517,10 @@ def register_routes(server, web, folder_paths, context):
         # Not while something is being made: a running request may be reading or writing these files.
         if generating():
             return web.json_response({'error': 'busy'}, status=409, headers=headers)
-        freed = await asyncio.to_thread(private_store.clear_cache, cache_roots())
+        try:
+            freed = await asyncio.to_thread(private_store.clear_cache, cache_roots())
+        except BlockingIOError:
+            return web.json_response({'error': 'busy'}, status=409, headers=headers)
         return web.json_response({'freed_bytes': freed}, headers=headers)
 
     @server.routes.post('/freevideo/private/legacy-delete')

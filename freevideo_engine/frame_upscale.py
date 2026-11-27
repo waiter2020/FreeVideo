@@ -66,6 +66,10 @@ def catalog():
     return json.loads(Path(__file__).with_name('frame_upscale_model.json').read_text(encoding='utf-8'))
 
 
+def default_weight(root):
+    return Path(root) / 'models' / 'frame-upscale' / catalog()['files'][0]['file']
+
+
 def _grid(value):
     # Half up, as Math.round in upscale_offer.js (Python's round would go to even).
     return int(math.floor(value / 8 + .5)) * 8
@@ -204,8 +208,8 @@ def ensure_weights(root, emit, check):
     from .adaln_assets import _download_plan
     spec = catalog()
     row = spec['files'][0]
-    folder = Path(root) / 'models' / 'frame-upscale'
-    path = folder / row['file']
+    path = default_weight(root)
+    folder = path.parent
     folder.mkdir(parents=True, exist_ok=True)
     with _lock(folder / 'download.lock', check):
         if path.is_file() and path.stat().st_size == row['bytes'] and _digest(path, check) == row['sha256']:
@@ -380,7 +384,14 @@ def _convert(request, emit, check):
         raise UpscaleError('upscale_disk', 'Not enough disk space to save the 4K video (about %d MB is needed). Free some '
                            'space on the drive that holds the output folder, then try again'
                            % (needed_bytes(video['frames']) // 10**6))
-    weights = ensure_weights(root, emit, check)
+    from .model_components import selected_file
+    default = default_weight(root)
+    weights = selected_file(root, 'frame-upscale', default.name, default)
+    if weights == default:
+        weights = ensure_weights(root, emit, check)
+        weight_sha256 = catalog()['files'][0]['sha256']
+    else:
+        weight_sha256 = _digest(weights, check)
     import torch
     if device == 'cuda':
         if not torch.cuda.is_available():
@@ -401,8 +412,9 @@ def _convert(request, emit, check):
         torch.cuda.reset_peak_memory_stats()
     frames = write(source, target, video, frame, emit, check)
     return dict(frames=frames, width=size(video['width'], video['height'])[0], height=size(video['width'], video['height'])[1],
-                seconds=round(time.monotonic() - started, 2), device=device, model='realesr-general-x4v3',
-                weights_sha256=catalog()['files'][0]['sha256'], tile=TILE, sound=video['sound'],
+                seconds=round(time.monotonic() - started, 2), device=device,
+                model='realesr-general-x4v3' if weights == default else 'Custom Real-ESRGAN General x4v3',
+                weights_sha256=weight_sha256, tile=TILE, sound=video['sound'],
                 torch_peak_reserved_bytes=torch.cuda.max_memory_reserved() if device == 'cuda' else None,
                 torch=torch.__version__)
 

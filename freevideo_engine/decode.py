@@ -8,6 +8,7 @@ import torch
 
 from .offload import LayerOffloader, pin_layer_weights
 from .vae_tiles import TileDecoder, compile_blocks
+from .model_components_generation import vae_directory
 
 
 DECODE_LABELS = {
@@ -49,6 +50,7 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
     started = time.perf_counter()
     vae = None
     weight_source = None
+    video_vae_dir = vae_directory(base)
     compute_cache_metrics = None
     if type(linear_compute_cache) is not bool:
         raise ValueError('linear_compute_cache must be a boolean')
@@ -62,7 +64,7 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
         raise ValueError('Streamed VAE weights require offloading without host preload or whole-model pinning')
     if model_cache is not None and not offload:
         from .resident_models import key, file_identity
-        vae_key = key([file_identity(path) for path in sorted((Path(base)/'vae').iterdir()) if path.is_file()])
+        vae_key = key([file_identity(path) for path in sorted(video_vae_dir.iterdir()) if path.is_file()])
         if linear_compute_cache:
             vae_key = key([vae_key, 'decoder-fp16-linear-v1'])
         vae = model_cache.take('video_vae', vae_key)
@@ -74,7 +76,7 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
         # straight to their device. Without the Linear cache all stay FP32.
         from .vae_weights import load_video_decoder
         layers = AutoencoderKLMiniMaxH3.load_config(
-            str(Path(base)/'vae'), local_files_only=True)['decoder_num_layers']
+            str(video_vae_dir), local_files_only=True)['decoder_num_layers']
         count = resident_blocks if offload else layers
         if stream_weights:
             from .streamed_weights import SafetensorLayers
@@ -89,7 +91,7 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
                     from .system import memory_sample
                     used = memory_sample(ProcessMemory().sample(os.getpid()))
                     return ram_budget_bytes - used if type(used) is int and used >= 0 else None
-            weight_source = SafetensorLayers((Path(base)/'vae').glob('*.safetensors'),
+            weight_source = SafetensorLayers(video_vae_dir.glob('*.safetensors'),
                 [f'decoder.transformer_blocks.{index}.' for index in range(count, layers)],
                 intermediate_dtype=torch.float32 if linear_compute_cache else None,
                 keep_converted=True, converted_room=room,
@@ -141,7 +143,7 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
         # buffers, avoiding small random page faults in the offload thread.
         read_started = time.perf_counter()
         buffer = bytearray(8 * 1024 * 1024)
-        for path in sorted((Path(base) / 'vae').glob('*.safetensors')):
+        for path in sorted(video_vae_dir.glob('*.safetensors')):
             with path.open('rb', buffering=0) as stream:
                 while stream.readinto(buffer):
                     pass
@@ -260,7 +262,8 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
             audio_vae = None
             if model_cache is not None:
                 from .resident_models import key, file_identity
-                audio_key = key([file_identity(path) for path in sorted((Path(base)/'audio_vae').iterdir()) if path.is_file()])
+                audio_key = key([file_identity(path) for path in sorted(vae_directory(base, audio=True).iterdir())
+                                 if path.is_file()])
                 audio_vae = model_cache.take('audio_vae', audio_key)
                 model_cache.make_room('audio_vae', 1*2**30, model=audio_vae, ram_need=256*2**20)
             audio_cache_hit = audio_vae is not None

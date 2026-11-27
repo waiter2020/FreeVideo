@@ -24,6 +24,8 @@ import { createUpdateNotice, releaseNotesInto, productVersion } from './updates.
 import { createImageGenClient } from './image_generation.js';
 import { IMAGE_MODELS, modelState, pausedText, continueUse } from './image_view_models.js';
 import { hfModelSettings } from './settings_video_models.js';
+import { createSettingsPiVideoPacks } from './settings_pi_video_packs.js';
+import { createModelManagement } from './model_management.js';
 import { VIDEO_MODEL_CHANGED } from './video_model.js';
 import { swapLoraFailureText } from './swap_lora.js';
 import { MODULES } from './health.js';
@@ -267,7 +269,25 @@ export async function openSetup(options) {
         sharedEncoderRow.sub.textContent = [sharedEncoderFormat, active?.damaged ? t('Active weights unavailable', '当前权重不可用') :
             active?.label && t(`In use: ${active.label}`, `使用中：${active.label}`)].filter(Boolean).join(' · ');
     }
-    models.append(...videoModels.elements, sharedEncoderCard);
+    const piVideoModels = createSettingsPiVideoPacks({fetchApi: api.fetchApi.bind(api), t});
+    later(piVideoModels.dispose);
+    const [videoHead, installedVideos, ...videoImport] = videoModels.elements;
+    const modelManagement = createModelManagement({...modelRequest, t, onManage: model => {
+        if (model.manager === 'video' && (model.manager_component === 'comfy_h3' ? videoModels.focusComfy() : videoModels.focusVideo())) return;
+        const target = model.manager === 'video' ? videoHead : model.manager === 'pi-video' ? piVideoModels.element : imageHead;
+        target.scrollIntoView?.({block: 'start'});
+        target.tabIndex = -1;
+        target.focus({preventScroll: true});
+        if (model.manager === 'image' && model.manager_model) imageModels.focusComponent(model.manager_model, model.manager_component || 'dit');
+    }});
+    function updateModelControls(info = {}) {
+        modelManagement.update(info.model_components, busy);
+        videoModels.update(info.video_models, busy || modelManagement.busy());
+        imageModels.update(info.image_models, busy || modelManagement.busy());
+        modelManagement.update(undefined, busy || videoModels.busy() || imageModels.busy());
+    }
+    models.append(modelManagement.element);
+    models.append(videoHead, installedVideos, piVideoModels.element, ...videoImport, sharedEncoderCard);
 
     // Picture models: both always listed, each with its own state (installed, not installed, downloading, failed).
     const imageCard = card(); const imageRows = new Map();
@@ -1367,8 +1387,7 @@ export async function openSetup(options) {
         tip(install, t('Install', '安装'), t('Download and fix what the plan lists', '按计划下载并修复缺少的部分'), {why: install.disabled ? why || t('Wait for the current task to finish', '请等待当前任务完成') : ''});
         recheck.hidden = !planErrors; install.hidden = planErrors; acceptLabel.hidden = busy || !planId;
         tip(calibrateButton, t('Start measuring', '开始测量'), t('Measure this computer; about 30 min per pass', '测量本机性能，每轮约 30 分钟'), {why: busy ? t('Wait for the current setup task to finish', '请等待当前安装任务完成') : ''});
-        videoModels.update(undefined, busy);
-        imageModels.update(undefined, busy);
+        updateModelControls();
         paintHero();
     };
     // A changed setting makes a shown plan outdated: clear it rather than leave it beside a disabled button.
@@ -1485,12 +1504,11 @@ export async function openSetup(options) {
             if (sequence !== pollSequence) return;
             token = info.discovery.token;
             render(info.task); showDownloads(info.discovery.downloads);
-            videoModels.update(info.video_models, busy);
-            imageModels.update(info.image_models, busy);
+            updateModelControls(info);
             paintSharedEncoder(info.image_models);
         }
         catch (error) { if (sequence !== pollSequence) return; fail(error); }
-        if (dialog.open && (busy || probeBusy || videoModels.busy() || imageModels.busy())) pollTimer = setTimeout(poll, 750);
+        if (dialog.open && (busy || probeBusy || videoModels.busy() || imageModels.busy() || modelManagement.busy())) pollTimer = setTimeout(poll, 750);
     }
     async function saveModelFolders() {
         const result = await request('model-directories', {extra_libraries: extra.value.split("\n")});
@@ -1562,12 +1580,11 @@ export async function openSetup(options) {
         paths.dataset.count = String(libs.length);
         ready = Boolean(info.discovery.ready);
         render(info.task || {});
-        videoModels.update(info.video_models, busy);
-        imageModels.update(info.image_models, busy);
+        updateModelControls(info);
         paintSharedEncoder(info.image_models);
         // A failure the last task left stays readable; only a quiet ready installation says it is ready.
         if (info.discovery.ready && !busy && info.task?.status !== 'failed') state.textContent = t("Ready to generate.", "已就绪，可以开始生成。");
-        if (busy || probeBusy || videoModels.busy() || imageModels.busy()) poll();
+        if (busy || probeBusy || videoModels.busy() || imageModels.busy() || modelManagement.busy()) poll();
         paintHero();
     } catch (error) { loaded = true; readFailed = true; fail(error); }
     return dialog;

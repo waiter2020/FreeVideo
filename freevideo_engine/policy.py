@@ -6,6 +6,7 @@ evidence of measured speed on an untested GPU. A process OOM remains a failure.
 from __future__ import annotations
 from dataclasses import asdict, dataclass
 import math
+from .fast_tier import MODES as FAST_TIERS
 from .hardware import Hardware, GiB
 from .system import HOST_WEIGHT_HEADROOM, weight_cache_headroom, residual_host_headroom
 
@@ -912,8 +913,7 @@ def decoder_workspace(canvas=None):
     return int(3.25 * GiB * max(1., area))
 
 
-# The fast mode ('fast2': two steps, no VAE) decodes with the adapter's pixel head instead of the video VAE. Like the
-# VAE it runs after sampling has released the transformer, and the head's weights load only then; the VAE is not read.
+# The pi-H3 pixel head loads after sampling has released the transformer. It takes the place of the video VAE.
 # Reserved peaks of the memory-saving head, its BF16 weights (1.1 GiB) included, by latent frames and pixel area. They were
 # measured with the four-step adapter's head, whose tensors have the same names and shapes as the two-step one's
 # (pih3-5x, 11-25), on the product path (INT8 adapter, RTX PRO 6000 with 8-24 GB caps; torch.cuda.max_memory_reserved over the whole
@@ -924,7 +924,7 @@ def decoder_workspace(canvas=None):
 # planner draws the line through the two sizes' largest reserved peaks, by pixel area, and keeps that plus
 # PIXEL_HEAD_MARGIN; smaller sizes follow the line (never below the weights), larger ones the line or the large size scaled
 # by the area, whichever is more; lengths beyond the points follow the nearest segment.
-FAST_MODES = ('none', 'fast2')
+FAST_MODES = ('none', *FAST_TIERS)
 PIXEL_HEAD_WEIGHT_BYTES = int(1.1 * GiB)
 PIXEL_HEAD_MARGIN = int(.25 * GiB)
 _SMALL_AREA = 960 * 544 / (1344 * 768)
@@ -948,16 +948,16 @@ def _pixel_head_points(area):
 PIXEL_HEAD_RESERVED = _pixel_head_points(1.)
 # In the fast mode blocks 46-49 swap twelve int8 matrices for the adapter's BF16 ones (2.16 GB): about 1.08 GB more
 # weight than the int8 layers they replace (pih3-5x; inferred, not measured). They go with their blocks during sampling.
-FAST2_EXTRA_WEIGHT_BYTES = 2_160_000_000 // 2
+FAST_EXTRA_WEIGHT_BYTES = 2_160_000_000 // 2
 # Those twelve BF16 matrices are not module parameters (c2 d3c873ecb): a resident block keeps them on the GPU (counted
 # above), a streamed one keeps all 2.16 GB pinned in host memory and lends one (about 180 MB) to the GPU per call. So a
 # fast plan that streams any block holds them in RAM beside its weight cache (the int8 layers they replace are no longer
 # read, which this does not count back).
-FAST2_PINNED_BYTES = 2_160_000_000
+FAST_PINNED_BYTES = 2_160_000_000
 # At the end of the last step the pixel head's features (the final block's video rows, 5376 BF16 channels each) are
 # copied to host memory, while the weight cache is still held, so the transformer can be released before the head runs
 # (fast_tier_runtime.Features). c4 stage 2: 1344x768 15 s at a 16 GiB budget crossed the RAM guard by 0.34 GiB there.
-FAST2_FEATURE_BYTES_PER_TOKEN = 5376 * 2
+FAST_FEATURE_BYTES_PER_TOKEN = 5376 * 2
 # With both counted, the peak working PSS (PSS less clean file pages) under a RAM cap, on the second RTX PRO 6000
 # machine: 1344x768 15 s, 16 GiB RAM and 16 GB VRAM, 14.04-14.32 GiB against a 14.97 GiB budget; 960x544 15 s, 12 GiB
 # RAM, 9.86-10.18 GiB against 10.95-10.97 GiB. The same request run twice on the same tree differed by 0.28 GiB (14.32
@@ -969,18 +969,18 @@ FAST2_FEATURE_BYTES_PER_TOKEN = 5376 * 2
 # end of sampling (c3 planner measurements). The floor is the largest of them plus the
 # 0.28 GiB run-to-run spread. All of them kept their outputs and residuals on the GPU (0.5 GiB of host activations); a
 # plan that puts them in host memory, and every other system, was not measured and keeps the video stage's floor.
-FAST2_HOST_FLOOR_BYTES = int((2.45 + .28) * GiB)
+FAST_HOST_FLOOR_BYTES = int((2.45 + .28) * GiB)
 
 
 def fast_host_bytes(canvas, stage='generation'):
     """Host bytes the fast mode holds beside the weight cache during sampling: the pinned matrices and the features."""
-    if canvas is None or stage != 'generation' or fast_mode(canvas) != 'fast2':
+    if stage != 'generation' or fast_mode(canvas) == 'none':
         return 0
-    return FAST2_PINNED_BYTES + canvas['video_tokens'] * FAST2_FEATURE_BYTES_PER_TOKEN
+    return FAST_PINNED_BYTES + canvas['video_tokens'] * FAST_FEATURE_BYTES_PER_TOKEN
 
 
 def fast_mode(canvas=None):
-    """The canvas's fast mode: 'none' (every quality level) or 'fast2'."""
+    """Return the canvas's pi-H3 mode, or 'none' for ordinary quality levels."""
     value = (canvas or {}).get('fast_mode') or 'none'
     if value not in FAST_MODES:
         raise ValueError('Unsupported fast mode')
@@ -999,7 +999,7 @@ def pixel_head_bytes(canvas):
 
 def decode_workspace(canvas=None):
     """GPU bytes the stage after sampling needs: the pixel head in the fast mode, else the VAE decoder's workspace."""
-    if canvas is not None and fast_mode(canvas) == 'fast2' and canvas.get('fast_decode') != 'vae':
+    if fast_mode(canvas) != 'none' and canvas.get('fast_decode') != 'vae':
         return pixel_head_bytes(canvas)
     return decoder_workspace(canvas)
 
@@ -1165,7 +1165,7 @@ def choose(hardware: Hardware, *, canvas=None, stage='generation', **options):
     except ResourceBudgetError as error:
         # In the fast mode, a refusal the VAE's workspace would not have made is the pixel head's: its way out (the
         # light level, or a shorter video) differs from a sampling shortfall's. Ask the same plan once more with that.
-        if (canvas is not None and fast_mode(canvas) == 'fast2' and 'ram' not in error.details['insufficient']
+        if (fast_mode(canvas) != 'none' and 'ram' not in error.details['insufficient']
                 and error.details.get('gpu_requirement') != 'fast_mode_decode'):
             try:
                 choose_placement(hardware, canvas=dict(canvas, fast_decode='vae'), stage=stage, **options)
@@ -1227,8 +1227,8 @@ def _choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto'
     lora_workspace = (128 * 2**20 + 2 * lora_max_block_bytes + lora_root_bytes
                       if lora_max_block_bytes or lora_root_bytes else 0)
     table_workspace = adaln_extra_bytes(canvas) if stage == 'generation' else 0
-    fast2 = canvas is not None and fast_mode(canvas) == 'fast2'
-    fast_weights = FAST2_EXTRA_WEIGHT_BYTES if fast2 and stage == 'generation' else 0
+    fast = fast_mode(canvas) != 'none'
+    fast_weights = FAST_EXTRA_WEIGHT_BYTES if fast and stage == 'generation' else 0
     placement_workspace = lora_workspace + table_workspace + step_cache_bytes + fast_weights
     if canvas is not None:
         checked = geometry(canvas['width'], canvas['height'], frames=canvas['frames'])
@@ -1961,7 +1961,7 @@ def _choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto'
     streamed_weights = ((hardware.system == 'Windows' and resident < 50)
                         or (50 - resident) * block_bytes + host_activation - (fast_host if fast_measured else 0)
                         + 2 * GiB > retention_budget)
-    fast_floor = ((FAST2_HOST_FLOOR_BYTES if fast_measured else ram_minimum) + fast_host
+    fast_floor = ((FAST_HOST_FLOOR_BYTES if fast_measured else ram_minimum) + fast_host
                   if fast_host and resident < 50 else 0)
     if ram_budget < fast_floor:
         # A fast plan that offloads blocks holds the adapter's matrices and the features beside its measured working set.
@@ -2171,7 +2171,7 @@ def _choose(hardware: Hardware, *, vram_gib=None, ram_gib=None, attention='auto'
     if stream_output:
         notes.append('Decode streams original temporal clips into rgb.npy; full floating video and duplicate RGB storage are avoided.')
     pixel_head = {}
-    if fast2:
+    if fast:
         pixel_head = dict(vae='skipped', pixel_head_bytes=decode_workspace(canvas))
         notes.append('Fastest mode: after sampling releases the transformer, the pixel head decodes the video within '
                      '%.2f GiB (estimated from measured peaks), and the video VAE is not loaded. The %d-step sampling '

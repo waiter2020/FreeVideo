@@ -10,6 +10,7 @@ import torch
 from . import usage_habit
 from .torch_compat import empty_host_cache, host_cache_release_supported
 from .device_index import device_properties
+from .model_components_generation import vae_directory
 
 GiB = 1 << 30
 # Allocator overhead beside a measured decode peak: 5% reserved but unallocated at the limit
@@ -536,7 +537,7 @@ class ModelBank:
     def input_video_encoder(self, base, canvas, *, device='cuda'):
         """Reuse just the image/video encoder; never load the output decoder."""
         from .vae_weights import load_video_encoder
-        directory = Path(base) / 'vae'
+        directory = vae_directory(base)
         identity = key(dict(files=[file_identity(path) for path in
                            sorted([directory/'config.json', *directory.glob('*.safetensors')])],
                            device=str(device)))
@@ -552,7 +553,7 @@ class ModelBank:
     def input_audio_encoder(self, base, canvas, *, device='cuda'):
         """Reuse the reference-audio VAE the way the image/video encoder is reused."""
         from .vae_weights import load_audio_vae
-        directory = Path(base) / 'audio_vae'
+        directory = vae_directory(base, audio=True)
         identity = key(dict(files=[file_identity(path) for path in
                            sorted([directory/'config.json', *directory.glob('*.safetensors')])],
                            device=str(device)))
@@ -675,6 +676,10 @@ class ModelBank:
             if request['engine_options'].get(name):
                 options[name + '_on'] = True
         options.pop('resident_blocks', None)
+        if (mode := options.get('fast_tier')) is not None:
+            from .fast_tier import component_hashes
+            from .paths import installed_model_root
+            options['fast_component_hashes'] = component_hashes(installed_model_root(), mode)
         return dict(cache=file_identity(Path(request['cache'])/'manifest.json'),
                     options=options, geometry=request.get('geometry'),
                     inputs=request.get('input_cache_dir'))

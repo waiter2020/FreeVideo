@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 
+from ..input_cache import capture_used
 from . import keep
 from .failure import Context, classify_exception, component_facts, exception_details, host_memory_shortage, safe_plan
 from .step_preview import LIMIT as PREVIEW_LIMIT
@@ -330,7 +331,7 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
     inbox = Inbox(stream, send)
     runner = None
     back_detector = None
-    back_detector_loaded = False
+    back_detector_path = None
     wait, crowding = idle_seconds, None
     try:
         while not inbox.closed.is_set():
@@ -381,6 +382,7 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
             try:
                 from PIL import Image
                 with ExitStack() as stack, redirect_stdout(sys.stderr):
+                    receipts = stack.enter_context(capture_used())
                     if inbox.cancel.is_set():
                         raise InterruptedError('cancelled')
                     stack.enter_context(lease())
@@ -431,10 +433,15 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
                                else dict(stage=context.timing.enter) if model == 'moss-image-sft' else {}))
 
                     if value.get('cast_view') == 'back' and len(references) == 1 and not region:
-                        from .back_view import generate_back, load_detector
-                        if not back_detector_loaded:
-                            back_detector = load_detector(pack_dir)
-                            back_detector_loaded = True
+                        from ..model_components import selected_file
+                        from ..paths import data_root
+                        from .back_view import POSE_FILE, default_checkpoint, generate_back, load_detector
+                        default = default_checkpoint(pack_dir)
+                        checkpoint = selected_file(engine_root or data_root(), 'pose-detector', POSE_FILE, default)
+                        if back_detector_path != checkpoint:
+                            back_detector = (load_detector(pack_dir) if checkpoint == default else
+                                             load_detector(pack_dir, checkpoint=checkpoint))
+                            back_detector_path = checkpoint
                         image, back_check = generate_back(generate, value.get('seed'), back_detector,
                                                          cancel=inbox.cancel.is_set)
                     else:
@@ -459,13 +466,8 @@ def serve(pack_dir, *, device='cuda', idle_seconds=45., stream=None, output=None
                             image.save(target, format='PNG', **(dict(pnginfo=info) if info else {}))
                     if back_check is not None:
                         plan = dict(plan or {}, back_check=back_check)
-                result = dict(phase='result', path=value['path'], seconds=time.monotonic() - started, plan=plan)
-                try:
-                    from ..input_cache import used
-                    # The cached encodings this picture read or wrote: deleting the picture removes the ones only it used.
-                    result['receipts'] = used()[:64]
-                except Exception:
-                    pass
+                result = dict(phase='result', path=value['path'], seconds=time.monotonic() - started, plan=plan,
+                              receipts=receipts[:64])
                 try:
                     result.update(attention_report(runner, context.redactor))
                 except Exception:

@@ -6,6 +6,7 @@ import shutil
 from tempfile import TemporaryDirectory
 import threading
 import time
+from urllib.parse import quote
 
 from . import disk_space, image_components
 from .adaln_assets import asset_path, file_hash
@@ -72,6 +73,14 @@ def _verify_stamps(folder, record):
             raise ValueError('The installed image model changed. Inspect and import it again.')
 
 
+def device_identity(machine):
+    return machine.get('device_identity') if machine.get('device_backend') == 'mps' else machine.get('gpu_uuid')
+
+
+def recorded_device(record):
+    return record.get('device_identity', record.get('gpu_uuid'))
+
+
 def active_profile(engine_root, model, *, gpu_uuid=None):
     """Resolve only locally verified profiles for the native worker."""
     identity = _choices(engine_root).get(model)
@@ -79,8 +88,8 @@ def active_profile(engine_root, model, *, gpu_uuid=None):
         return None
     try:
         folder, record = _profile(engine_root, identity)
-        gpu_uuid = gpu_uuid or _read(Path(engine_root) / 'machine.json').get('gpu_uuid')
-        if record['model']['model'] == model and record.get('gpu_uuid') == gpu_uuid:
+        selected_device = gpu_uuid or device_identity(_read(Path(engine_root) / 'machine.json'))
+        if record['model']['model'] == model and recorded_device(record) == selected_device:
             _verify_stamps(folder, record)
             return dict(record['model'], root=str(folder))
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
@@ -105,11 +114,12 @@ class ImageModels(HubModelJobs):
     def _machine(self):
         try:
             value = _read(self.root / 'machine.json')
-            if value.get('ready') and all(value.get(key) for key in ('python', 'comfy_python', 'model_root', 'gpu_uuid')):
+            if (value.get('ready') and device_identity(value)
+                    and all(value.get(key) for key in ('python', 'comfy_python', 'model_root'))):
                 return dict(value, root=str(self.root))
         except (OSError, ValueError, TypeError, AttributeError):
             pass
-        raise ValueError('Install the FreeVideo engine on Windows with a CUDA GPU first.')
+        raise ValueError('Install the FreeVideo image runtime on a supported device first.')
 
     def status(self):
         with self.mutex:
@@ -118,7 +128,7 @@ class ImageModels(HubModelJobs):
             machine = self._machine()
         except ValueError:
             return dict(available=False, families=[], active={}, installed=[], task=task)
-        families, installed, active, components = [], [], {}, {}
+        families, installed, damaged, active, components = [], [], [], {}, {}
         try:
             choices = image_components.read_selections(self.root)
             selection_error = None
@@ -132,11 +142,11 @@ class ImageModels(HubModelJobs):
                 shared = model == image_model.H3 and role == 'text_encoder'
                 slot_ready = ready or (shared and image_components.shared_ready(machine))
                 if not slot_ready:
-                    slots[role] = dict(ready=False, active=None, installed=[])
+                    slots[role] = dict(ready=False, active=None, installed=[], damaged=[])
                     continue
                 builtin = dict(id=image_components.builtin_id(model, role), model=model, component=role,
                                label=label if role == 'dit' else 'FreeVideo ' + image_components.LABELS[role],
-                               format='FreeVideo', builtin=True)
+                               format='FreeVideo', builtin=True, repairable=True, removable=False)
                 identity = choices.get(model, {}).get(role)
                 selected = builtin
                 if identity:
@@ -145,7 +155,8 @@ class ImageModels(HubModelJobs):
                                                                                      model=model, role=role))
                     except (OSError, ValueError, TypeError, KeyError, AttributeError):
                         selected = dict(id=identity, model=model, component=role, label='Unavailable component', damaged=True)
-                slots[role] = dict(ready=True, active=selected, installed=[dict(builtin, active=not identity)], shared=shared)
+                slots[role] = dict(ready=True, active=selected, installed=[dict(builtin, active=not identity)],
+                                   damaged=[], shared=shared)
                 if role == 'dit':
                     active[model] = selected
                     installed.extend(slots[role]['installed'])
@@ -153,15 +164,26 @@ class ImageModels(HubModelJobs):
             if not PROFILE_ID.fullmatch(folder.name):
                 continue
             try:
-                row = image_components.public(image_components.installed(self.root, folder.name, machine))
+                record = self._maintenance_record(folder.name)
+                raw = record['model']
+                row = dict(public_candidate(raw), component=raw.get('component', 'dit'))
+                try:
+                    row.update(image_components.public(image_components.installed(self.root, folder.name, machine)))
+                except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                    row['damaged'] = True
                 slot = components[row['model']][row['component']]
                 row['active'] = choices.get(row['model'], {}).get(row['component']) == row['id']
-                slot['installed'].append(row)
+                row.update(removable=not row['active'], repairable=self._repairable(record))
+                (slot['damaged'] if row.get('damaged') else slot['installed']).append(row)
+                if row['active']:
+                    slot['active'] = row
                 if row['component'] == 'dit':
-                    installed.append(row)
+                    (damaged if row.get('damaged') else installed).append(row)
+                    if row['active']:
+                        active[row['model']] = row
             except (OSError, ValueError, TypeError, KeyError, AttributeError):
                 continue
-        return dict(available=True, families=families, active=active, installed=installed, task=task,
+        return dict(available=True, families=families, active=active, installed=installed, damaged=damaged, task=task,
                     components=components, selection_error=selection_error)
 
     def search(self, query, token=None):
@@ -177,6 +199,9 @@ class ImageModels(HubModelJobs):
             raise ValueError('Install the built-in image model for this family first.')
 
     def inspect(self, reference, model, token=None, component='dit'):
+        return self._remember(self._hub_candidate(reference, model, token, component))
+
+    def _hub_candidate(self, reference, model, token, component):
         from . import hf_image_catalog, image_component_catalog
         machine = self._machine()
         self._check_slot(machine, model, component)
@@ -189,7 +214,7 @@ class ImageModels(HubModelJobs):
         contents = sorted((row['target'], row.get('sha256') or row.get('git_blob'), row['bytes'])
                           for row in candidate['files'])
         candidate['id'] = image_components.digest([model, component, contents])[:24]
-        return self._remember(candidate)
+        return candidate
 
     def local_picker_kind(self, model, component='dit'):
         self._check_slot(self._machine(), model, component)
@@ -198,6 +223,9 @@ class ImageModels(HubModelJobs):
         return 'encoder_shards' if model == image_model.MOSS and component == 'text_encoder' else component
 
     def inspect_local(self, selection, model, component='dit'):
+        return self._remember_local(self._local_candidate(selection, model, component))
+
+    def _local_candidate(self, selection, model, component):
         from . import local_image_catalog, image_component_catalog
         machine = self._machine()
         self._check_slot(machine, model, component)
@@ -206,8 +234,135 @@ class ImageModels(HubModelJobs):
             candidate['required_bytes'] -= sum(row['bytes'] for row in candidate['base_files'])
         else:
             candidate = image_component_catalog.inspect_local(selection, self.root, machine, model, component)
-        candidate.update(component=component, base_files=[])
-        return self._remember_local(candidate)
+        candidate.update(component=component, base_files=[], source_selection=str(selection))
+        return candidate
+
+    def _maintenance_record(self, identity):
+        folder = _folder(self.root, identity)
+        try:
+            receipt = _read(folder / image_components.RECEIPT)
+        except FileNotFoundError:
+            _, receipt = _profile(self.root, identity)
+        row = receipt['model']
+        image_components.check(row['model'], row.get('component', 'dit'))
+        if receipt.get('schema_version') != 1 or row.get('id') != identity:
+            raise ValueError('Invalid installed image model receipt.')
+        return receipt
+
+    @staticmethod
+    def _repairable(receipt):
+        model = receipt['model']
+        return bool(receipt.get('origin') or model.get('repo') and model.get('revision') and model.get('path'))
+
+    def _maintenance_slot(self, identity, model, component):
+        if not isinstance(identity, str):
+            raise ValueError('Choose an installed image model version.')
+        if identity.startswith(BUILTIN):
+            _, family, *parts = identity.split(':')
+            role = parts[0] if parts else 'dit'
+            image_components.check(family, role)
+            if identity != image_components.builtin_id(family, role):
+                raise ValueError('Unknown built-in image component.')
+            receipt = None
+        else:
+            receipt = self._maintenance_record(identity)
+            family = receipt['model']['model']
+            role = receipt['model'].get('component', 'dit')
+        if model is not None and model != family or component is not None and component != role:
+            raise ValueError('This version belongs to a different image component.')
+        return family, role, receipt
+
+    def verify(self, identity, *, model=None, component=None):
+        model, role, receipt = self._maintenance_slot(identity, model, component)
+        return self._maintenance(identity, 'verify', self._verify_version, identity, model, role, receipt)
+
+    @staticmethod
+    def _builtin_group(model, role):
+        return 'h3-text-encoder' if model == image_model.H3 and role == 'text_encoder' else FAMILIES[model][1]
+
+    def _verify_version(self, identity, model, role, receipt):
+        machine = self._machine()
+        if receipt is None:
+            value = image_pack.verify(machine['model_root'], self._maintenance_progress, self._check,
+                                      group=self._builtin_group(model, role))
+            if not value.get('ready'):
+                raise ValueError('The built-in image pack failed verification. Repair the pack first.')
+            return
+        image_components.installed(self.root, identity, machine, model=model, role=role)
+        if 'hashes' in receipt:
+            folder = _folder(self.root, identity)
+            for name, digest in receipt['hashes'].items():
+                self._check()
+                if file_hash(io_path(asset_path(folder, name))) != digest:
+                    raise ValueError('The imported image weight failed SHA-256 verification.')
+        else:
+            _verify_stamps(_folder(self.root, identity), receipt)
+
+    def _maintenance_progress(self, event):
+        if event.get('phase') in ('verify', 'download'):
+            self._update('verifying' if event['phase'] == 'verify' else 'downloading',
+                         done_bytes=event['done'], total_bytes=event['total'])
+
+    def remove(self, identity, *, model=None, component=None):
+        model, role, receipt = self._maintenance_slot(identity, model, component)
+        if receipt is None:
+            raise ValueError('Remove built-in weights from the installation controls.')
+        return self._maintenance(identity, 'remove', self._remove_version, identity, model, role)
+
+    def _remove_version(self, identity, model, role):
+        with self._maintenance_lease():
+            if image_components.read_selections(self.root).get(model, {}).get(role) == identity:
+                raise ValueError('Activate another image component before removing this version.')
+            self._delete_import(_folder(self.root, identity))
+
+    def repair(self, identity, *, model=None, component=None, token=None):
+        from .hf_auth import validate
+        model, role, receipt = self._maintenance_slot(identity, model, component)
+        if receipt is None:
+            return self._maintenance(identity, 'repair', self._repair_builtin, model, role, lock=False)
+        if not self._repairable(receipt):
+            raise ValueError('Inspect the original image weight again before replacing this version.')
+        token = validate(token or '')
+        return self._maintenance(identity, 'repair', self._repair_version, identity, model, role, receipt, token, token=token)
+
+    def _repair_builtin(self, model, role):
+        machine = self._machine()
+        self.release_idle()
+        try:
+            image_pack.repair(machine['model_root'], self._maintenance_progress, self._check,
+                              engine_root=self.root, group=self._builtin_group(model, role))
+        except image_pack.PackError as error:
+            if error.reason == 'confirm_replace':
+                raise ValueError('Review and confirm the shared H3 encoder replacement in Installation first.') from error
+            raise
+
+    def _repair_version(self, identity, model, role, receipt, token):
+        origin = receipt.get('origin') or {}
+        source = origin.get('path')
+        local = source is not None
+        if local:
+            candidate = self._local_candidate(source, model, role)
+        else:
+            row = receipt['model']
+            url = 'https://huggingface.co/' + row['repo'] + '/blob/' + quote(row['revision'], safe='') + '/' + quote(row['path'])
+            candidate = self._hub_candidate(url, model, token, role)
+            if 'hashes' in receipt and candidate['id'] != identity:
+                raise ValueError('The original source no longer matches this image component.')
+        candidate['id'] = identity
+        folder = _folder(self.root, identity)
+        with TemporaryDirectory(prefix='repair-image-', dir=io_path(folder.parent)) as temporary:
+            staged = Path(temporary) / identity
+            staged.mkdir()
+            if local:
+                self._update('copying', total_bytes=candidate['copy_bytes'])
+                hashes = self._copy_local_files(staged, candidate, lambda done: self._update('copying', done_bytes=done))
+                if hashes != [tuple(row) for row in origin.get('hashes', ())]:
+                    raise ValueError('The original local model changed. Import it as a new version.')
+                candidate['local_hashes'] = hashes
+            self._stage(candidate, token, folder=staged, remote=not local)
+            with self._maintenance_lease():
+                self._replace_import(folder, staged, lambda: image_components.installed(
+                    self.root, identity, self._machine(), model=model, role=role))
 
     def _profile_folder(self, identity):
         return _folder(self.root, identity)
@@ -227,9 +382,9 @@ class ImageModels(HubModelJobs):
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
             return False
 
-    def _stage(self, candidate, token, *, folder=None):
+    def _stage(self, candidate, token, *, folder=None, remote=False):
         if 'component' in candidate:
-            return self._stage_component(candidate, token, folder)
+            return self._stage_component(candidate, token, folder, remote=remote)
         from . import hf_image_catalog, local_image_catalog, local_models, provision
         from .network import retain_partial
         machine = self._machine()
@@ -298,23 +453,25 @@ class ImageModels(HubModelJobs):
         paths = [row['target'] for row in candidate['files']] + ['image_gen/' + row['file'] for row in candidate['base_files']]
         stamps = {path: _stamp(asset_path(folder, path)) for path in paths}
         published = public_candidate(candidate)
+        key = 'device_identity' if machine.get('device_backend') == 'mps' else 'gpu_uuid'
         save(folder / 'profile.json', dict(schema_version=1, model=published, stamps=stamps,
-                                          gpu_uuid=machine['gpu_uuid']), durable=True)
+                                          **{key: device_identity(machine)}), durable=True)
         if not local:
             self._update('ready')
         return published
 
-    def _stage_component(self, candidate, token, folder):
+    def _stage_component(self, candidate, token, folder, *, remote=False):
         from . import hf_image_catalog, image_component_catalog, local_image_catalog, provision
 
         machine = self._machine()
         model, role = candidate['model'], candidate['component']
         self._check_slot(machine, model, role)
-        local = folder is not None
+        local = folder is not None and not remote
+        direct = folder is None
         if not local:
-            folder = _folder(self.root, candidate['id'])
+            folder = folder or _folder(self.root, candidate['id'])
             folder.mkdir(parents=True, exist_ok=True)
-            if self._complete_profile(folder, machine) is not None:
+            if direct and self._complete_profile(folder, machine) is not None:
                 self._update('ready', done_bytes=candidate['bytes'])
                 return
             remaining, ledger = self._remaining(folder, candidate['files'])
@@ -350,9 +507,10 @@ class ImageModels(HubModelJobs):
         stamps = {name: _stamp(asset_path(folder, name)) for name in hashes}
         self._check()
         published = public_candidate(candidate)
+        origin = dict(path=candidate['source_selection'], hashes=candidate['local_hashes']) if candidate.get('source_selection') else None
         save(folder / image_components.RECEIPT, dict(schema_version=1, model=published, weights=target,
-                                                     hashes=hashes, stamps=stamps), durable=True)
-        if not local:
+                                                     hashes=hashes, stamps=stamps, origin=origin), durable=True)
+        if direct:
             self._update('ready', candidate=published, done_bytes=candidate['bytes'])
         return published
 
@@ -503,8 +661,8 @@ class ImageModels(HubModelJobs):
             except FileNotFoundError as error:
                 raise ValueError('Install this image model before activating it.') from error
             model = record['model']['model']
-            if record['gpu_uuid'] != machine['gpu_uuid']:
-                raise ValueError('This model was tested on a different GPU. Import it again.')
+            if recorded_device(record) != device_identity(machine):
+                raise ValueError('This model was tested on a different device. Import it again.')
             if not _ready(machine, model):
                 raise ValueError('Install the built-in image model for this family first.')
             _verify_stamps(folder, record)

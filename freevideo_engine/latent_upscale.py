@@ -28,7 +28,7 @@ LATENTS_STD = (1.2223774194717407, 1.2767263650894165, 1.6831774711608887, 1.754
 
 
 @torch.no_grad()
-def upscale(video, checkpoint, width, height, *, memory_saving=False):
+def upscale(video, checkpoint, width, height, *, memory_saving=False, expected_sha256=None):
     """Preserve normalized latent/time axes and return a float32 spatial lift."""
     if (not isinstance(video, torch.Tensor) or video.ndim != 5 or tuple(video.shape[:2]) != (1,24)
             or not video.is_floating_point() or not bool(torch.isfinite(video).all())):
@@ -47,11 +47,14 @@ def upscale(video, checkpoint, width, height, *, memory_saving=False):
     from .streamed_weights import _open_safetensors
     checkpoint = Path(checkpoint)
     tick = time.perf_counter()
-    if checkpoint.stat().st_size != CHECKPOINT_BYTES:
+    expected_sha256 = expected_sha256 or CHECKPOINT_SHA256
+    if expected_sha256 == CHECKPOINT_SHA256 and checkpoint.stat().st_size != CHECKPOINT_BYTES:
         raise ValueError('Incomplete latent upscaler checkpoint')
     with checkpoint.open('rb') as stream:
         digest = hashlib.file_digest(stream,'sha256').hexdigest()
-    if digest != CHECKPOINT_SHA256:
+    if digest != expected_sha256:
+        if expected_sha256 != CHECKPOINT_SHA256:
+            raise ValueError('The latent upscaler weights changed since selection')
         raise ValueError('The selected file is not the supported H3 3D v1 upscaler')
     model = None
     try:

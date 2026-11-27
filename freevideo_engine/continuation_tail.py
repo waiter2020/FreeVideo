@@ -257,11 +257,18 @@ def _cache_file(tail, manifest, device):
     import json
     from .continuation import identity
     from .continuation_store import root
+    from .model_components import root_for_model_dir, selected_identity
+    from .model_components_generation import AUDIO_VAE, VIDEO_VAE, vae_directory
     try:
         base = Path(tail['base'])
-        encoders = sorted((folder.name, item.name, item.stat().st_size)
-                          for folder in (base / 'vae', base / 'audio_vae') if folder.is_dir()
+        encoders = sorted((role, item.name, item.stat().st_size)
+                          for role, folder in (('vae', vae_directory(base)), ('audio_vae', vae_directory(base, audio=True)))
+                          if folder.is_dir()
                           for item in folder.glob('*.safetensors'))
+        component_root = root_for_model_dir(base)
+        for role in (VIDEO_VAE, AUDIO_VAE):
+            if (version := selected_identity(component_root, role)) is not None:
+                encoders.append((role, version))
         key = json.dumps([CACHE_REVISION, tail['source_id'], tail['canvas'], tail['first'], identity(manifest),
                           encoders, str(device).split(':')[0]], sort_keys=True)
         return root() / 'encoded' / (hashlib.sha256(key.encode('utf-8')).hexdigest() + '.safetensors')

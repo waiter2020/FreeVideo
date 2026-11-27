@@ -253,6 +253,10 @@ def generate(request, resident=None):
             # Models kept for the next request stay only where the decoder still fits beside them with
             # the allocator's slack; the room step drops resident blocks before it evicts one.
             nonlocal decoder
+            if pixel_head:
+                from .policy import pixel_head_bytes
+                resident.make_room('pixel_head', pixel_head_bytes(canvas), device=True)
+                return
             planned = decoder.get('resident_blocks', 0)
             fitted = resident.decoder_room(decoder, canvas)
             if isinstance(fitted, dict) and fitted.get('resident_blocks', 0) < planned:
@@ -582,7 +586,8 @@ def generate(request, resident=None):
                                 try:
                                     kwargs = dict(memory_saving=True) if memory_saving else {}
                                     lifted_video, lifted = upscale(latents, request.get('upscaler_checkpoint'),
-                                        lift_canvas['width'], lift_canvas['height'], **kwargs)
+                                        lift_canvas['width'], lift_canvas['height'],
+                                        expected_sha256=sampling_plan['upscaler_sha256'], **kwargs)
                                 except Exception as error:
                                     from .adaptive import classify_failure
                                     if classify_failure(error)['kind'] != 'gpu_oom' or (released(engine) and memory_saving):
@@ -607,7 +612,8 @@ def generate(request, resident=None):
                                     metrics['latent_upscale'].update(buffer_reuse=True, allocation_retries=1)
                                     save(request['metrics'], metrics)
                                     lifted_video, lifted = upscale(latents, request.get('upscaler_checkpoint'),
-                                        lift_canvas['width'], lift_canvas['height'], memory_saving=True)
+                                        lift_canvas['width'], lift_canvas['height'], memory_saving=True,
+                                        expected_sha256=sampling_plan['upscaler_sha256'])
                                 latents = lifted_video
                                 del lifted_video
                                 latents = crop_latents(latents, sampling_plan)

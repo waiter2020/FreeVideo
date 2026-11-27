@@ -31,7 +31,7 @@ export function optionalInputValue(name, value) {
     if (name === 'refine_from' || name === 'continue_from') return optionalText(value);
     if (BOOLEANS.has(name)) return value === true;
     if (name === 'step_cache') return STEP_CACHE_OPTIONS.includes(value) ? value : 'none';
-    if (name === 'fast_mode') return value === 'fast2' ? value : 'none';
+    if (name === 'fast_mode') return ['fast2', 'fast4'].includes(value) ? value : 'none';
     if (name === 'upscale_factor') return UPSCALE_OPTIONS.includes(value) ? value : '2';
     return value;
 }

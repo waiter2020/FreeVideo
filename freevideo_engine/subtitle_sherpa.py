@@ -346,10 +346,34 @@ def in_speech(word, spans, offset=0.):
     return spans is None or any(begin <= at < end for begin, end in spans)
 
 
+def make_lid(folder, threads):
+    import sherpa_onnx
+    whisper = sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
+        encoder=str(folder / 'tiny-encoder.int8.onnx'), decoder=str(folder / 'tiny-decoder.int8.onnx'))
+    return sherpa_onnx.SpokenLanguageIdentification(sherpa_onnx.SpokenLanguageIdentificationConfig(
+        whisper=whisper, num_threads=min(2, threads), provider='cpu'))
+
+
+def make_vad(path):
+    import sherpa_onnx
+    config = sherpa_onnx.VadModelConfig()
+    config.silero_vad.model = str(path)
+    config.silero_vad.threshold = .5
+    config.silero_vad.min_speech_duration = .1
+    config.silero_vad.min_silence_duration = .2
+    config.silero_vad.window_size = 512
+    config.silero_vad.max_speech_duration = CORE + 2 * OVERLAP + 1
+    config.sample_rate = RATE
+    config.num_threads = 1
+    config.provider = 'cpu'
+    return sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=60)
+
+
 class Engine:
     name = 'sherpa-ctc'
 
-    def __init__(self, directories, threads, vad_model=None):
+    def __init__(self, directories, threads, vad_model=None, *, lid_folder=None, multilingual_folder=None,
+                 custom_vad=False, custom_lid=False, managed=False):
         self._directories = directories
         self._threads = threads
         self._recognizers = {}
@@ -358,7 +382,11 @@ class Engine:
         self._vad = None
         self._vad_signature = None
         self._vad_lock = threading.Lock()
-        self._lid_folder = next(iter(directories.values())).parent / LID_FOLDER
+        self._lid_folder = lid_folder if lid_folder is not None else next(iter(directories.values())).parent / LID_FOLDER
+        self._multilingual_folder = multilingual_folder
+        self._custom_vad = custom_vad
+        self._custom_lid = custom_lid
+        self._managed = managed
         self._lid = None
         self._lid_signature = None
         self._lid_lock = threading.Lock()
@@ -378,6 +406,8 @@ class Engine:
 
     def _lid_ready(self):
         """The identification files, verified by size and SHA-256, or None."""
+        if self._custom_lid:
+            return self._lid_folder
         try:
             for name, (size, digest) in LID_FILES.items():
                 path = self._lid_folder / name
@@ -422,13 +452,7 @@ class Engine:
                 raise EarsError('no_engine')
             try:
                 if self._lid is None:
-                    import sherpa_onnx
-                    whisper = sherpa_onnx.SpokenLanguageIdentificationWhisperConfig(
-                        encoder=str(folder / 'tiny-encoder.int8.onnx'),
-                        decoder=str(folder / 'tiny-decoder.int8.onnx'))
-                    self._lid = sherpa_onnx.SpokenLanguageIdentification(
-                        sherpa_onnx.SpokenLanguageIdentificationConfig(
-                            whisper=whisper, num_threads=min(2, self._threads), provider='cpu'))
+                    self._lid = make_lid(folder, self._threads)
                 stream = self._lid.create_stream()
                 stream.accept_waveform(RATE, np.concatenate(pieces).astype('float32', copy=False))
                 return str(self._lid.compute(stream)).strip().lower()
@@ -453,7 +477,7 @@ class Engine:
             if language not in self._recognizers:
                 import sherpa_onnx
                 folder = self._directories[language]
-                if folder.name == MULTILINGUAL:
+                if folder.name == MULTILINGUAL or folder == self._multilingual_folder:
                     # One recogniser for all its languages; it names the language of each stretch itself.
                     key = MULTILINGUAL
                     if key not in self._recognizers:
@@ -478,22 +502,12 @@ class Engine:
                 if signature != self._vad_signature:
                     self._vad = None
                     self._vad_signature = signature
-                    data = self._vad_model.read_bytes() if stat.st_size == VAD_BYTES else b''
-                    if hashlib.sha256(data).hexdigest() != VAD_SHA256:
-                        _LOG.warning('Subtitle speech gate model is unverified; using unfiltered recognition')
-                        return None
-                    import sherpa_onnx
-                    config = sherpa_onnx.VadModelConfig()
-                    config.silero_vad.model = str(self._vad_model)
-                    config.silero_vad.threshold = .5
-                    config.silero_vad.min_speech_duration = .1
-                    config.silero_vad.min_silence_duration = .2
-                    config.silero_vad.window_size = 512
-                    config.silero_vad.max_speech_duration = CORE + 2 * OVERLAP + 1
-                    config.sample_rate = RATE
-                    config.num_threads = 1
-                    config.provider = 'cpu'
-                    self._vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=60)
+                    if not self._custom_vad:
+                        data = self._vad_model.read_bytes() if stat.st_size == VAD_BYTES else b''
+                        if hashlib.sha256(data).hexdigest() != VAD_SHA256:
+                            _LOG.warning('Subtitle speech gate model is unverified; using unfiltered recognition')
+                            return None
+                    self._vad = make_vad(self._vad_model)
                 return speech_spans(self._vad, audio, cancelled) if self._vad is not None else None
             except Cancelled:
                 raise
@@ -533,6 +547,19 @@ class Engine:
         return words
 
     def align(self, audio, lines, language, progress, cancelled):
+        return self._run('_align', audio, lines, language, progress, cancelled)
+
+    def _run(self, method, *args):
+        if not self._managed:
+            return getattr(self, method)(*args)
+        from .model_components import usage_lock
+        with usage_lock(None, shared=True, wait_seconds=10):
+            engine = factory()
+            if engine is None:
+                raise EarsError('no_engine')
+            return getattr(engine, method)(*args)
+
+    def _align(self, audio, lines, language, progress, cancelled):
         language = self._pick(language, ' '.join(lines))
         words = self._listen(audio, language, lambda f: progress(f * .95), cancelled)
         result = match_lines(lines, words)
@@ -540,6 +567,9 @@ class Engine:
         return result
 
     def transcribe(self, audio, language, progress, cancelled):
+        return self._run('_transcribe', audio, language, progress, cancelled)
+
+    def _transcribe(self, audio, language, progress, cancelled):
         language = self._spoken(audio, language, cancelled)
         words = self._listen(audio, language, lambda f: progress(f * .98), cancelled)
         limit = LINE_UNITS[language]
@@ -567,13 +597,16 @@ _CACHE = {}
 
 
 def folders(root=None):
+    from .model_components import selected_directory
+    from .model_components_audio import SUBTITLE_SLOTS
+
     base = (root or model_root()) / 'subtitles'
     found = {}
     for language, name in MODELS.items():
-        folder = base / name
+        folder = selected_directory(None, SUBTITLE_SLOTS[name], base / name)
         if (folder / 'model.int8.onnx').is_file() and (folder / 'tokens.txt').is_file():
             found[language] = folder
-    folder = base / MULTILINGUAL
+    folder = selected_directory(None, SUBTITLE_SLOTS[MULTILINGUAL], base / MULTILINGUAL)
     if (folder / 'model.int8.onnx').is_file() and (folder / 'tokens.txt').is_file():
         for language in MULTILINGUAL_LANGUAGES:
             found.setdefault(language, folder)
@@ -593,13 +626,29 @@ def factory():
         import numpy  # noqa: F401
     except ImportError:
         return None
+    from .model_components import selected_directory, selected_file
     found = folders()
     if not found:
         return None
-    key = tuple(sorted(found.items()))
+    base = model_root() / 'subtitles'
+    vad = selected_file(None, 'subtitle-silero-vad', VAD_MODEL, base / VAD_MODEL)
+    lid = selected_directory(None, 'subtitle-whisper-lid', base / LID_FOLDER)
+    assets = [vad, *(lid / name for name in LID_FILES)]
+    assets.extend(folder / name for folder in set(found.values()) for name in ('model.int8.onnx', 'tokens.txt'))
+
+    def stamp(path):
+        try:
+            info = path.stat()
+            return (path, info.st_size, info.st_mtime_ns, info.st_ino)
+        except OSError:
+            return (path,)
+
+    key = (tuple(sorted(found.items())), tuple(stamp(path) for path in sorted(assets)))
     if key not in _CACHE:
         _CACHE.clear()
-        _CACHE[key] = Engine(found, max(1, min(4, os.cpu_count() or 1)))
+        _CACHE[key] = Engine(found, max(1, min(4, os.cpu_count() or 1)), vad_model=vad, lid_folder=lid,
+                             multilingual_folder=found.get('ja'), custom_vad=vad != base / VAD_MODEL,
+                             custom_lid=lid != base / LID_FOLDER, managed=True)
     return _CACHE[key]
 
 

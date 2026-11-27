@@ -435,8 +435,14 @@ class SpeechSpans:
             return Path(self._model_path)
         from .comfy_bridge import installation
         from .image_gen import image_pack
+        from .model_components import selected_file
         from .speech import MODEL_FILE
-        return image_pack.base(installation()[1]['model_root']) / MODEL_FILE
+        root, machine = installation()
+        return selected_file(root, 'editor-silero-vad', 'model.onnx', image_pack.base(machine['model_root']) / MODEL_FILE)
+
+    def busy(self):
+        with self.lock:
+            return bool(self.pending)
 
     def audio(self, key):
         if self._resolve is not None:
@@ -444,11 +450,13 @@ class SpeechSpans:
         from .editor_export import resolve_source
         return resolve_source(key).get('audio')
 
-    def compute(self, path, cancelled=None):
+    def compute(self, path, cancelled=None, model=None):
         if self._compute is not None:
             return self._compute(path)
         from .speech import speech_spans
-        return speech_spans(path, self.model_path(), self.cache(), cancelled)
+        from .model_components import usage_lock
+        with usage_lock(None, shared=True, wait_seconds=10):
+            return speech_spans(path, self.model_path() if model is None else model, self.cache(), cancelled)
 
     def get(self, key):
         """{'spans': [...]} when known, {'state': 'pending'} while working, {'spans': None, 'reason': …} otherwise."""
@@ -460,23 +468,24 @@ class SpeechSpans:
             return dict(spans=None, reason='source_missing')
         if path is None:
             return dict(spans=[])
-        with self.lock:
-            if key in self.known:
-                return dict(spans=self.known[key])
         model = self.model_path()
         if not model.is_file():
             return dict(spans=None, reason='model_missing')
+        job = (key, model, model.stat().st_mtime_ns)
+        with self.lock:
+            if job in self.known:
+                return dict(spans=self.known[job])
         from .speech import cached
         found = cached(path, model, self.cache())
         if found is not None:
             return dict(spans=found)
         with self.lock:
-            if key in self.failed:
-                return dict(spans=None, reason=self.failed[key])
-            if key not in self.pending:
+            if job in self.failed:
+                return dict(spans=None, reason=self.failed[job])
+            if job not in self.pending:
                 if len(self.pending) >= MAX_QUIET:
                     return dict(spans=None, reason='busy')
-                self.pending.append(key)
+                self.pending.append(job)
             if self.worker is None or not self.worker.is_alive():
                 self.worker = threading.Thread(target=self._run, name='freevideo-editor-speech', daemon=True)
                 self.worker.start()
@@ -489,10 +498,11 @@ class SpeechSpans:
                 if not self.pending:
                     self.worker = None
                     return
-                key = self.pending[0]
+                job = self.pending[0]
+            key, model, _ = job
             reason = found = None
             try:
-                found = self.compute(self.audio(key))
+                found = self.compute(self.audio(key), model=model)
             except SpeechError as error:
                 reason = error.reason
             except Exception:  # noqa: BLE001 - one unreadable source must not stop the others
@@ -501,9 +511,9 @@ class SpeechSpans:
             with self.lock:
                 self.pending.popleft()
                 if reason is not None:
-                    self.failed[key] = reason
+                    self.failed[job] = reason
                 else:
-                    self.known[key] = found
+                    self.known[job] = found
 
     def spans(self, keys, cancelled=None):
         """Speech spans for each key the export needs; a source that cannot be read has none."""

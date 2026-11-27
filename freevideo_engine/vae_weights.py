@@ -16,6 +16,8 @@ post-quantization stay FP32. Original checkpoint bytes are untouched.
 from contextlib import contextmanager
 from pathlib import Path
 
+from .model_components_generation import vae_directory
+
 
 # The initializers from_pretrained skips while constructing its skeleton.
 _INITIALIZERS = ('uniform_', 'normal_', 'trunc_normal_', 'constant_', 'xavier_uniform_', 'xavier_normal_',
@@ -217,7 +219,7 @@ def load_video_decoder(base, *, resident_blocks, weight_source=None, linear_fp16
     Without the Linear cache every parameter keeps from_pretrained's FP32.
     """
     from diffusers import AutoencoderKLMiniMaxH3
-    directory = Path(base) / 'vae'
+    directory = vae_directory(base)
     model = skeleton(AutoencoderKLMiniMaxH3, directory)
     if type(resident_blocks) is not int or not 0 <= resident_blocks <= len(model.decoder.transformer_blocks):
         raise ValueError('Invalid VAE resident block count')
@@ -256,7 +258,7 @@ def load_video_encoder(base, *, before_upload=None, device='cuda'):
     are final, before any weight reaches the device.
     """
     from diffusers import AutoencoderKLMiniMaxH3
-    directory = Path(base) / 'vae'
+    directory = vae_directory(base)
     model = skeleton(AutoencoderKLMiniMaxH3, directory)
     model.decoder = None
     model.post_quant_conv = None
@@ -271,7 +273,7 @@ def load_video_encoder(base, *, before_upload=None, device='cuda'):
 def load_audio_vae(base, *, before_upload=None, device='cuda'):
     """The complete audio VAE in FP32, including the buffers stored in its checkpoint."""
     from diffusers import AutoencoderKLMiniMaxH3Audio
-    directory = Path(base) / 'audio_vae'
+    directory = vae_directory(base, audio=True)
     model = skeleton(AutoencoderKLMiniMaxH3Audio, directory)
     if before_upload is not None:
         before_upload(model)

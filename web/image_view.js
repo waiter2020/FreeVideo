@@ -30,7 +30,7 @@ import { el, icon, t, cn, tip, button, section, readStore, writeStore, mod } fro
 import { IMAGE_MODELS, modelPicker, modelState, verifyText, pausedText } from './image_view_models.js';
 import { RANGES, RATIOS, areaRange, estimateSeconds, machineLimit, presetAt, ratioValue, sizePicker, sizeFor, sizeText, megapixels } from './image_view_size.js';
 import { createMetaStore, createTrash, filterCounts, filterRows, groupRows, historyPanel, sessionPrompts } from './image_view_history.js';
-import { PICTURE_WORDS, SUBJECT_WORDS, brokenMentions, mentionText, mentionsToEngine, posePrompt, promptMentions, renumberMentions, sketchPrompt } from './image_view_mentions.js';
+import { SUBJECT_WORDS, brokenMentions, mentionText, mentionsToEngine, posePrompt, promptMentions, renumberMentions, sketchPrompt } from './image_view_mentions.js';
 import { HISTORY_KEY, forgetDeletedPrompts, promptLibrary, rememberPrompt } from './image_view_prompts.js';
 import { COMPARE_MAX, compareView } from './image_view_compare.js';
 import { queuePanel } from './image_view_queue.js';
@@ -277,21 +277,30 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     if (keptDraft?.prompt) prompt.value = keptDraft.prompt;
     // The rewrite and the original are put in the box by the helper: the mention marks are drawn again over the new text.
     let paintMentions = () => {};
-    const enhancer = createPromptEnhancer({node: enhancerNode, input: prompt, api, t, context: enhanceScene, setText: () => { render(); paintMentions(); }, issueButton,
-        resolve: async ({references: ids, ...scene}) => {
+    const releaseRewriteMedia = ({media}) => {
+        if (media.length) void client.discardUploads?.(media.map(row => row.file)).catch(() => {});
+    };
+    const enhancer = createPromptEnhancer({node: enhancerNode, input: prompt, api, t, context: enhanceScene, setText: () => { render(); paintMentions(); }, issueButton, discardStale: true,
+        releaseMedia: releaseRewriteMedia,
+        resolve: async ({references: ids, ...scene}, checkCurrent) => {
+            const files = ids.map(id => references.find(r => pictureId(r.file) === id)?.file);
+            if (files.some(file => !file)) throw new Error('stale');
             const media = [];
-            for (const id of ids) {
-                // A picture removed meanwhile makes this rewrite stale; it is dropped when the answer comes back.
-                const record = references.find(r => pictureId(r.file) === id);
-                if (record) media.push({file: await client.upload(record.file), role: 'reference'});
+            try {
+                for (const file of files) {
+                    checkCurrent();
+                    media.push({file: await client.upload(file), role: 'reference'});
+                }
+                return {...scene, media};
+            } catch (error) {
+                releaseRewriteMedia({media});
+                throw error;
             }
-            return {...scene, media};
         },
         // The rewrite names only the pictures sent with it, as the generation does.
-        prepare: text => {
-            const sent = references.slice(0, cap_(model)).length;
-            return mentionsToEngine(text, sent).replace(PICTURE_WORDS, (all, n) => Number(n) >= 1 && Number(n) <= sent ? `<Picture ${n}>` : all)
-                .replace(SUBJECT_WORDS, (_, n) => `<Subject ${n}>`);
+        prepare: (text, scene) => {
+            const sent = scene.references.length;
+            return mentionsToEngine(text, sent).replace(SUBJECT_WORDS, (_, n) => `<Subject ${n}>`);
         },
         restore: text => text.replace(/<Picture (\d+)>/g, (_, n) => mentionText(n)).replace(/<Subject (\d+)>/g, (_, n) => subject(Number(n)))});
     let enhancerReady = false;
@@ -370,7 +379,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
 
     // Prompt history and presets.
     const libGroup = section('library', {title: t('History and presets', '提示词与预设'), iconName: 'history', fixed: true});
-    const library = promptLibrary({onUsePrompt: text => { prompt.value = text; prompt.dispatchEvent(new Event('input', {bubbles: true})); promptGroup.open(true); prompt.focus(); },
+    const library = promptLibrary({onUsePrompt: text => { enhancer.replaceDraft(text); promptGroup.open(true); prompt.focus(); },
         onApplyPreset: preset => applyPreset(preset), currentSettings: () => ({model: model.id, ratio, area, seed: seedInput.value || '', prompt: prompt.value}),
         describe: p => [IMAGE_MODELS.find(m => m.id === p.model)?.short, p.ratio && p.ratio !== 'same' && RATIOS.includes(p.ratio) ? p.ratio : p.ratio && p.ratio !== 'same' ? t('Custom', '自定') : '', p.area ? `${megapixels(p.area)} MP` : '', p.prompt ? t('with prompt', '含提示词') : ''].filter(Boolean).join(' · ')});
     libGroup.body.append(library.element);
@@ -426,7 +435,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         const b = el('button'), i = el('img'); b.type = 'button'; i.alt = ''; i.draggable = false; i.src = new URL(`./assets/tour/sample-${key}.webp`, import.meta.url).href;
         if (key === 'jazz') i.style.objectPosition = '50% 0';
         tip(b, t('Try this prompt', '试试这条提示词'), SAMPLE_PROMPTS[key].slice(0, 48) + '…'); b.append(i);
-        b.onclick = () => { prompt.value = SAMPLE_PROMPTS[key]; prompt.dispatchEvent(new Event('input', {bubbles: true})); promptGroup.open(true); prompt.focus(); };
+        b.onclick = () => { enhancer.replaceDraft(SAMPLE_PROMPTS[key]); promptGroup.open(true); prompt.focus(); };
         grid.append(b);
     }
     const failHost = el('div', 'fv-image-fail fv-iv-fail fv-glass fv-g3'); failHost.setAttribute('role', 'alert');
@@ -472,7 +481,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     function usePrompt(file) {
         const text = promptFor(file), boxes = layoutOf[file];
         if (!text && !boxes) return;
-        prompt.value = text; prompt.dispatchEvent(new Event('input', {bubbles: true})); promptGroup.open(true);
+        enhancer.replaceDraft(text); promptGroup.open(true);
         if (boxes) { const moss = IMAGE_MODELS.find(m => m.id === MOSS); if (moss && model.id !== MOSS) chooseModel(moss); layout.set(boxes); }
     }
     more.append(menuItem('folder', t('Open folder', '打开文件夹'), t('Show the images on this computer', '在电脑上打开保存图片的文件夹'), () => void openFolder()),
@@ -761,6 +770,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     const over = () => Math.max(0, references.length - cap_(model));
     function addFiles(files, card) {
         if (cap_(model) === 0) return;
+        const previousCount = references.length;
         let skipped = 0;
         for (const file of files) {
             if (!file.type.startsWith('image/')) continue;
@@ -768,6 +778,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
             const record = {file, url: URL.createObjectURL(file), card}; references.push(record);
             const probe = new Image(); probe.onload = () => { record.width = probe.naturalWidth; record.height = probe.naturalHeight; if (alive) render(); }; probe.src = record.url;
         }
+        if (references.length !== previousCount) enhancer.invalidateDraft();
         // The note stays until the strip changes again.
         notice.dataset.keep = String(skipped > 0);
         notice.textContent = skipped ? t('At most {most}, {skipped} more were not added.', '最多 {most} 张，多出的 {skipped} 张没有加入。', { most: most(), skipped }) : '';
@@ -787,28 +798,26 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     // Any change to the pictures' order goes through here: the mentions in the prompt follow their pictures.
     function changeRefs(mutate) {
         const before = references.slice(); mutate();
-        const caret = prompt.selectionStart ?? prompt.value.length, next = renumberMentions(prompt.value, before, references, caret);
-        if (next.changed) {
-            const focused = document.activeElement === prompt;
-            prompt.value = next.text; if (focused) prompt.setSelectionRange(next.caret, next.caret);
-        }
+        const start = renumberMentions(prompt.value, before, references, prompt.selectionStart ?? prompt.value.length);
+        const end = renumberMentions(prompt.value, before, references, prompt.selectionEnd ?? prompt.value.length);
+        enhancer.mapDrafts(text => renumberMentions(text, before, references).text);
+        if (document.activeElement === prompt) prompt.setSelectionRange(start.caret, end.caret);
         mentions.paint();
     }
     // The engine reads <Picture N>; the page writes "@图N" / "@Image N" (and older prompts "图 N"). A prompt that names none gets them
     // listed, all but the sketches: the words around the description name those.
-    function engineText(seed) {
-        const swapped = mentionsToEngine(prompt.value, references.length).replace(PICTURE_WORDS, (_, n) => `<Picture ${n}>`)
-            .replace(SUBJECT_WORDS, (_, n) => `<Subject ${n}>`);
+    function engineText(text, {seed, images, modelId}) {
+        const swapped = mentionsToEngine(text, images.length).replace(SUBJECT_WORDS, (_, n) => `<Subject ${n}>`);
         // A sketch with mannequins takes the pose words (the other pictures listed in front when the text names none).
-        const poseAt = references.findIndex((r, at) => r.sketch && r.pose && at < cap_(model));
+        const poseAt = images.findIndex(r => r.sketch && r.pose);
         if (poseAt >= 0) {
-            const rest = references.map((_, at) => at === poseAt || at >= cap_(model) ? '' : `<Picture ${at + 1}>`).filter(Boolean);
-            return posePrompt(rest.length && !/<Picture \d+>/.test(swapped) ? rest.join(' ') + ' ' + swapped : swapped, poseAt + 1, references[poseAt].pose, seed);
+            const rest = images.map((_, at) => at === poseAt ? '' : `<Picture ${at + 1}>`).filter(Boolean);
+            return posePrompt(rest.length && !/<Picture \d+>/.test(swapped) ? rest.join(' ') + ' ' + swapped : swapped, poseAt + 1, images[poseAt].pose, seed);
         }
-        const sketches = references.map((r, at) => r.sketch && at < cap_(model) ? at + 1 : 0).filter(Boolean);
-        const others = references.map((_, at) => sketches.includes(at + 1) ? '' : `<Picture ${at + 1}>`).filter(Boolean);
+        const sketches = images.map((r, at) => r.sketch ? at + 1 : 0).filter(Boolean);
+        const others = images.map((_, at) => sketches.includes(at + 1) ? '' : `<Picture ${at + 1}>`).filter(Boolean);
         const listed = others.length && !/<Picture \d+>/.test(swapped) ? others.join(' ') + ' ' + swapped : swapped;
-        return sketchPrompt(listed, sketches, model.id);
+        return sketchPrompt(listed, sketches, modelId);
     }
     // What the rewrite sees: the model, the shape asked for (Image 1's own when it follows it), and the pictures sent.
     function enhanceScene() {
@@ -834,7 +843,8 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         const file = new File([outcome.blob], 'sketch.png', {type: outcome.blob.type || 'image/png'});
         if (record) {
             if (!references.includes(record)) return;
-            URL.revokeObjectURL(record.url); Object.assign(record, {file, url: URL.createObjectURL(file), width: outcome.width, height: outcome.height, edit: outcome.edit || null, pose: outcome.pose || null}); render(); return;
+            URL.revokeObjectURL(record.url); Object.assign(record, {file, url: URL.createObjectURL(file), width: outcome.width, height: outcome.height, edit: outcome.edit || null, pose: outcome.pose || null});
+            enhancer.invalidateDraft(); render(); return;
         }
         const fresh = {file, url: URL.createObjectURL(file), width: outcome.width, height: outcome.height, edit: outcome.edit || null, sketch: true, pose: outcome.pose || null};
         changeRefs(() => references.unshift(fresh));
@@ -861,12 +871,14 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         if (record.original) URL.revokeObjectURL(record.url);
         else record.original = {file: record.file, url: record.url, width: record.width, height: record.height};
         Object.assign(record, {file: edited, url: URL.createObjectURL(edited), width: outcome.width, height: outcome.height, edit: outcome.edit || null});
+        enhancer.invalidateDraft();
         render();
     }
     function restoreReference(record) {
         if (!record.original) return;
         URL.revokeObjectURL(record.url);
         Object.assign(record, record.original); delete record.original; delete record.edit;
+        enhancer.invalidateDraft();
         render();
     }
 
@@ -1003,6 +1015,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         area = at ? RANGES[model.id].presets[at] : sizes[model.id] || RANGES[model.id].presets.standard;
         area = Math.min(limits.max, Math.max(limits.min, area));
         if (!missing() && !loading()) pendingGenerate = false;
+        enhancer.invalidateDraft({showOriginal: true});
         keepSize(); render(); warmUp('full');
     }
     function applyPreset(preset) {
@@ -1011,7 +1024,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         if (preset.area) area = preset.area;
         if (preset.ratio || preset.area) startDraft();
         seedInput.value = preset.seed ?? '';
-        if (preset.prompt) { prompt.value = preset.prompt; prompt.dispatchEvent(new Event('input', {bubbles: true})); }
+        if (preset.prompt) enhancer.replaceDraft(preset.prompt);
         keepSize(); render();
     }
 
@@ -1378,63 +1391,82 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         if (seedInput.value !== '' && !seedNote.settle()) { advanced.open = true; return; }
         if (!seedInput.checkValidity()) { advanced.open = true; seedNote.say(t('Enter a whole number, or leave it empty', '请输入整数，或留空')); seedInput.focus(); return; }
         const seed = seedInput.value === '' ? undefined : Number(seedInput.value);
-        // The boxes as they are now (MOSS only); the frame gives way to the picture being made.
         const boxes = layoutActive() ? layout.request() : [], drawn = boxes.length ? layout.snapshot().filter(item => item.line.trim()) : null;
-        // The words the engine will read (the picture marks written out, the pictures listed): it takes 1 to 2,000 characters of them.
-        const engineSeed = seed ?? Math.floor(Math.random() * 1e9);
-        const sentWords = () => boxes.length && !prompt.value.trim() ? layout.caption() : engineText(engineSeed);
-        // False, with the reason said, when the engine would refuse the words; asked again after a rewrite that was still running has finished.
-        const fits = () => {
-            const length = sentWords().trim() ? sentWords().length : 0;
-            if (length > 0 && length <= 2000) return true;
-            note.dataset.kind = '';
-            say(length > 2000
-                ? t('With the image references counted, the prompt is over 2,000 characters. Shorten it by {count} and try again.',
-                    '加上图片引用后，提示词超过 2000 字。请缩短 {count} 字后重试。', { count: length - 2000 })
-                : t('The prompt has only image references and no words. Describe the image you want, then try again.', '提示词里只有图片引用，没有文字。请写上要生成的画面后重试。'));
-            return false;
-        };
-        if (!fits()) { prompt.focus(); return; }
+        const caption = boxes.length ? layout.caption() : '';
+        const modelId = model.id, sent = size(), tierNow = tier, loras = loraRow.value(modelId);
+        const images = references.slice(0, cap_(model)).map(({file, sketch, pose}) => ({file, sketch, pose: pose ? structuredClone(pose) : null}));
+        const context = {seed: seed ?? Math.floor(Math.random() * 1e9), images, modelId};
+        const inputsKey = () => JSON.stringify([enhanceScene(), size(), tier, seedInput.value, loraRow.value(model.id), layoutActive() ? layout.request() : []]);
+        const revision = enhancer.draftRevision, scene = inputsKey();
+        const sentWords = text => boxes.length && !text.trim() ? caption : engineText(text, context);
+        const lengthOf = words => words.trim() ? [...words].length : 0;
+        const fits = words => lengthOf(words) > 0 && lengthOf(words) <= 2000;
         layoutOn = false;
-        say(''); note.dataset.kind = ''; failure = null; const mine = running = {cancelled: false}, withImages = references.length > 0, sent = size(), tierNow = tier;
+        say(''); note.dataset.kind = ''; failure = null; const mine = running = {cancelled: false};
+        const active = () => alive && !mine.cancelled && running === mine;
+        const isCurrent = () => active() && enhancer.draftRevision === revision && inputsKey() === scene;
+        const changedMessage = () => t('Generation settings changed. Generate again when ready.', '生成设置已变更，请重新生成。');
+        const stopPreparation = message => {
+            if (!active()) return;
+            running = null; level.hidden = true; clearStep(); say(message); render(); drawWorks();
+        };
         render(); drawWorks(); progressLine.textContent = progressSub.textContent = ''; runReport.replaceChildren(); runReport.dataset.id = ''; doneReport.replaceChildren(); lastReport = null;
         level.hidden = false; level.dataset.counted = 'false'; level.style.setProperty('--fv-progress', '0');
         clearStep();
         const names = [];
         // Where a failure without a reason of its own was caught (#1097: an upload that never left the page said "unreported").
-        let reached = 'upload';
+        let reached = 'prepare';
         try {
-            for (const r of references.slice(0, cap_(model))) names.push(await client.upload(r.file));
-            if (mine.cancelled) return;
-            reached = 'prepare';
-            if (!enhancerOff() && await enhancer.beforeGenerate() === false) { say(''); if (running === mine) running = null; level.hidden = true; render(); drawWorks(); return; }
-            if (!fits()) { if (running === mine) running = null; level.hidden = true; render(); drawWorks(); fits(); prompt.focus(); return; }
+            if (!boxes.length && (await enhancer.beforeGenerate({isCurrent}) === false || !isCurrent())) {
+                stopPreparation(isCurrent() ? '' : changedMessage());
+                return;
+            }
+            let text = prompt.value, words = sentWords(text);
+            if (!fits(words) && !boxes.length && enhancer.fallbackToOriginal(original => fits(sentWords(original)),
+                t('Using the original prompt because the enhanced prompt cannot be submitted.', '改写稿超出可提交的范围，本次使用原文。'))) {
+                text = prompt.value; words = sentWords(text);
+            }
+            if (!fits(words)) {
+                const length = lengthOf(words);
+                stopPreparation(length > 2000
+                    ? t('With the image references counted, the prompt is over 2,000 characters. Shorten it by {count} and try again.',
+                        '加上图片引用后，提示词超过 2000 字。请缩短 {count} 字后重试。', {count: length - 2000})
+                    : t('The prompt has only image references and no words. Describe the image you want, then try again.', '提示词里只有图片引用，没有文字。请写上要生成的画面后重试。'));
+                prompt.focus(); return;
+            }
+            reached = 'upload';
+            for (const {file} of images) {
+                names.push(await client.upload(file));
+                if (!isCurrent()) { stopPreparation(changedMessage()); return; }
+            }
+            if (!isCurrent()) { stopPreparation(changedMessage()); return; }
             startJobSources();
-            const loras = loraRow.value(model.id);
+            const display = text.trim(), historyPrompt = display && display !== words.trim() && [...display].length <= 2000 ? display : '';
+            const request = {prompt: words, ...sent, model: modelId, remember: true, images: names, retry_busy: true,
+                ...(historyPrompt ? {history_prompt: historyPrompt} : {}),
+                ...(seed === undefined ? {} : {seed}), ...(loras.length ? {loras} : {}), ...(boxes.length ? {layout: boxes} : {})};
+            const meta = {text, withImages: images.length > 0, tier: tierNow, width: sent.width, height: sent.height, ...(drawn ? {layout: drawn} : {})};
             let id;
             reached = 'submit';
             // The engine makes one picture at a time: a second request waits its turn here and starts by itself; Stop cancels the wait.
             for (;;) {
                 try {
-                    // With boxes and no description, the boxes' lines describe the whole picture.
-                    const words = sentWords();
-                    ({id} = await jobs.submit('image', {prompt: words, ...sent, model: model.id, remember: true, images: names, ...(seed === undefined ? {} : {seed}), ...(loras.length ? {loras} : {}), ...(boxes.length ? {layout: boxes} : {})},
-                        {view: 'image', client, meta: {text: prompt.value, withImages, tier: tierNow, width: sent.width, height: sent.height, ...(drawn ? {layout: drawn} : {})}}));
+                    ({id} = await jobs.submit('image', request, {view: 'image', client, meta}));
                     break;
                 } catch (error) {
                     if (error.code !== 'busy') throw error;
-                    if (!alive || mine.cancelled || running !== mine) return;
+                    if (!active()) return;
                     note.dataset.kind = 'busy';
                     say(t('Another image is generating. This one starts when it finishes.', '前面有 1 张在生成，完成后自动开始。'));
                     progressLine.textContent = t('Waiting', '等待开始');
                     await new Promise(done => setTimeout(done, 2000));
-                    if (!alive || mine.cancelled || running !== mine) return;
+                    if (!active()) return;
                 }
             }
-            say(''); note.dataset.kind = '';
-            if (!alive || running !== mine) return;
             mine.id = id;
             if (mine.cancelled) { void jobs.cancel(id); return; }
+            if (!active()) return;
+            say(''); note.dataset.kind = '';
             follow(id);
         } catch (error) {
             if (!alive || mine.cancelled || running !== mine) return;
@@ -1761,7 +1793,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
     startJobSources();
     // Only the image view's own job: a picture the image editor is making is a draft of the editor's.
     const live = jobs.active({kind: 'image', view: 'image'})[0];
-    if (live) { running = {cancelled: false, id: live.id}; if (!prompt.value && live.meta?.text) prompt.value = live.meta.text; follow(live.id); }
+    if (live) { running = {cancelled: false, id: live.id}; if (!prompt.value && live.meta?.text) enhancer.replaceDraft(live.meta.text); follow(live.id); }
     // ── end run ──
     current = dialog; document.body.append(dialog); dialog.showModal(); viewChanged('image', node); keepSize(); render(); drawWorks(); fitLeft();
     if (viewCache?.scroll) requestAnimationFrame(() => { const list = works.element.querySelector('.fv-iv-works-body'); if (list) list.scrollTop = viewCache.scroll; });
@@ -1781,6 +1813,7 @@ export function openImageView(node, {studio = null, client: given = null, poll =
         if (keepChosen && model === before) return;
         const limits = areaRange(model.id, ratioValue(shapeOf()));
         area = Math.min(limits.max, Math.max(limits.min, sizes[model.id] || RANGES[model.id].presets.standard));
+        if (model !== before) enhancer.invalidateDraft({showOriginal: true});
         keepSize();
     }
     async function refreshModelProfiles() {

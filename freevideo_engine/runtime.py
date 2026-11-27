@@ -65,7 +65,9 @@ class Engine:
                  residual_offload=False, device_backend=None, gpu_allocation_bytes=None,
                  fetch_tables=True, adaln_task=None, step_cache=None, fast_tier=None):
         from .step_cache import requested
-        requested(step_cache)  # Validate the effective selection before loading weights.
+        effective_cache = requested(step_cache)
+        if fast_tier is not None and effective_cache is not None:
+            raise ValueError('The fastest mode cannot be used with a step cache')
         self.device_backend = device_backend if device_backend is not None else get_backend()
         if gpu_allocation_bytes is not None and (type(gpu_allocation_bytes) is not int or gpu_allocation_bytes < 0):
             raise ValueError('GPU allocation limit must be a nonnegative byte count')
@@ -155,13 +157,13 @@ class Engine:
         fast = None
         self.raw_grid = None
         if fast_tier is not None:
-            # The adapter's own modulation replaces the tables; no 8-step table is read.
-            from .fast_tier import RAW_GRID
+            from .fast_tier import mode_spec, unsupported, validate_setup
             from .fast_tier_runtime import Runtime
-            from .fast_tier import STEPS
-            if manifest.get('precision') != 'int8' or steps != STEPS:
-                raise ValueError('The fastest mode runs two steps on the int8 model')
-            fast, self.raw_grid = Runtime(self.device_backend.device), RAW_GRID
+            spec = mode_spec(fast_tier)
+            validate_setup(unsupported(cuda_missing=not torch.version.cuda, precision=manifest.get('precision', '')))
+            if steps != spec['steps']:
+                raise ValueError('Selected pi-H3 adapter does not match the sampling step count')
+            fast, self.raw_grid = Runtime(self.device_backend.device, fast_tier), spec['raw_grid']
         for group in manifest['groups']:
             if (self.cache / group['file']).stat().st_size != group['bytes']:
                 raise ValueError('Incomplete prepared weights')

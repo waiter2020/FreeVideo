@@ -8,8 +8,9 @@ from tempfile import TemporaryDirectory
 from threading import Event, Lock
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from freevideo_engine import input_cache
 from freevideo_engine.image_gen import image_model, prompt_cache, worker
 from freevideo_engine.image_gen.failure import Context, component_facts
 from freevideo_engine.image_gen.service import Service
@@ -102,6 +103,78 @@ class ImageComponentRuntimeTests(unittest.TestCase):
             self.assertIs(prompt_cache.open_cache(**options, encoder_component='new'), selected)
             self.assertIs(prompt_cache.open_cache(**options, encoder_component='builtin'), stock)
         self.assertEqual(open_cache.call_count, 2)
+
+    def test_worker_reports_only_the_current_jobs_cache_receipts(self):
+        inbox = SimpleNamespace(closed=Event(), cancel=Event(), mutex=Lock())
+        output = io.StringIO()
+        requests = iter(range(69))
+
+        def next_request(*_):
+            inbox.cancel.clear()
+            number = next(requests, None)
+            if number is not None:
+                return dict(model=image_model.H3, prompt=str(number), width=256, height=256,
+                            path=str(self.root / f'{number}.png'))
+
+        def generate(prompt, **_):
+            number = int(prompt)
+            if number != 68:
+                receipt = self.root / 'input-cache' / 'conditioning' / 'identity' / f'{0 if number == 67 else number}.json'
+                input_cache._note(receipt)
+                input_cache._note(receipt)
+            if number == 65:
+                raise ValueError('failed')
+            if number == 66:
+                inbox.cancel.set()
+            return SimpleNamespace(save=lambda stream, **_: stream.write(b'fixture'))
+
+        runner = SimpleNamespace(generate=generate, close=lambda: None, stats=dict)
+        with (patch.object(worker, 'Inbox', return_value=inbox),
+              patch.object(worker, 'next_request', side_effect=next_request),
+              patch.object(worker, 'lease', side_effect=nullcontext),
+              patch.object(worker, 'attention_report', return_value={}),
+              patch.object(worker, 'idle_wait', return_value=(1, None)),
+              patch.dict('sys.modules', {'PIL': SimpleNamespace(Image=None)})):
+            worker.serve(self.pack, h3_factory=lambda *_, **__: runner, output=output)
+
+        rows = [json.loads(line) for line in output.getvalue().splitlines()]
+        self.assertEqual(len(rows), 69)
+        for number, row in enumerate(rows[:65]):
+            self.assertEqual(row['receipts'], [f'conditioning/identity/{number}.json'])
+        for row in rows[65:67]:
+            self.assertEqual(row['phase'], 'error')
+            self.assertNotIn('receipts', row)
+        self.assertEqual(rows[66]['code'], 'cancelled')
+        self.assertEqual(rows[67]['receipts'], ['conditioning/identity/0.json'])
+        self.assertEqual(rows[68]['receipts'], [])
+
+    def test_incomplete_prompt_cache_recomputes_and_replaces_the_entry(self):
+        torch = SimpleNamespace(Tensor=type('Tensor', (), {}), load=Mock(return_value={'prompt_embeds': object()}),
+                                save=Mock())
+        cache = SimpleNamespace(get=Mock(return_value={'success': True}), put=Mock())
+        compute = Mock(return_value={'new': 'conditioning'})
+        stats = {}
+        with patch.dict('sys.modules', {'torch': torch}):
+            result = prompt_cache.encode('same prompt', [], compute, cache=cache, encoder='encoder', stats=stats)
+
+        self.assertEqual(result, compute.return_value)
+        self.assertEqual(stats['encode_cache'], 'miss')
+        self.assertTrue(torch.load.call_args.kwargs['weights_only'])
+        compute.assert_called_once_with()
+        cache.put.assert_called_once()
+
+    @unittest.skipUnless(find_spec('torch'), 'requires the installed image runtime')
+    def test_h3_prompt_cache_checks_tensor_shape_values_and_tag_dtype(self):
+        import torch
+
+        value = dict(prompt_embeds=torch.zeros((2, 5120), dtype=torch.bfloat16), text_token_tags=torch.tensor([1, 0]))
+        self.assertTrue(prompt_cache._valid_conditioning(value, torch))
+        for invalid in (dict(prompt_embeds=torch.zeros((2, 5119))),
+                        dict(prompt_embeds=torch.full((2, 5120), float('nan'))),
+                        dict(text_token_tags=torch.tensor([1])),
+                        dict(text_token_tags=torch.tensor([1., 0.])),
+                        dict(text_token_tags=torch.tensor([1, 2]))):
+            self.assertFalse(prompt_cache._valid_conditioning({**value, **invalid}, torch))
 
     @unittest.skipUnless(find_spec('torch'), 'requires the installed image runtime')
     def test_h3_resident_encoder_retries_once_with_the_same_component_and_references(self):

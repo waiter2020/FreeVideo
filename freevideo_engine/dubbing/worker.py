@@ -197,7 +197,11 @@ def run(request, model_dir, device='cuda'):
         used.append(('job',) + job_ref + ('reference_short' if line.get('reference_short') else None,))
     emit(phase='loading')
     started = time.monotonic()
-    backend = backends.create(name, model_dir, device=device)
+    from ..model_components import snapshot
+    from ..model_components_audio import VOICE_SLOTS, overrides
+    selected = overrides(None, VOICE_SLOTS)
+    components = {file: path for files in selected.values() for file, path in files.items()}
+    backend = backends.create(name, model_dir, device=device, **({'components': components} if components else {}))
     emit(phase='loaded', seconds=round(time.monotonic() - started, 2))
     try:
         if backend.needs_reference_text and any(not item[3] for item in used):
@@ -245,7 +249,8 @@ def run(request, model_dir, device='cuda'):
         backend.close()
     if all('code' in row for row in results):
         raise _LineFailure(results[0])
-    return dict(lines=results, reference_seconds=round(used[0][2], 2), backend=name, sample_rate=backend.sample_rate)
+    return dict(lines=results, reference_seconds=round(used[0][2], 2), backend=name, sample_rate=backend.sample_rate,
+                model_components=snapshot(None, VOICE_SLOTS))
 
 
 class _LineFailure(Exception):

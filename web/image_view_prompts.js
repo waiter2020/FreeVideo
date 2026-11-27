@@ -24,23 +24,27 @@ export function orderedPrompts(list, query = '') {
 // The words of works deleted for good leave the history too, unless a kept work still has them (the engine knows) or
 // the user saved them in a preset. The engine answers which of the given prompts only deleted works had
 // (POST /freevideo/private/forgotten {prompts} → {forget: [indexes]}); an engine without the call leaves all as they are.
-export function dropForgotten(list, texts, forget, presets = []) {
-    const gone = new Set((forget || []).filter(i => Number.isInteger(i) && i >= 0 && i < texts.length).map(i => String(texts[i]).trim()));
+export function dropForgotten(list, requested, forget, presets = []) {
+    const gone = new Map((forget || []).filter(i => Number.isInteger(i) && i >= 0 && i < requested.length)
+        .map(i => [String(requested[i].text).trim(), requested[i]]));
     const saved = new Set(presets.map(p => String(p?.prompt || '').trim()).filter(Boolean));
-    return list.filter(p => !gone.has(String(p.text).trim()) || saved.has(String(p.text).trim()));
+    return list.filter(row => {
+        const text = String(row.text).trim(), previous = gone.get(text);
+        return !previous || row.at !== previous.at || row.count !== previous.count || saved.has(text);
+    });
 }
 export async function forgetDeletedPrompts({fetchImpl = (...args) => globalThis.fetch(...args), offered = () => privacyOffered(fetchImpl)} = {}) {
-    const texts = readStore(HISTORY_KEY, []).map(p => p.text).filter(Boolean).slice(0, 1000);
+    const requested = readStore(HISTORY_KEY, []).filter(p => p.text).slice(0, 1000);
     // An engine without the privacy calls is asked nothing (it would answer 404).
-    if (!texts.length || !await offered()) return 0;
+    if (!requested.length || !await offered()) return 0;
     let answer;
     try {
-        const response = await fetchImpl('/freevideo/private/forgotten', {method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({prompts: texts})});
+        const response = await fetchImpl('/freevideo/private/forgotten', {method: 'POST', cache: 'no-store', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({prompts: requested.map(p => p.text)})});
         if (!response?.ok) return 0;
         answer = await response.json();
     } catch { return 0; }
-    // Read again: a prompt added while the engine answered stays (it is matched by text, not by place).
-    const now = readStore(HISTORY_KEY, []), kept = dropForgotten(now, texts, answer?.forget, readStore(PRESET_KEY, []));
+    // A prompt generated again before the engine answered is a newer history entry, even when the words match.
+    const now = readStore(HISTORY_KEY, []), kept = dropForgotten(now, requested, answer?.forget, readStore(PRESET_KEY, []));
     if (kept.length !== now.length) writeStore(HISTORY_KEY, kept);
     return now.length - kept.length;
 }

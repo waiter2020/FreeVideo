@@ -99,7 +99,8 @@ def separate(source, out_dir, *, server=None, cancelled=lambda: False, phase=lam
     Raises Preempted when a video started, InterruptedError when cancelled, StemsError otherwise."""
     from ..comfy_bridge import installation
     root, machine = installation()
-    if not ready(machine['model_root']):
+    from ..model_components import selected_identity
+    if not selected_identity(root, 'bandit-plus') and not ready(machine['model_root']):
         phase('downloading', 0.)
         install(machine['model_root'], root, lambda fraction: phase('downloading', fraction), cancelled)
     if cancelled():
@@ -134,8 +135,10 @@ def _run(source, out_dir, server, cancelled, root, machine):
             except resident_process.SessionRestarted:
                 pass
             env.pop(resident_process.ENV, None)
+        from ..model_components import selected_file
+        weights = selected_file(root, 'bandit-plus', 'bandit_plus_cocktail.pt', image_pack.base(machine['model_root']) / WEIGHTS)
         command = processes.module_command(
-            'freevideo_engine.stems.worker', '--weights', image_pack.base(machine['model_root']) / WEIGHTS,
+            'freevideo_engine.stems.worker', '--weights', weights,
             '--source', source, '--out', out_dir, '--device', machine.get('device_backend', 'cuda'))
         command[0] = machine['comfy_python']
         env['FREEVIDEO_RUNTIME_LOCK_FD'] = str(descriptor)

@@ -325,6 +325,10 @@ def create_ui(session, *, show=True, instance=None):
         def imagePackAction(self, action):
             self.invoke(session.image_pack_action, action)
 
+        @Slot(str, str, str)
+        def piH3PackAction(self, action, mode, job_id):
+            self.invoke(session.pi_h3_pack_action, action, mode, job_id)
+
         @Slot(str)
         def promptModelAction(self, action):
             self.invoke(session.prompt_model_action, action)

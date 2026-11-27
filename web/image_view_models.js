@@ -88,7 +88,8 @@ const actionOf = state => state.locked ? '' : state.state === 'missing' ? (state
 
 // The picker: one row for the chosen model; the list opens below it (above when there is no room), takes the
 // arrow keys, Home, End, Enter and Escape, and scrolls when there are more models than fit.
-export function modelPicker({host, onPick, onInstall, onPause}) {
+export function modelPicker({host, onPick, onInstall, onPause, models = IMAGE_MODELS, readState = modelState,
+    describe = useOf, actionLabel = actionOf, labelStatus = statusLine, menuClass = ''}) {
     const root = el('div', 'fv-iv-mpick');
     const trigger = el('button', 'fv-iv-mpick-btn'); trigger.type = 'button'; trigger.setAttribute('aria-haspopup', 'listbox'); trigger.setAttribute('aria-expanded', 'false');
     const name = el('b', 'fv-iv-mpick-name'), status = el('span', 'fv-iv-mpick-status');
@@ -96,18 +97,20 @@ export function modelPicker({host, onPick, onInstall, onPause}) {
     const action = button('fv-iv-text-btn fv-iv-mpick-act'), bar = el('i', 'fv-iv-mpick-bar');
     root.append(trigger, action, bar);
     const list = el('div', 'fv-iv-mlist fv-glass fv-g3'); list.hidden = true; list.setAttribute('role', 'listbox'); list.setAttribute('aria-label', t('Model', '模型'));
+    if (menuClass) list.classList.add(menuClass);
     let last = {info: null, chosen: '', pending: false};
-    const states = () => IMAGE_MODELS.map(model => ({model, state: modelState(last.info, model.id)}));
+    const states = () => models.map(model => ({model, state: readState(last.info, model.id)}));
     function open() {
         paintList(); list.hidden = false; trigger.setAttribute('aria-expanded', 'true');
-        (host || document.body).append(list); place();
+        ((typeof host === 'function' ? host() : host) || document.body).append(list); place();
         requestAnimationFrame(() => (list.querySelector('[aria-selected=true]') || list.querySelector('[role=option]'))?.focus());
     }
     function close(focus = true) { if (list.hidden) return; list.hidden = true; trigger.setAttribute('aria-expanded', 'false'); if (focus) trigger.focus({preventScroll: true}); }
     // Fixed to the row, so the panel's clipping and scrolling never cut it.
     function place() {
         const r = root.getBoundingClientRect(), h = Math.min(list.scrollHeight, 320), below = innerHeight - r.bottom - 8;
-        list.style.left = `${Math.round(r.left)}px`; list.style.width = `${Math.round(r.width)}px`;
+        const width = Math.min(innerWidth - 16, Math.max(r.width, Number(root.dataset.minMenuWidth) || 0));
+        list.style.left = `${Math.round(Math.max(8, Math.min(r.left, innerWidth - width - 8)))}px`; list.style.width = `${Math.round(width)}px`;
         if (below >= h || below >= r.top) { list.style.top = `${Math.round(r.bottom + 4)}px`; list.style.bottom = ''; }
         else { list.style.top = ''; list.style.bottom = `${Math.round(innerHeight - r.top + 4)}px`; }
     }
@@ -116,16 +119,16 @@ export function modelPicker({host, onPick, onInstall, onPause}) {
             const row = el('div', 'fv-iv-mopt'); row.setAttribute('role', 'option'); row.tabIndex = -1; row.dataset.model = model.id; row.dataset.state = state.state;
             row.setAttribute('aria-selected', String(model.id === last.chosen)); row.setAttribute('aria-disabled', String(state.state === 'unavailable'));
             const label = displayName(model, state);
-            const text = el('span', 'fv-iv-mopt-tx'); text.append(el('b', '', label), el('small', '', statusLine(state)));
+            const text = el('span', 'fv-iv-mopt-tx'); text.append(el('b', '', label), el('small', '', labelStatus(state)));
             row.append(icon('check', 'fv-iv-mopt-mark'), text);
-            const act = actionOf(state);
+            const act = actionLabel(state);
             if (act) {
-                const b = button('fv-iv-text-btn fv-iv-mopt-act', {label: act, name: act, use: state.paused ? continueUse() : useOf(model, state)});
+                const b = button('fv-iv-text-btn fv-iv-mopt-act', {label: act, name: act, use: state.paused ? continueUse() : describe(model, state)});
                 b.addEventListener('click', event => { event.stopPropagation(); if (state.state === 'downloading' && !state.paused) onPause(model); else onInstall(model); close(false); });
                 row.append(b);
             }
             if (state.state === 'downloading') { const p = el('i', 'fv-iv-mpick-bar'); p.style.setProperty('--p', String(state.fraction || 0)); row.append(p); }
-            tip(row, label, useOf(model, state));
+            tip(row, label, describe(model, state));
             row.addEventListener('click', () => { if (state.state === 'unavailable') return; onPick(model); close(); });
             return row;
         }));
@@ -139,25 +142,35 @@ export function modelPicker({host, onPick, onInstall, onPause}) {
         else if ((event.key === 'Enter' || event.key === ' ') && document.activeElement?.matches('[role=option]')) { event.preventDefault(); document.activeElement.click(); }
         else if (event.key === 'Escape' || event.key === 'Tab') { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); } close(event.key === 'Escape'); }
     });
-    document.addEventListener('pointerdown', event => { if (!list.hidden && !list.contains(event.target) && !root.contains(event.target)) close(false); }, true);
-    addEventListener('resize', () => { if (!list.hidden) place(); });
-    action.addEventListener('click', () => { const model = IMAGE_MODELS.find(m => m.id === last.chosen); const state = modelState(last.info, last.chosen); if (!model) return; if (state.state === 'downloading' && !state.paused) onPause(model); else onInstall(model); });
+    const outside = event => { if (!list.hidden && !list.contains(event.target) && !root.contains(event.target)) close(false); };
+    const resize = () => { if (!list.hidden) place(); };
+    document.addEventListener('pointerdown', outside, true);
+    addEventListener('resize', resize);
+    action.addEventListener('click', () => { const model = models.find(m => m.id === last.chosen); const state = readState(last.info, last.chosen); if (!model) return; if (state.state === 'downloading' && !state.paused) onPause(model); else onInstall(model); });
 
     function paint(info, chosen, pending) {
         last = {info, chosen, pending};
-        const model = IMAGE_MODELS.find(m => m.id === chosen) || IMAGE_MODELS[0], state = modelState(info, model.id);
+        const model = models.find(m => m.id === chosen) || models[0], state = readState(info, model.id);
         root.dataset.state = state.state;
         const label = displayName(model, state);
         name.textContent = label;
-        status.replaceChildren(icon(state.unknown ? 'clock' : ICON_OF[state.state] || 'cloud'), el('span', '', statusLine(state)));
+        status.replaceChildren(icon(state.unknown ? 'clock' : ICON_OF[state.state] || 'cloud'), el('span', '', labelStatus(state)));
         // Closed, the row names the model only; it speaks when something needs doing (to download, downloading, failed).
         status.hidden = state.state === 'ready' || state.state === 'checking';
-        tip(trigger, t('Model', '模型'), t('{name}: {state}. Click to choose another', '{name}：{state}。点开换别的模型', { name: label, state: useOf(model, state) }));
-        const act = actionOf(state); action.hidden = !act; action.replaceChildren(el('span', 'fv-iv-btn-label', act));
+        tip(trigger, t('Model', '模型'), t('{name}: {state}. Click to choose another', '{name}：{state}。点开换别的模型', { name: label, state: describe(model, state) }));
+        const act = actionLabel(state); action.hidden = !act; action.replaceChildren(el('span', 'fv-iv-btn-label', act));
         if (act) tip(action, state.paused ? t('Continue download', '继续下载') : state.state === 'downloading' ? t('Pause download', '暂停下载') : state.state === 'failed' ? t('Retry download', '重新下载') : t('Install {short}', '安装 {short}', { short: model.short }),
-            state.paused ? continueUse() : useOf(model, state));
+            state.paused ? continueUse() : describe(model, state));
         bar.hidden = state.state !== 'downloading'; bar.style.setProperty('--p', String(state.fraction || 0));
-        if (!list.hidden) { paintList(); place(); }
+        if (!list.hidden) {
+            const focused = list.contains(document.activeElement) ? document.activeElement.closest('[role=option]')?.dataset.model : '';
+            paintList(); place();
+            if (focused) [...list.querySelectorAll('[role=option]')].find(row => row.dataset.model === focused)?.focus({preventScroll: true});
+        }
     }
-    return {element: root, paint, close};
+    return {element: root, paint, close, dispose() {
+        document.removeEventListener('pointerdown', outside, true);
+        removeEventListener('resize', resize);
+        list.remove();
+    }};
 }

@@ -57,6 +57,17 @@ def _open_cache(*, encoder, comfy_root, comfy_python, model_paths, encoder_compo
         return None
 
 
+def _valid_conditioning(value, torch):
+    if not isinstance(value, dict):
+        return False
+    embeds = value.get('prompt_embeds')
+    tags = value.get('text_token_tags')
+    return (isinstance(embeds, torch.Tensor) and embeds.ndim == 2 and embeds.shape[0] > 0
+            and embeds.shape[1] == 5120 and embeds.is_floating_point() and bool(torch.isfinite(embeds).all())
+            and isinstance(tags, torch.Tensor) and tags.dtype == torch.long and tags.shape == embeds.shape[:1]
+            and bool(((tags == 0) | (tags == 1)).all()))
+
+
 def encode(prompt, images, compute, *, cache, encoder, stats=None, use_saved=True):
     """``compute()`` returns the conditioning dict; it runs only when the cache has no entry for this input, or
     always with ``use_saved`` false (the encoding is then wanted for what it does besides, and is saved again)."""
@@ -73,8 +84,8 @@ def encode(prompt, images, compute, *, cache, encoder, stats=None, use_saved=Tru
         try:
             found = cache.get(key, target) if use_saved else None
             if found is not None:
-                value = torch.load(target, map_location='cpu', weights_only=False)
-                if isinstance(value, dict) and 'prompt_embeds' in value:
+                value = torch.load(target, map_location='cpu', weights_only=True)
+                if _valid_conditioning(value, torch):
                     stats['encode_cache'] = 'hit'
                     stats['encode_cache_s'] = round(time.perf_counter() - started, 2)
                     return value

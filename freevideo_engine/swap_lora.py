@@ -37,6 +37,37 @@ def present(names, spec=None):
     return any(isinstance(n, str) and PurePosixPath(n.replace('\\', '/')).name.lower() == wanted for n in names or ())
 
 
+def selected(name=None, *, root=None):
+    from .comfy_bridge import installation_root
+    from .model_components import selected_file
+    from .model_components_generation import SWAP_LORA
+    spec = catalog()
+    if name is not None and not present([name], spec):
+        return None
+    return selected_file(root or installation_root(), SWAP_LORA, spec['name'], None)
+
+
+def registered_names(names):
+    from .comfy_bridge import installation_root
+    from .model_components import selected_identity
+    from .model_components_generation import SWAP_LORA
+    wanted = catalog()['name']
+    return [*names, wanted] if wanted not in names and selected_identity(installation_root(), SWAP_LORA) else names
+
+
+def validate_component(path):
+    from .lora_check import _find, require_usable
+    from .lora_names import _targets, adapter_keys
+    from .model_components_generation import _tensor_layout
+    layout = _tensor_layout(path)
+    pairs, _ = adapter_keys(layout)
+    known = [_find(target) for name, pair in pairs.items() if {'A', 'B'} <= pair.keys()
+             for target, _, _ in _targets(name)]
+    if not any(known):
+        raise ValueError('No compatible H3 LoRA factors are present.')
+    require_usable(path)
+
+
 def remote(spec, row):
     """One catalog file on the pinned Hugging Face revision (official host or its mirror) or our ModelScope copy."""
     from .network import source_url
@@ -59,7 +90,7 @@ def _partial(path):
     return path.with_name(path.name + '.partial')
 
 
-def install(folder, names=(), progress=None, check=None, *, engine_root=None, spec=None):
+def install(folder, names=(), progress=None, check=None, *, engine_root=None, spec=None, verify_existing=False):
     """Fetch the licence and the LoRA into folder; skip when the LoRA is already registered or on disk."""
     from . import network
     from .image_gen.image_pack import PackError as TransferError, _download_plan, _transfer
@@ -71,7 +102,7 @@ def install(folder, names=(), progress=None, check=None, *, engine_root=None, sp
     check = check or (lambda: None)
     folder = Path(folder)
     weights = folder / spec['files'][-1]['target']
-    if present(names, spec) or weights.exists():
+    if not verify_existing and (present(names, spec) or weights.exists()):
         return 'present'
     try:
         lock_root = Path(engine_root) if engine_root is not None else data_root()
@@ -81,7 +112,7 @@ def install(folder, names=(), progress=None, check=None, *, engine_root=None, sp
             for row in spec['files']:
                 check()
                 path = folder / row['target']
-                if row is spec['files'][-1] and path.exists():
+                if not verify_existing and row is spec['files'][-1] and path.exists():
                     return 'present'
                 if _intact(path, row, check):
                     continue
@@ -150,12 +181,20 @@ class Installer:
             self.value.update(kwargs)
 
     def status(self):
+        from .model_components import ComponentError
         spec = catalog()
         try:
             found = present(self.names(), spec)
         except Exception:
             found = False
-        return dict(name=spec['name'], bytes=sum(r['bytes'] for r in spec['files']), present=found, install=self.state())
+        try:
+            managed = selected(root=self.engine_root) is not None
+        except ComponentError:
+            # Keep the feature's row available so it reports the effective
+            # component error if a queued request tries to use these weights.
+            managed = True
+        return dict(name=spec['name'], bytes=sum(r['bytes'] for r in spec['files']), present=found or managed,
+                    managed=managed, install=self.state())
 
     def start(self):
         with self.lock:

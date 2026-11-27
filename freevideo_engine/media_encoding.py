@@ -12,6 +12,8 @@ import math
 from contextlib import nullcontext
 from pathlib import Path
 
+from .model_components_generation import vae_directory
+
 
 REFERENCE_FRAMES = 360  # 15 s at 24 fps, the longest H3 generation
 
@@ -330,7 +332,7 @@ def reference_options(normalized, options, step):
 def vae_identity(base):
     """File identity of the VAE encoder, matching existing model identity fields."""
     from .input_cache import digest
-    directory = Path(base) / 'vae'
+    directory = vae_directory(base)
     files = sorted(directory.glob('*.safetensors'))
     if not files:
         return None
@@ -438,7 +440,7 @@ def _latent_cache(root, base, device, *, folder='vae', recipe='reference-latent-
     from .input_cache import InputCache, digest
     from .paths import data_root
     if weight_file is None:
-        directory = Path(base) / folder
+        directory = vae_directory(base, audio=folder == 'audio_vae')
         files = sorted(directory.glob('*.safetensors'))
     else:
         weight_file = Path(weight_file)

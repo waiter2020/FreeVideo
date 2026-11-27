@@ -718,13 +718,14 @@ def verify(root=None, progress=None, check=None, *, group='image'):
         return status(root, group=group)
 
 
-def _verify(folder, root, progress, check, full=False, *, group='image'):
+def _verify(folder, root, progress, check, full=False, *, group='image', entries=None):
     ledger = _read(folder, LEDGER)
     snapshot = json.dumps(ledger, sort_keys=True)
     todo = []
-    total = sum(r['bytes'] for r in rows(group=group))
+    entries = rows(group=group) if entries is None else entries
+    total = sum(r['bytes'] for r in entries)
     done = 0
-    for row in rows(group=group):
+    for row in entries:
         check()
         path = target(row, root)
         hashed = False
@@ -920,7 +921,8 @@ def _swap_in(folder, path, staged, approved, prior):
         pass
 
 
-def install(root=None, progress=None, check=None, *, engine_root=None, repair=False, _background=None, group='image', confirm=None):
+def install(root=None, progress=None, check=None, *, engine_root=None, repair=False, _background=None,
+            group='image', confirm=None, only=None):
     """Install only missing weights. Repair also hashes and retains bad originals.
 
     A damaged file the video install shares is renamed only after the user has seen it: with repair or confirm given,
@@ -936,8 +938,11 @@ def install(root=None, progress=None, check=None, *, engine_root=None, repair=Fa
     transfer_check = _background.check if _background is not None else check
     try:
         with _install_lease(root, engine_root, repair, _background) as folder:
+            entries = [row for row in rows(group=group) if only is None or row['file'] in only]
+            if only is not None and set(only) != {row['file'] for row in entries}:
+                raise PackError('unknown_component')
             replacing = repair or confirm is not None
-            for row in rows(group=group):
+            for row in entries:
                 if replacing and row.get('shared') and not os.path.lexists(target(row, root)):
                     new = Path(str(target(row, root)) + '.replacing')
                     if not (new.is_file() and new.stat().st_size == row['bytes']):
@@ -946,7 +951,7 @@ def install(root=None, progress=None, check=None, *, engine_root=None, repair=Fa
                         # is not left without its file. Only a swap that left its record is undone, and only in a
                         # repair (which holds the engine lease); a plain install never renames the user's files.
                         _put_back(folder, target(row, root))
-            ledger, todo = _verify(folder, root, progress, check, full=repair, group=group)
+            ledger, todo = _verify(folder, root, progress, check, full=repair, entries=entries)
             total = sum(r['bytes'] for r in todo)
             reserve = BACKGROUND_RESERVE if _background is not None else RESERVE
             # Each disk a file lands on must hold what lands there: the shared encoder goes to the video encoder
@@ -1002,7 +1007,7 @@ def install(root=None, progress=None, check=None, *, engine_root=None, repair=Fa
             done = 0
             pending_prefixes = 0
             if _background is not None:
-                done = sum(r['bytes'] for r in rows(group=group)) - total
+                done = sum(r['bytes'] for r in entries) - total
                 total += done
                 pending_prefixes = sum(min(row['bytes'], _side(folder, row, root, '.partial').stat().st_size)
                                        for row in todo if _side(folder, row, root, '.partial').is_file())

@@ -1,111 +1,141 @@
-"""The fastest sampling mode: pi-H3's two-step no-decode adapter on the installed int8 weights.
+"""Two- and four-step pi-H3 DWD adapters on FreeVideo's installed INT8 weights.
 
-fast2 is a single pass of two steps whose pixels come from the adapter's own head on
-the last step, so the video VAE is not loaded; the sound still goes through the audio
-VAE. Nothing is merged into the installed weights: the adapter's low-rank factors go
-through the online LoRA folder, and its output heads, 8-dimensional modulation and the
-whole matrices it replaces in the last four blocks change the Engine's in memory only
-(fast_tier_runtime). The pixel head runs after sampling (dwd_head).
+The adapter's pixel head draws the final frames and the audio VAE decodes the sound.
+Online LoRA applies the adapter's low-rank factors. The output heads, modulation and
+the last four blocks' replacement matrices are changed only in the running engine.
 
-The adapter was trained for sigmas 0.99377, 0.86534 and 0 on plain H3.
-Using it on VDN is outside what its authors trained or support.
+The adapters were trained on plain H3. This integration applies them to FreeVideo's
+VDN-derived base.
 
 This module imports no Torch unless it runs as the adapter-preparation child.
 """
 import argparse
 import json
 from pathlib import Path
-import stat
 import sys
 
-from .long_paths import io_path
-
-MODES = ('fast2',)
 FOLDER = 'pi-h3'
-ADAPTER = 'pi_h3_2step_dwd_adapter_int8_convrot.safetensors'
 CONSTANTS = 'pi_h3_adaln_constants.safetensors'
-FILES = {
-    ADAPTER: (2192176240, 'ef98527409eee4eaec8183265f4ee22d265680524237fae7149dbc203e11e739'),
-    CONSTANTS: (19435680, '7949a370323b2a15e13f2e9160cfb1325207cde21b2629643f390be3e32f690b'),
+CONSTANTS_FILE = (19435680, '7949a370323b2a15e13f2e9160cfb1325207cde21b2629643f390be3e32f690b')
+
+
+def _grid(steps, maximum):
+    # The author uses evenly spaced points with a last interval 0.6 times their size.
+    interval = maximum / (steps - 1 + .6)
+    return tuple(maximum - index * interval for index in range(steps)) + (0.,)
+
+
+_MODES = {
+    'fast2': dict(steps=2, raw_grid=_grid(2, .93), adapter='pi_h3_2step_dwd_adapter_int8_convrot.safetensors',
+                  adapter_bytes=2192176240, adapter_sha256='ef98527409eee4eaec8183265f4ee22d265680524237fae7149dbc203e11e739'),
+    'fast4': dict(steps=4, raw_grid=_grid(4, .96), adapter='pi_h3_4step_dwd_adapter_int8_convrot.safetensors',
+                  adapter_bytes=2192176240, adapter_sha256='a2fa1caae2cd4a12f85cc3eccd2a360fe9dabf430623d47deca619605e96ee6d'),
 }
-MISSING = 'FAST_MODE_FILES_MISSING: '
-# The adapter's points before the video (12) or audio (3) shift: max_raw_t 0.93, one step
-# of 0.93 / 1.6 and a last one to 0, as published with the adapter.
-RAW_GRID = (.93, .93 - .93 / 1.6, 0.)
-STEPS = len(RAW_GRID) - 1
+MODES = tuple(_MODES)
 
 
-def files(model_root):
-    """{relative name: path ready for I/O} after checking each file's published size.
-
-    Only a file that is not there, or has another size, counts as missing. Any other
-    failure to read it is reported with its own reason.
-    """
-    root = io_path(Path(model_root) / FOLDER)
-    found, absent = {}, []
-    for name, (size, _) in FILES.items():
-        path = root / name
-        try:
-            info = path.stat()
-        except (FileNotFoundError, NotADirectoryError):
-            absent.append(name)
-            continue
-        except OSError as error:
-            raise OSError(error.errno, 'Could not read the fastest mode file %s: %s'
-                          % (name, error.strerror or error)) from error
-        if stat.S_ISREG(info.st_mode) and info.st_size == size:
-            found[name] = path
-        else:
-            absent.append(name)
-    if absent:
-        raise FileNotFoundError(MISSING + 'install the fastest mode files (missing or incomplete: '
-                                + ', '.join(absent) + ')')
-    return found
+def mode_spec(mode):
+    try:
+        return _MODES[mode]
+    except (KeyError, TypeError):
+        raise ValueError('Fast mode must be one of ' + ', '.join(MODES)) from None
 
 
-def request(args):
+def unsupported(*, mac=False, gpu_name=None, vendor=None, cuda_missing=False, precision=None):
+    """Reason a known setup cannot execute a pi-H3 mode."""
+    if mac:
+        return 'mac'
+    name = str(gpu_name or '').casefold()
+    if ((vendor is not None and str(vendor).casefold() != 'nvidia') or cuda_missing
+            or any(word in name for word in ('amd', 'radeon', 'instinct'))):
+        return 'gpu'
+    if precision is not None and not str(precision).startswith('int8'):
+        return 'engine'
+    return None
+
+
+def setup_reason(machine=None):
+    """Use saved setup facts when available, including on installations without a capability grid."""
+    machine = machine or {}
+    hardware = machine.get('hardware')
+    hardware = hardware if isinstance(hardware, dict) else {}
+    capability = hardware.get('capability')
+    old_cuda = (isinstance(capability, (tuple, list)) and len(capability) == 2
+                and all(type(part) is int for part in capability) and tuple(capability) < (8, 0))
+    return unsupported(mac=sys.platform == 'darwin' or machine.get('device_backend') == 'mps',
+                       gpu_name=hardware.get('gpu_name') or machine.get('gpu_name'), vendor=machine.get('gpu_vendor'),
+                       cuda_missing=old_cuda or ('cuda_version' in hardware and hardware['cuda_version'] in (None, '', 'None')),
+                       precision='' if machine.get('video_model') is False else machine.get('prepared_format'))
+
+
+def validate_setup(reason):
+    if reason == 'mac':
+        raise ValueError('The fastest mode is not available on Mac')
+    if reason == 'gpu':
+        raise ValueError('pi-H3 needs an NVIDIA CUDA GPU')
+    if reason == 'engine':
+        raise ValueError('The fastest mode needs the int8 model')
+
+
+def files(model_root, mode='fast2', *, engine_root=None):
+    """Return the selected, verified runtime files by their basenames."""
+    from .fast_pack import files as verified_files
+    spec = mode_spec(mode)
+    found = verified_files(model_root, mode=mode, engine_root=engine_root)
+    return {name: found[f'{FOLDER}/{name}'] for name in (spec['adapter'], CONSTANTS)}
+
+
+def component_hashes(model_root, mode, *, engine_root=None):
+    from .model_components import root_for_model_dir, selected_hash
+    from .model_components_generation import PI_SLOTS
+    spec = mode_spec(mode)
+    root = engine_root or root_for_model_dir(model_root)
+    slot = PI_SLOTS[mode]
+    return (selected_hash(root, slot, spec['adapter']) or spec['adapter_sha256'],
+            selected_hash(root, slot, CONSTANTS) or CONSTANTS_FILE[1])
+
+
+def request(args, *, original_audio=False):
     """Check a generate command at its entry and set its steps; None without --fast-mode."""
     mode = getattr(args, 'fast_mode', None)
     if mode is None:
         return None
-    if mode not in MODES:
-        raise ValueError('Fast mode must be one of ' + ', '.join(MODES))
-    if sys.platform == 'darwin':
-        raise ValueError('The fastest mode is not available on Mac')
-    for name, label in (('continue_from', 'a continued part'), ('continue_anchor', 'a continued part'),
-                        ('preview', 'a preview'), ('refine_from', 'finishing a preview'),
-                        ('upscale_from', 'an upscale'), ('redo_sound', 'redoing the sound'),
-                        ('step_cache', 'a step cache')):
-        if getattr(args, name, None) not in (None, False, 'none'):
-            raise ValueError('The fastest mode cannot be used with ' + label)
-    if getattr(args, 'upscale_factor', None) not in (None, 2):
-        raise ValueError('The fastest mode uses the 2x upscale')
+    validate_setup(unsupported(mac=sys.platform == 'darwin'))
+    spec = mode_spec(mode)
+    upscale_factor = getattr(args, 'upscale_factor', None)
+    sampling = bridge_steps(mode,
+        preview=getattr(args, 'preview', False), refine_from=getattr(args, 'refine_from', None),
+        continue_from=getattr(args, 'continue_from', None) or getattr(args, 'continue_anchor', None),
+        upscale_from=getattr(args, 'upscale_from', None), original_audio=original_audio,
+        redo_sound=getattr(args, 'redo_sound', None), step_cache=getattr(args, 'step_cache', None),
+        upscale_factor=2 if upscale_factor is None else upscale_factor)
     from .paths import installed_model_root
-    paths = files(installed_model_root())
-    args.base_steps = STEPS
-    args.two_pass = False
-    args.refine_steps = 3
-    return dict(mode=mode, adapter=str(paths[ADAPTER]), constants=str(paths[CONSTANTS]),
-                adapter_sha256=FILES[ADAPTER][1], constants_sha256=FILES[CONSTANTS][1])
+    model_root = installed_model_root()
+    paths = files(model_root, mode)
+    adapter_hash, constants_hash = component_hashes(model_root, mode)
+    args.two_pass, args.base_steps, args.refine_steps = sampling
+    return dict(spec, mode=mode, adapter=str(paths[spec['adapter']]), constants=str(paths[CONSTANTS]),
+                adapter_sha256=adapter_hash, adapter_bytes=paths[spec['adapter']].stat().st_size,
+                constants_sha256=constants_hash)
 
 
 def bridge_steps(mode, *, preview=False, refine_from=None, continue_from=None, upscale_from=None, step_cache=None,
-                 upscale_factor=2, parts=1):
+                 upscale_factor=2, parts=1, original_audio=False, redo_sound=False):
     """(two_pass, base_steps, refine_steps) of a queued request, refused before anything is loaded."""
-    if mode not in MODES:
-        raise ValueError('Fast mode must be one of ' + ', '.join(MODES))
+    spec = mode_spec(mode)
     for value, label in ((preview, 'a preview'), (refine_from, 'finishing a preview'),
                          (continue_from, 'a continued part'), (upscale_from, 'an upscale'),
-                         (step_cache not in (None, 'none'), 'a step cache'), (upscale_factor != 2, 'another upscale factor'),
+                         (original_audio, 'the original sound of a video'), (redo_sound, 'redoing the sound'),
+                         (step_cache not in (None, '', False, 'none'), 'a step cache'), (upscale_factor != 2, 'another upscale factor'),
                          (parts > 1, 'a video made in parts')):
         if value:
             raise ValueError('The fastest mode cannot be used with ' + label)
-    return False, STEPS, 3
+    return False, spec['steps'], 3
 
 
 def adapter_row(spec):
     """The adapter as the first row of the online LoRA request."""
-    return dict(path=spec['adapter'], sha256=spec['adapter_sha256'], bytes=FILES[ADAPTER][0],
+    return dict(path=spec['adapter'], sha256=spec['adapter_sha256'], bytes=spec['adapter_bytes'],
                 strength=1., alpha=None, only_factors=True)
 
 

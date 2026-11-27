@@ -100,6 +100,10 @@ def weights_folder(root):
     return Path(root) / 'models' / 'rife'
 
 
+def default_weight(root):
+    return weights_folder(root) / Path(catalog()['files'][0]['file']).name
+
+
 def ensure_weights(root, emit, check):
     """The same optional-model catalog, pins, resume and mainland fallback as the depth reference model."""
     from . import network
@@ -107,9 +111,9 @@ def ensure_weights(root, emit, check):
     from .prompt_vlm.assets import remote
     spec = catalog()
     row = spec['files'][0]
-    folder = weights_folder(root)
+    path = default_weight(root)
+    folder = path.parent
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / Path(row['file']).name
     with _lock(folder / 'download.lock', check):
         if path.is_file() and path.stat().st_size == row['bytes'] and _digest(path, check) == row['sha256']:
             return path
@@ -273,7 +277,11 @@ def main():
         save(work / 'progress.json', state)
     try:
         with processes.worker_signals():
-            weights = ensure_weights(request['root'], emit, check)
+            from .model_components import selected_file
+            default = default_weight(request['root'])
+            weights = selected_file(request['root'], 'frame-interpolation', default.name, default)
+            if weights == default:
+                weights = ensure_weights(request['root'], emit, check)
             emit(stage=STAGE, done=0, total=None, unit='frames')
             between = model_between(weights, request.get('device', 'cuda'))
             write(request['source'], request['target'], fps=request['fps'], video_options=request['video_options'],

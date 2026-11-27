@@ -172,18 +172,18 @@ class Setup:
         self._hub_models = {}
         self._hub_models_guard = threading.Lock()
         self._local_picker = threading.Lock()
+        self._component_jobs = None
+        self._component_delegate = None
         self.comfy_h3_smoke = comfy_h3_smoke
         from .download_settings import Probe
         self.download_probe = Probe()
 
     def hub_models(self, kind, queue_busy, release_idle):
-        if os.name != 'nt':
-            return None
         try:
             root, machine = installation(self.source)
         except (OSError, ValueError):
             return None
-        if not machine.get('gpu_uuid') or (kind == 'video' and machine.get('video_model') is False):
+        if not (machine.get('gpu_uuid') or machine.get('device_identity')) or (kind == 'video' and machine.get('video_model') is False):
             return None
         with self._hub_models_guard:
             models = self._hub_models.get(kind)
@@ -208,9 +208,10 @@ class Setup:
                     installed=[], task=None)
 
     def _hub_status(self, kind, value, local_available):
-        result = dict(value, local_available=bool(local_available and value['available']))
+        result = dict(value, local_available=bool(local_available and value['available']), native_picker=os.name == 'nt')
         if kind == 'video':
             result['comfy_h3_available'] = result['local_available'] and self._comfy_h3_available()
+            result['comfy_h3_hf_available'] = bool(value['available'] and self._comfy_h3_available())
         return result
 
     def _comfy_h3_available(self):
@@ -219,12 +220,14 @@ class Setup:
     def hub_model_action(self, kind, name, value, queue_busy, release_idle, *, local_available=False):
         models = self.hub_models(kind, queue_busy, release_idle)
         if models is None:
-            raise ValueError('Install the FreeVideo engine on Windows with a CUDA GPU first.')
+            raise ValueError('Install the FreeVideo engine on a supported GPU first.')
         token = getattr(self.runner, 'token', '')
         if name == 'search':
             return dict(models=models.search(value.get('query'), token=token))
         if name == 'inspect':
             arguments = {'model': value.get('model'), 'component': value.get('component', 'dit')} if kind == 'image' else {}
+            if kind == 'video' and value.get('preset'):
+                arguments['preset'] = value['preset']
             return dict(candidate=models.inspect(value.get('reference'), token=token, **arguments))
         if name == 'local-pick':
             if not local_available:
@@ -257,6 +260,17 @@ class Setup:
                 raise ValueError('Wait for setup to finish before switching models.')
             selection = {'model': value.get('model'), 'component': value.get('component', 'dit')} if kind == 'image' else {}
             models.activate(value.get('id'), **selection)
+        elif name in ('verify', 'repair', 'remove'):
+            if not local_available:
+                raise ValueError('Open FreeVideo directly on this computer to manage installed models.')
+            if name != 'verify' and value.get('accepted') is not True:
+                raise ValueError('Confirm the model action first.')
+            if self.runner.busy:
+                raise ValueError('Wait for setup to finish before managing another model.')
+            selection = {'model': value.get('model'), 'component': value.get('component', 'dit')} if kind == 'image' else {}
+            if name == 'repair':
+                selection['token'] = token
+            getattr(models, name)(value.get('id'), **selection)
         else:
             raise ValueError('Unknown model action')
         status = models.status()
@@ -280,7 +294,15 @@ class Setup:
             if picker_kind not in ('cache', 'source', 'comfy_h3'):
                 raise ValueError('Choose a prepared cache, a VDN-H3 source folder, or ComfyUI H3 weights.')
             if picker_kind == 'comfy_h3' and not self._comfy_h3_available():
-                raise ValueError('ComfyUI H3 imports need a local Windows ComfyUI generation queue.')
+                raise ValueError('ComfyUI H3 imports need a compatible local ComfyUI generation queue.')
+        if value.get('path'):
+            from .model_component_jobs import approved_path
+            selection = approved_path(value['path'], self.component_libraries(machine))
+            if picker_kind == 'comfy_h3':
+                return models.scan_comfy_h3(selection)
+            return models.inspect_local(selection, **arguments)
+        if os.name != 'nt':
+            raise ValueError('Enter the path of a file or folder in a configured model library.')
         if not self._local_picker.acquire(blocking=False):
             raise ValueError('Close the other local model picker first.')
         try:
@@ -291,6 +313,89 @@ class Setup:
                 return models.inspect_local(selection, **arguments)
         finally:
             self._local_picker.release()
+
+    def component_libraries(self, machine):
+        from .launcher_settings import extra_model_directories
+        return [*extra_model_directories(), *discover_libraries(self.folder_paths), machine.get('model_root')]
+
+    def component_jobs(self, queue_busy, release_idle):
+        from .model_component_jobs import ComponentJobs
+        from .model_components import retained_use
+        root, machine = installation(self.source)
+        with self._hub_models_guard:
+            if self._component_jobs is None or self._component_jobs.root != root:
+                self._component_jobs = ComponentJobs(root, machine, source=self.source, queue_busy=queue_busy,
+                                                     release_idle=release_idle, about_to_switch=self._release_comfy_models,
+                                                     retained=lambda identity: retained_use(self.folder_paths.get_output_directory(), identity))
+            elif self._component_jobs.thread is None or not self._component_jobs.thread.is_alive():
+                self._component_jobs.machine = machine
+            return self._component_jobs
+
+    def component_status(self, queue_busy, release_idle, local, managers=None):
+        try:
+            jobs = self.component_jobs(queue_busy, release_idle)
+        except (OSError, ValueError):
+            return dict(slots=[], job=None, local_available=False, native_picker=False)
+        if managers is None:
+            managers = {kind: self.hub_model_status(kind, queue_busy, release_idle, local_available=local)
+                        for kind in ('video', 'image')}
+        value = jobs.status(local=local, native_picker=local and os.name == 'nt', managers=managers)
+        if self._component_delegate:
+            kind, slot = self._component_delegate
+            task = managers[kind].get('task')
+            if task and task.get('phase') != 'idle':
+                value['job'] = dict(task, slot=slot)
+        return value
+
+    def component_action(self, value, queue_busy, release_idle):
+        jobs = self.component_jobs(queue_busy, release_idle)
+        slot = jobs.slot(value.get('slot'))
+        action = value.get('action')
+        token = getattr(self.runner, 'token', '')
+        if slot.manager:
+            from .model_component_jobs import manager_versions, _known_default
+            if action not in ('verify', 'activate', 'reset', 'remove', 'repair', 'cancel'):
+                raise ValueError('Open this model’s import controls to add a version.')
+            identity = value.get('version_id')
+            if identity == 'builtin' or action == 'reset':
+                default = _known_default(slot)
+                manager = self.hub_model_status(slot.manager, queue_busy, release_idle, local_available=True)
+                manager_versions(slot, default, {slot.manager: manager})
+                if not default['installed']:
+                    raise ValueError('The default model is unavailable.')
+                identity = default['id']
+            name = 'activate' if action == 'reset' else action
+            self.hub_model_action(slot.manager, name, dict(id=identity, model=slot.model, component=slot.component,
+                                                           accepted=value.get('accepted')), queue_busy, release_idle,
+                                  local_available=True)
+            self._component_delegate = (slot.manager, slot.id) if name != 'activate' else None
+            return dict(model_components=self.component_status(queue_busy, release_idle, True))
+        if action == 'inspect':
+            return dict(candidate=jobs.inspect(slot, value, self.component_libraries(jobs.machine), token))
+        if action == 'pick':
+            from .local_model_picker import select
+            if os.name != 'nt' or not slot.supported or slot.manager or slot.validate is None:
+                raise ValueError('Enter the path of a file or folder in a configured model library.')
+            if not self._local_picker.acquire(blocking=False):
+                raise ValueError('Close the other local model picker first.')
+            try:
+                path = select(jobs.machine['python'], self.source,
+                              'model-directory' if slot.layout or len(slot.files) != 1 else 'model-file')
+            finally:
+                self._local_picker.release()
+            if path:
+                with jobs.mutex:
+                    if len(jobs.picked) >= 24:
+                        jobs.picked.clear()
+                    jobs.picked.add(path)
+            return dict(path=path)
+        if action in ('install', 'remove') and value.get('accepted') is not True:
+            raise ValueError('Confirm the model action first.')
+        if self.runner.busy and action != 'cancel':
+            raise ValueError('Wait for setup to finish before changing another model.')
+        self._component_delegate = None
+        jobs.perform(slot, action, value, token)
+        return dict(model_components=self.component_status(queue_busy, release_idle, True))
 
     def _release_idle_video_workers(self):
         from . import video_warm
@@ -641,23 +746,40 @@ def register():
         setup._release_idle_video_workers()
         release_idle_worker(server)
 
-    def local_model_access(request):
-        if os.name == 'nt':
-            try:
-                access.check(request, local=True)
-            except JobError:
-                return False
+    def component_busy():
+        services = ('_freevideo_prompt_vlm', '_freevideo_dubbing', '_freevideo_editor_music', '_freevideo_editor_speech')
+        if queue_busy() or any(service is not None and getattr(service, 'busy', lambda: False)()
+                               for service in (getattr(server, name, None) for name in services)):
             return True
+        jobs = getattr(server, '_freevideo_agent', None)
+        if jobs is not None:
+            with jobs.lock:
+                return any(row.get('status') in ('queued', 'running', 'cancelling') for row in jobs.jobs.values())
         return False
+
+    def release_components():
+        release_idle()
+        vlm = getattr(server, '_freevideo_prompt_vlm', None)
+        if vlm is not None:
+            vlm.stop_prestart('switch-model')
+
+    def local_model_access(request):
+        try:
+            access.check(request, local=True)
+        except JobError:
+            return False
+        return True
 
     @server.routes.get('/freevideo/setup')
     async def info(request):
         try:
             root=setup.validate_root(request.query['root']) if request.query.get('root') else None
             local = local_model_access(request)
+            managers = {kind: setup.hub_model_status(kind, queue_busy, release_idle, local_available=local)
+                        for kind in ('video', 'image')}
             return web.json_response(dict(discovery=setup.discovery(root), task=setup.status(),
-                                          video_models=setup.hub_model_status('video', queue_busy, release_idle, local_available=local),
-                                          image_models=setup.hub_model_status('image', queue_busy, release_idle, local_available=local)))
+                                          video_models=managers['video'], image_models=managers['image'],
+                                          model_components=setup.component_status(component_busy, release_components, local, managers)))
         except (OSError, ValueError) as error:
             return web.json_response({'error': str(error)}, status=400)
 
@@ -672,7 +794,11 @@ def register():
             if not isinstance(value, dict):
                 raise ValueError('Invalid setup request')
             name = request.match_info['action']
-            if name.startswith(('video-model-', 'image-model-')):
+            if name == 'model-component':
+                if not local_model_access(request):
+                    return web.json_response({'error': 'Open FreeVideo directly on this computer to manage models.'}, status=403)
+                result = await asyncio.to_thread(setup.component_action, value, component_busy, release_components)
+            elif name.startswith(('video-model-', 'image-model-')):
                 kind, _, action = name.partition('-model-')
                 local = local_model_access(request)
                 if action in ('local-pick', 'local-copy', 'local-comfy-inspect') and not local:

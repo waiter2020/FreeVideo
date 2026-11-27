@@ -1739,7 +1739,8 @@ def register():
             value = dict(width=int(query['width']), height=int(query['height']), seconds=float(query['seconds']),
                          task=query.get('task', 't2va'), base_steps=int(query.get('base_steps', '8')),
                          refine_steps=int(query.get('refine_steps', '3')), two_pass=query.get('two_pass', '1') == '1',
-                         enhance=query.get('enhance') == '1', loras=query.getall('lora', [])[:32])
+                         enhance=query.get('enhance') == '1', loras=query.getall('lora', [])[:32],
+                         fast_mode=query.get('fast_mode'))
             refs = []
             for item in query.getall('ref', [])[:32]:
                 kind, _, name = item.partition(':')

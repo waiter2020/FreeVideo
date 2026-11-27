@@ -1,11 +1,12 @@
 """Shared job lifecycle for staging and activating compatible model weights."""
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import subprocess
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp, TemporaryDirectory
 import threading
 import time
 
@@ -90,6 +91,71 @@ class HubModelJobs:
         with self.mutex:
             self.stop.set()
             return dict(self.task)
+
+    def _maintenance(self, identity, action, work, *args, token='', lock=True):
+        with self.mutex:
+            if self.thread is not None and self.thread.is_alive():
+                raise ValueError(f'Wait for the current {self.media} model action to finish.')
+            self.stop = threading.Event()
+            self.task = {}
+            phase = {'verify': 'verifying', 'repair': 'verifying', 'remove': 'waiting_for_gpu'}[action]
+            self._update(phase, id=identity, operation=action, done_bytes=0, total_bytes=0)
+            self.thread = threading.Thread(target=self._run_maintenance, args=(work, args, token, lock),
+                                           name='freevideo-' + self.media + '-model-' + action, daemon=True)
+            self.thread.start()
+            return dict(self.task)
+
+    def _run_maintenance(self, work, args, token, lock):
+        try:
+            with runtime_lock(self.root / 'setup.lock', inherit=False) if lock else nullcontext():
+                self._check()
+                work(*args)
+            self._update('ready')
+        except InterruptedError:
+            self._update('cancelled')
+        except BlockingIOError:
+            self._update('failed', error='Another FreeVideo installation task is running. Retry when it finishes.')
+        except Exception as error:
+            message = str(error).replace(token, '[redacted]') if token else str(error)
+            self._update('failed', error=(message or type(error).__name__)[:700])
+
+    @contextmanager
+    def _maintenance_lease(self):
+        self._update('waiting_for_gpu')
+        self.release_idle()
+        with self._smoke_lease():
+            self._check()
+            yield
+
+    def _delete_import(self, folder):
+        from .file_ops import publish
+        folder = io_path(folder)
+        if not folder.is_dir() or folder.is_symlink():
+            raise ValueError('The model is no longer installed.')
+        with TemporaryDirectory(prefix='removed-model-', dir=folder.parent) as temporary:
+            destination = Path(temporary) / 'model'
+            publish(folder, destination)
+            shutil.rmtree(destination)
+
+    def _replace_import(self, folder, staged, update):
+        from .file_ops import publish
+        folder = io_path(folder)
+        temporary = Path(mkdtemp(prefix='replace-model-', dir=folder.parent))
+        backup = temporary / 'original'
+        try:
+            publish(folder, backup)
+            try:
+                publish(staged, folder)
+                update()
+            except BaseException:
+                if folder.is_dir():
+                    publish(folder, staged)
+                publish(backup, folder)
+                raise
+        finally:
+            if not backup.exists():
+                temporary.rmdir()
+        shutil.rmtree(temporary)
 
     def _check(self):
         if self.stop.is_set():

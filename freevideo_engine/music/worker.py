@@ -52,6 +52,8 @@ def main(argv=None):
         if args.frames is not None and not (0 < args.frames and 0 < args.fps):
             raise BadRequest("frames and fps must be positive")
         import torch
+        from ..model_components import snapshot
+        from ..model_components_audio import MUSIC_SLOTS
         cuda = args.device == "cuda" and torch.cuda.is_available()
         mode = args.mode
         if cuda:
@@ -83,6 +85,7 @@ def main(argv=None):
             write_wav(path, audio)
         result = dict(ok=True, path=str(path), seconds=audio.shape[1] / 48000,
                       sample_rate=48000, load_s=load_s, generate_s=generate_s, mode=mode,
+                      model_components=snapshot(None, MUSIC_SLOTS),
                       sequential=mode != "resident",
                       lm_s=getattr(pipeline, "stage_times", {}).get("lm_s", 0.0),
                       peak_vram_gib=torch.cuda.max_memory_allocated() / 2**30 if cuda else None)

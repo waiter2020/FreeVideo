@@ -161,7 +161,7 @@ def _worse(current, idle):
 
 def placements(machine, usage, *, kind='video', width=1344, height=768, frames=243,
                steps=8, two_pass=True, task='t2va', refine=3, references=None,
-               step_cache=None, upscale=2, reference_pixels=0):
+               step_cache=None, upscale=2, reference_pixels=0, fast_mode=None):
     """Identical request and reserves, with and without the measured other usage."""
     idle = _machine(machine)
     usage = net(usage, machine)
@@ -182,14 +182,15 @@ def placements(machine, usage, *, kind='video', width=1344, height=768, frames=2
             or occupied['host_mode'] != base['host_mode'])
     else:
         params = dict(width=width, height=height, frames=frames, steps=steps, two_pass=two_pass,
-                      task=task, refine=refine, references=references, step_cache=step_cache, upscale=upscale)
+                      task=task, refine=refine, references=references, step_cache=step_cache, upscale=upscale,
+                      fast_mode=fast_mode)
         base, occupied = _admit(idle, **params), _admit(current, **params)
         worse = _worse(occupied, base)
     return dict(idle=base, occupied=occupied, worse=bool(worse))
 
 
 def fits_beside(machine, vram, ram, *, width, height, seconds, steps=8, two_pass=True, refine=3, step_cache=None,
-                upscale=2):
+                upscale=2, fast_mode=None):
     """Whether a text-to-video request is planned the same with ``vram`` card bytes and ``ram`` host bytes held by
     something that stays (the idle picture worker) as without: same admission, no fewer resident blocks, the same
     decoder placement. False when the machine cannot be read or either plan is refused."""
@@ -200,7 +201,7 @@ def fits_beside(machine, vram, ram, *, width, height, seconds, steps=8, two_pass
     frames = geometry(width, height, seconds=seconds)['frames']
     current = dict(idle, vram_free=max(0, idle['vram_free'] - vram), ram_available=max(0, idle['ram_available'] - ram))
     params = dict(width=width, height=height, frames=frames, steps=steps, two_pass=two_pass, task='t2va',
-                  refine=refine, references=None, step_cache=step_cache, upscale=upscale)
+                  refine=refine, references=None, step_cache=step_cache, upscale=upscale, fast_mode=fast_mode)
     base, occupied = _admit(idle, **params), _admit(current, **params)
     if base[0] is None or occupied[0] is None:
         return False

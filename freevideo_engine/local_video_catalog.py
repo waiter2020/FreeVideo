@@ -44,7 +44,16 @@ def _tensor_header(row, *, dtypes=TENSOR_BYTES):
             length = int.from_bytes(stream.read(8), 'little')
             if not 2 <= length <= min(MAX_HEADER, row['bytes'] - 8):
                 raise ValueError('Invalid header length')
-            value = json.loads(stream.read(length), object_pairs_hook=catalog._object)
+            header = stream.read(length)
+        return tensor_layout(header, row['bytes'], dtypes=dtypes)
+    except (AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError) as error:
+        raise ValueError('Invalid video safetensors: ' + row['target']) from error
+
+
+def tensor_layout(header, size, *, dtypes=TENSOR_BYTES):
+    """Check safetensors records, tensor extents and the complete file size."""
+    try:
+        value = json.loads(header, object_pairs_hook=catalog._object)
         metadata = value.pop('__metadata__', {})
         if not value or not isinstance(metadata, dict):
             raise ValueError('Missing tensor layout')
@@ -64,11 +73,11 @@ def _tensor_header(row, *, dtypes=TENSOR_BYTES):
             if begin != cursor:
                 raise ValueError('Non-contiguous tensor data')
             cursor = end
-        if cursor != row['bytes'] - length - 8:
+        if cursor != size - len(header) - 8:
             raise ValueError('Incomplete tensor data')
         return layout
-    except (AttributeError, KeyError, OSError, RecursionError, TypeError, ValueError) as error:
-        raise ValueError('Invalid video safetensors: ' + row['target']) from error
+    except (AttributeError, KeyError, RecursionError, TypeError, ValueError) as error:
+        raise ValueError('Invalid video safetensors tensor layout') from error
 
 
 def _official_manifest(sha):
