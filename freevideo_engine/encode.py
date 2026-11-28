@@ -11,6 +11,7 @@ from .locking import runtime_lock, LOCK_ENV
 from .music_request import without_music
 from .paths import comfy_root
 from .policy import choose
+from .resident_process import credit
 from . import processes
 from .resident_process import ENV as RESIDENT_ENV
 from .system import ram_budget_is_estimate, inference_emergency_floor
@@ -23,7 +24,10 @@ def run(args):
     if destination.exists():
         raise FileExistsError(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    hardware = detect()
+    # A resident worker that already holds the encoder on the card gives that card memory back to this plan, as
+    # the video plan counts it: only its own idle allocations, never what another program holds. The encoding then
+    # reuses that encoder in the same worker (one copy on the card), making room by releasing other idle models.
+    hardware, _ = credit(detect(), os.environ, reuse_encoder=True)
     policy = choose(hardware, **{key: getattr(args, key) for key in
                     ['vram_gib', 'ram_gib', 'attention', 'gpu_reserve_gib', 'ram_reserve_gib']},
                     available_backends=available_backends(hardware), allow_capacity_trial=True)
